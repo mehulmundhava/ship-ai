@@ -25,12 +25,13 @@ def create_get_few_shot_examples_tool(vector_store_manager):
     @tool
     def get_few_shot_examples(question: str) -> str:
         """
-        Retrieve similar example queries and business rules from the knowledge base.
+        Retrieve additional similar example queries and business rules from the knowledge base.
         
-        Use this tool when:
-        - The user question is complex and you need guidance on query structure
-        - You need to understand business rules or table relationships
-        - You want to see similar examples before generating SQL
+        NOTE: You already have 1-2 relevant examples pre-loaded in your system prompt.
+        Use this tool ONLY when:
+        - You need MORE examples beyond what's already provided
+        - The pre-loaded examples don't match your specific use case
+        - You need additional business rules or schema information
         
         Args:
             question: The user's question to find similar examples for

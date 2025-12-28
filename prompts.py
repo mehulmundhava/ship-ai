@@ -1,8 +1,9 @@
 """
 System Prompts for SQL Agent
 
-This module contains concise system prompts without embedded examples.
-Examples are retrieved dynamically via FAISS vector store.
+This module contains system prompts with optional pre-loaded examples.
+Examples are retrieved from FAISS vector store and embedded in the initial prompt
+to reduce token usage by eliminating the need for a separate tool call.
 """
 
 # Security and access control instructions
@@ -74,7 +75,26 @@ Key points to remember:
 #     return prompt
 
 
-def get_system_prompt(user_id: str, top_k: int = 20) -> str:
+def get_system_prompt(
+    user_id: str, 
+    top_k: int = 20,
+    question: str = None,
+    vector_store_manager = None,
+    preload_examples: bool = True
+) -> str:
+    """
+    Get the complete system prompt with optional pre-loaded examples.
+    
+    Args:
+        user_id: User ID for access control
+        top_k: Maximum number of results to return
+        question: User's question (for retrieving relevant examples)
+        vector_store_manager: VectorStoreManager instance for retrieving examples
+        preload_examples: Whether to pre-load 1-2 examples in the prompt
+        
+    Returns:
+        Complete system prompt string with optional examples
+    """
     base_prompt = f"""
             You are a restricted SQL-generation agent for a PostgreSQL database.
 
@@ -89,13 +109,14 @@ def get_system_prompt(user_id: str, top_k: int = 20) -> str:
             - NEVER use INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE.
             - NEVER use SELECT *.
             - Always LIMIT results to at most {top_k}, unless the user explicitly requests fewer.
-            - NEVER reveal or describe database schema, table names, columns, joins, indexes, or internal logic.
+
+            schema details, or SQL logic in the final human-readable answer.
             - NEVER explain how the SQL was constructed.
             - If asked about schema or internals, respond ONLY with:
             "Sorry, I cannot provide that information."
 
             Available tools:
-            1. get_few_shot_examples — use ONLY if query logic is unclear
+            1. get_few_shot_examples — use ONLY if you need additional examples beyond what's provided below
             2. execute_db_query — execute validated SQL
 
             - Validate SQL before execution.
@@ -119,14 +140,60 @@ def get_system_prompt(user_id: str, top_k: int = 20) -> str:
         - EVERY query MUST filter by user_id
         - ALWAYS join via user_device_assignment (ud)
         - ALWAYS apply ud.user_id = '{user_id}'
-        - NEVER return aggregated or comparative data across users.
+        - Aggregations (COUNT, SUM, AVG, etc.) are ALLOWED
+           ONLY when the data is strictly filtered to this user_id.
+        - Aggregations across multiple users are FORBIDDEN.
         - Cross-user data access is forbidden
-        - Any violation of these rules → respond ONLY with:
-          "Sorry, I cannot provide that information."
+        
+        - Any TRUE violation → respond ONLY with:
+            "Sorry, I cannot provide that information."
+
+        DEFAULT INTERPRETATION RULE:
+        - If a question is ambiguous but safe, assume the most reasonable
+        interpretation based on examples and business rules.
+        - "Has battery value" means battery IS NOT NULL
+        from the latest battery reading.
+
+        
+        SQL CONSTRUCTION RULES:
+        - You MAY use internal table names, columns, and joins to construct SQL.
+        - You MUST NOT expose or explain schema, table names, columns, joins,
+        or SQL logic in the final answer.
+
         """.strip()
 
+    # Build the main prompt
     if user_id and str(user_id).lower() == "admin":
-        return "\n\n".join([base_prompt, admin_prompt])
+        main_prompt = "\n\n".join([base_prompt, admin_prompt])
     else:
-        return "\n\n".join([base_prompt, user_prompt])
+        main_prompt = "\n\n".join([base_prompt, user_prompt])
+    
+    # Pre-load examples if requested and parameters are provided
+    if preload_examples and question and vector_store_manager:
+        try:
+            # Retrieve 1-2 most similar examples
+            example_docs = vector_store_manager.search_examples(question, k=2)
+            extra_docs = vector_store_manager.search_extra_prompts(question, k=1)
+            
+            examples_section_parts = []
+            
+            if example_docs:
+                examples_section_parts.append("\n\n=== RELEVANT EXAMPLE QUERIES ===\n")
+                for i, doc in enumerate(example_docs, 1):
+                    examples_section_parts.append(f"Example {i}:\n{doc.page_content}\n")
+            
+            if extra_docs:
+                examples_section_parts.append("\n=== RELEVANT BUSINESS RULES & SCHEMA INFO ===\n")
+                for i, doc in enumerate(extra_docs, 1):
+                    examples_section_parts.append(f"{i}. {doc.page_content}\n")
+            
+            if examples_section_parts:
+                examples_section = "".join(examples_section_parts)
+                main_prompt += examples_section
+                print(f"✅ Pre-loaded {len(example_docs)} examples and {len(extra_docs)} business rules into system prompt")
+        except Exception as e:
+            # If example retrieval fails, continue without examples
+            print(f"⚠️  Warning: Failed to pre-load examples: {e}. Continuing without examples.")
+    
+    return main_prompt
 

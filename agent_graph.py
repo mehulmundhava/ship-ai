@@ -191,7 +191,14 @@ class SQLAgentGraph:
         
         if not messages or not has_system or not has_human:
             # Initialize messages if empty or missing required components
-            system_prompt = get_system_prompt(self.user_id, self.top_k)
+            # Pre-load examples in the system prompt to reduce token usage
+            system_prompt = get_system_prompt(
+                user_id=self.user_id,
+                top_k=self.top_k,
+                question=state["question"],
+                vector_store_manager=self.vector_store_manager,
+                preload_examples=True
+            )
             base_messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=state["question"])
