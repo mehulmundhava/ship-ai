@@ -460,18 +460,34 @@ class SQLAgentGraph:
         
         # If we have query results, format them
         if query_result and not query_result.startswith("::::::"):
-            # Generate final answer from results
-            final_prompt = f"""Based on the SQL query results below, provide a clear, natural language answer to the user's question.
+            # Generate final answer from results using a MINIMAL, one-shot prompt.
+            # IMPORTANT: We DO NOT send the full message history, system prompt,
+            # or retrieved examples again here. This keeps token usage low for
+            # the final "explain the result" step.
+            user_question = state.get("question", "")
+            user_id = state.get("user_id", "")
 
-SQL Query:
-{sql_query}
+            final_prompt = f"""
+                You are a helpful assistant. Your task is ONLY to explain database query results
+                to the user in clear, natural language.
 
-Query Results:
-{query_result}
+                Constraints for your answer:
+                - Do NOT mention or describe table names, column names, joins, or SQL syntax.
+                - Do NOT reveal anything about database schema or internal implementation.
+                - Answer ONLY for the active user_id if relevant: {user_id}.
+                - Be concise and focus on what the numbers mean for the question.
 
-User Question: {state['question']}
+                User Question:
+                {user_question}
 
-Provide a concise, helpful answer:"""
+                SQL Query (for your reference only, do NOT explain it explicitly):
+                {sql_query}
+
+                SQL Query Results:
+                {query_result}
+
+                Now provide a short, user-friendly answer to the question based on these results.
+                """.strip()
             
             print(f"🤖 Generating final answer from query results...")
             print(f"   Prompt length: {len(final_prompt)} characters")
