@@ -9,7 +9,7 @@ import json
 from typing import TypedDict, List, Annotated, Optional, Dict, Any
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langchain_openai import ChatOpenAI
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_community.utilities.sql_database import SQLDatabase
 from agent_tools import create_get_few_shot_examples_tool, create_execute_db_query_tool
@@ -63,7 +63,7 @@ class SQLAgentGraph:
     
     def __init__(
         self,
-        llm: ChatOpenAI,
+        llm: BaseChatModel,
         db: SQLDatabase,
         vector_store_manager: VectorStoreManager,
         user_id: Optional[str] = None,
@@ -73,7 +73,7 @@ class SQLAgentGraph:
         Initialize the SQL agent graph.
         
         Args:
-            llm: Language model instance
+            llm: Language model instance (OpenAI, Groq, or any BaseChatModel)
             db: SQLDatabase instance
             vector_store_manager: VectorStoreManager instance
             user_id: User ID for access control
@@ -175,8 +175,18 @@ class SQLAgentGraph:
             }
         )
         
+        # After tools, check if we have query results - if yes, go to format_answer directly
+        # This prevents another LLM call with full history just to format the answer
+        workflow.add_conditional_edges(
+            "tools",
+            self._should_format_after_tools,
+            {
+                "format": "format_answer",
+                "continue": "agent"
+            }
+        )
+        
         # Add edges
-        workflow.add_edge("tools", "agent")  # After tools, go back to agent
         workflow.add_edge("format_answer", END)
         
         return workflow.compile()
@@ -288,7 +298,9 @@ class SQLAgentGraph:
             if human_msg:
                 print(f"💬 User Question: {human_msg.content}")
             
-            print(f"🤖 Invoking LLM (model: {self.llm.model_name})...")
+            # Get model name in a provider-agnostic way
+            model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
+            print(f"🤖 Invoking LLM (model: {model_name})...")
             response = self.llm_with_tools.invoke(messages)
             messages.append(response)
             
@@ -366,6 +378,27 @@ class SQLAgentGraph:
             "iteration_count": iteration_count,
             "token_usage": current_token_usage
         }
+    
+    def _should_format_after_tools(self, state: AgentState) -> str:
+        """
+        Check if we should format answer directly after tool execution.
+        If we have query results, skip the agent node and go directly to format_answer.
+        This saves tokens by avoiding another LLM call with full message history.
+        """
+        messages = state.get("messages", [])
+        
+        # Check if we have query results from execute_db_query
+        for msg in reversed(messages):
+            if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
+                # We have query results - format answer directly without another agent call
+                print(f"\n{'='*80}")
+                print(f"✅ TOOL RESULT DETECTED - Routing directly to format_answer")
+                print(f"   This saves tokens by skipping agent node with full history")
+                print(f"{'='*80}\n")
+                return "format"
+        
+        # No query results yet, continue to agent
+        return "continue"
     
     def _should_continue(self, state: AgentState) -> str:
         """Determine if we should continue (call tools) or end."""
@@ -491,8 +524,19 @@ class SQLAgentGraph:
             
             print(f"🤖 Generating final answer from query results...")
             print(f"   Prompt length: {len(final_prompt)} characters")
-            response = self.llm.invoke(final_prompt)
+            print(f"   Using MINIMAL prompt (no system prompt, no examples, no history)")
+            
+            # Use HumanMessage format for proper LLM invocation
+            from langchain_core.messages import HumanMessage
+            response = self.llm.invoke([HumanMessage(content=final_prompt)])
             final_answer = response.content if hasattr(response, 'content') else str(response)
+            
+            # Track token usage for this final call
+            if hasattr(response, "response_metadata") and response.response_metadata:
+                usage = response.response_metadata.get("token_usage", {})
+                if usage:
+                    print(f"📊 Final Answer Token Usage: Input={usage.get('prompt_tokens', 0)}, Output={usage.get('completion_tokens', 0)}, Total={usage.get('total_tokens', 0)}")
+            
             print(f"✅ Final Answer Generated: {final_answer[:200]}...")
         elif query_result and query_result.startswith("::::::"):
             # Empty result

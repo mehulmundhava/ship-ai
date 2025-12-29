@@ -10,9 +10,15 @@ langchain==0.3.25
 langchain-community==0.3.25
 langchain-core==0.3.65
 langchain-openai==0.3.23
+langchain-groq==0.2.1
 
 # Vector Store (FAISS)
 faiss-cpu==1.8.0.post1
+
+# Hugging Face Embeddings
+sentence-transformers==2.7.0
+torch==2.5.1
+langchain-huggingface==0.1.2
 
 # Database
 psycopg2-binary==2.9.9

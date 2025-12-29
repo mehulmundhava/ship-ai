@@ -32,7 +32,7 @@ else:
 
 from fastapi import FastAPI, HTTPException, status, Request
 from contextlib import asynccontextmanager
-from models import ChatRequest, ChatResponse, HealthCheckResponse
+from models import ChatRequest, ChatResponse, HealthCheckResponse, ReloadVectorStoreResponse, ReloadVectorStoreResponse
 from llm_model import LLMModel
 from db import sync_engine
 from langchain_community.utilities.sql_database import SQLDatabase
@@ -232,9 +232,11 @@ def chat_api(request: Request, payload: ChatRequest):
         print(f"   Chat History Length: {len(payload.chat_history or [])}")
         print(f"{'='*80}\n")
         
-        # Get LLM instance
-        llm = llm_model.openai_llm_model()
-        print(f"🤖 LLM Model: {llm.model_name}")
+        # Get LLM instance (OpenAI or Groq based on LLM_PROVIDER env var)
+        llm = llm_model.get_llm_model()
+        model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', None) or 'Unknown'
+        print(f"🤖 LLM Provider: {llm_model.get_provider()}")
+        print(f"🤖 LLM Model: {model_name}")
         
         # Create SQL agent graph
         agent = SQLAgentGraph(
@@ -280,6 +282,56 @@ def chat_api(request: Request, payload: ChatRequest):
         sql_query=sql_query_str,
         debug=debug_info
     )
+
+
+@app.post("/reload-vector-store", response_model=ReloadVectorStoreResponse)
+def reload_vector_store(request: Request):
+    """
+    Reload Vector Store Endpoint
+    
+    Clears existing FAISS vector stores and rebuilds them from examples_data.py.
+    This is useful when:
+    - examples_data.py is updated with new examples
+    - You want to switch embedding models
+    - Vector stores become corrupted
+    
+    Process:
+        1. Clear existing FAISS indexes
+        2. Rebuild indexes from examples_data.py using current embedding model
+        3. Return status and counts
+    
+    Returns:
+        ReloadVectorStoreResponse with status and counts
+    """
+    print(f"\n{'='*80}")
+    print(f"🔄 RELOAD VECTOR STORE REQUEST RECEIVED")
+    print(f"{'='*80}\n")
+    
+    try:
+        # Get vector store manager from app state
+        vector_store = request.app.state.vector_store
+        
+        # Reload stores
+        result = vector_store.reload_stores()
+        
+        # Re-initialize to ensure stores are loaded
+        vector_store.initialize_stores()
+        
+        return ReloadVectorStoreResponse(
+            status=result["status"],
+            message=result["message"],
+            examples_count=result.get("examples_count"),
+            extra_prompts_count=result.get("extra_prompts_count")
+        )
+    except Exception as e:
+        error_msg = f"Error reloading vector stores: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return ReloadVectorStoreResponse(
+            status="error",
+            message=error_msg
+        )
 
 
 if __name__ == "__main__":

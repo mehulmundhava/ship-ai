@@ -9,11 +9,14 @@ A modern AI-powered application that converts natural language questions into SQ
 
 ## 🎯 Key Features
 
+- **Multi-Provider LLM Support**: Supports both OpenAI and Groq (configurable via environment variable)
+- **Free Embeddings**: Uses Hugging Face embeddings (no API key required!)
 - **Agentic RAG**: LLM conditionally retrieves examples from FAISS when needed
 - **Hybrid Storage**: FAISS for examples, PostgreSQL for data execution
 - **Token Optimization**: Long prompts moved to vector store, retrieved only when needed
 - **LangGraph Workflow**: State-based agent with conditional tool calling
 - **PostgreSQL Integration**: Full SQL query generation and execution
+- **Vector Store Management**: API endpoint to reload vector stores when examples are updated
 
 ## 🏗️ Architecture
 
@@ -54,7 +57,8 @@ ship-RAG-ai/
 
 - Python 3.12+
 - PostgreSQL database
-- OpenAI API key
+- OpenAI API key **OR** Groq API key (choose one for LLM)
+- **No API key needed for embeddings!** Uses free Hugging Face models
 
 ### Step 1: Install Dependencies
 
@@ -75,9 +79,25 @@ USER="your_postgresql_username"
 PASSWORD="your_postgresql_password"
 SSL_MODE="prefer"
 
-# OpenAI API Configuration
+# LLM Provider Configuration
+# Set LLM_PROVIDER to "OPENAI" or "GROQ" (default: "OPENAI")
+LLM_PROVIDER="OPENAI"
+
+# OpenAI API Configuration (required if LLM_PROVIDER=OPENAI)
 API_KEY="your_openai_api_key"
 OPENAI_API_KEY="your_openai_api_key"
+
+# Groq API Configuration (required if LLM_PROVIDER=GROQ)
+# Get your API key from: https://console.groq.com/
+GROQ_API_KEY="your_groq_api_key"
+
+# Embedding Model Configuration (optional)
+# Uses Hugging Face embeddings - no API key required!
+# Default: "sentence-transformers/all-MiniLM-L6-v2"
+# You can use other models like:
+# - "sentence-transformers/all-mpnet-base-v2" (better quality, slower)
+# - "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" (multilingual)
+EMBEDDING_MODEL_NAME="sentence-transformers/all-MiniLM-L6-v2"
 ```
 
 ### Step 3: Start the Application
@@ -91,6 +111,33 @@ uvicorn main:app --host 0.0.0.0 --port 3009 --reload
 ```
 
 The API will be available at: `http://localhost:3009`
+
+### Step 4: Switching LLM Providers
+
+The application supports both **OpenAI** and **Groq** LLM providers. Switch between them using the `LLM_PROVIDER` environment variable:
+
+**Using OpenAI (default):**
+```env
+LLM_PROVIDER="OPENAI"
+API_KEY="your_openai_api_key"
+```
+
+**Using Groq:**
+```env
+LLM_PROVIDER="GROQ"
+GROQ_API_KEY="your_groq_api_key"
+# Note: OpenAI API key is still required for embeddings (vector store)
+API_KEY="your_openai_api_key"
+```
+
+**Available Groq Models:**
+- `llama-3.3-70b-versatile` (default) - Best for complex queries
+- `llama-3.1-8b-versatile` - Faster, lighter model
+- `mixtral-8x7b-32768` - Alternative option
+
+**Embeddings:** The application uses **Hugging Face embeddings** (no API key required!) for the vector store. The default model is `sentence-transformers/all-MiniLM-L6-v2`, which provides good quality semantic search without any API costs.
+
+You can customize the model by modifying `llm_model.py` or passing a `model` parameter to `get_llm_model()`.
 
 ## 📖 Usage
 
@@ -115,6 +162,28 @@ The API will be available at: `http://localhost:3009`
 }
 ```
 
+### API Endpoint: `POST /reload-vector-store`
+
+Reload the vector store from `examples_data.py`. Useful when:
+- You've updated `examples_data.py` with new examples
+- You want to switch embedding models
+- Vector stores need to be rebuilt
+
+**Request:**
+```bash
+curl -X POST http://localhost:3009/reload-vector-store
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Vector stores reloaded successfully",
+  "examples_count": 10,
+  "extra_prompts_count": 12
+}
+```
+
 ### Interactive API Documentation
 
 - **Swagger UI**: `http://localhost:3009/docs`
@@ -127,8 +196,15 @@ The API will be available at: `http://localhost:3009`
 On first startup, the application:
 - Loads example queries from `examples_data.py`
 - Loads business rules and schema info
+- Uses Hugging Face embeddings (no API key needed!)
 - Creates FAISS indexes (saved to `./faiss_index/`)
 - On subsequent startups, loads existing indexes
+
+**To reload vector stores after updating `examples_data.py`:**
+```bash
+POST /reload-vector-store
+```
+This clears existing indexes and rebuilds them with the latest data.
 
 ### 2. Agent Workflow
 

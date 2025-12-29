@@ -3,11 +3,13 @@ FAISS Vector Store Manager
 
 This module handles FAISS vector store initialization and management.
 It loads example queries and extra prompt data into FAISS for semantic search.
+Uses Hugging Face embeddings instead of OpenAI for cost efficiency.
 """
 
 import os
+import shutil
 from typing import List, Dict
-from langchain_openai import OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
 from dotenv import load_dotenv
@@ -21,22 +23,39 @@ FAISS_INDEX_PATH = "./faiss_index"
 EXAMPLES_INDEX_PATH = os.path.join(FAISS_INDEX_PATH, "examples")
 EXTRA_PROMPT_INDEX_PATH = os.path.join(FAISS_INDEX_PATH, "extra_prompts")
 
+# Hugging Face model for embeddings (sentence-transformers model)
+# Using a good general-purpose model for semantic search
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+
 
 class VectorStoreManager:
     """
     Manages FAISS vector stores for examples and extra prompt data.
+    Uses Hugging Face embeddings for semantic search.
     """
     
-    def __init__(self):
-        """Initialize embeddings model."""
-        # Get API key from environment
-        api_key = os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("API_KEY or OPENAI_API_KEY must be set in environment variables")
+    def __init__(self, model_name: str = None):
+        """
+        Initialize embeddings model using Hugging Face.
         
-        self.embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+        Args:
+            model_name: Hugging Face model name for embeddings.
+                       Default: "sentence-transformers/all-MiniLM-L6-v2"
+        """
+        model_name = model_name or EMBEDDING_MODEL_NAME
+        print(f"🔧 Initializing Hugging Face embeddings with model: {model_name}")
+        
+        # Initialize Hugging Face embeddings
+        # This will download the model on first use if not cached
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=model_name,
+            model_kwargs={'device': 'cpu'},  # Use CPU by default
+            encode_kwargs={'normalize_embeddings': True}  # Normalize for better similarity
+        )
+        
         self.examples_store = None
         self.extra_prompts_store = None
+        self.model_name = model_name
     
     def _create_documents_from_examples(self) -> List[Document]:
         """Convert example data to Document objects."""
@@ -77,32 +96,95 @@ class VectorStoreManager:
         # Initialize examples store
         if self._index_exists(EXAMPLES_INDEX_PATH):
             print(f"Loading existing FAISS index from {EXAMPLES_INDEX_PATH}")
-            self.examples_store = FAISS.load_local(
-                EXAMPLES_INDEX_PATH,
-                self.embeddings,
-                allow_dangerous_deserialization=True
-            )
+            try:
+                self.examples_store = FAISS.load_local(
+                    EXAMPLES_INDEX_PATH,
+                    self.embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                print(f"✅ Examples vector store loaded successfully")
+            except Exception as e:
+                print(f"⚠️  Error loading examples store: {e}. Rebuilding...")
+                self._rebuild_examples_store()
         else:
-            print(f"Creating new FAISS index for examples at {EXAMPLES_INDEX_PATH}")
-            example_docs = self._create_documents_from_examples()
-            self.examples_store = FAISS.from_documents(example_docs, self.embeddings)
-            self.examples_store.save_local(EXAMPLES_INDEX_PATH)
-            print(f"✅ Examples vector store created with {len(example_docs)} documents")
+            self._rebuild_examples_store()
         
         # Initialize extra prompts store
         if self._index_exists(EXTRA_PROMPT_INDEX_PATH):
             print(f"Loading existing FAISS index from {EXTRA_PROMPT_INDEX_PATH}")
-            self.extra_prompts_store = FAISS.load_local(
-                EXTRA_PROMPT_INDEX_PATH,
-                self.embeddings,
-                allow_dangerous_deserialization=True
-            )
+            try:
+                self.extra_prompts_store = FAISS.load_local(
+                    EXTRA_PROMPT_INDEX_PATH,
+                    self.embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                print(f"✅ Extra prompts vector store loaded successfully")
+            except Exception as e:
+                print(f"⚠️  Error loading extra prompts store: {e}. Rebuilding...")
+                self._rebuild_extra_prompts_store()
         else:
-            print(f"Creating new FAISS index for extra prompts at {EXTRA_PROMPT_INDEX_PATH}")
-            extra_docs = self._create_documents_from_extra_prompts()
-            self.extra_prompts_store = FAISS.from_documents(extra_docs, self.embeddings)
-            self.extra_prompts_store.save_local(EXTRA_PROMPT_INDEX_PATH)
-            print(f"✅ Extra prompts vector store created with {len(extra_docs)} documents")
+            self._rebuild_extra_prompts_store()
+    
+    def _rebuild_examples_store(self):
+        """Rebuild the examples vector store from examples_data.py"""
+        print(f"Creating new FAISS index for examples at {EXAMPLES_INDEX_PATH}")
+        example_docs = self._create_documents_from_examples()
+        self.examples_store = FAISS.from_documents(example_docs, self.embeddings)
+        self.examples_store.save_local(EXAMPLES_INDEX_PATH)
+        print(f"✅ Examples vector store created with {len(example_docs)} documents")
+    
+    def _rebuild_extra_prompts_store(self):
+        """Rebuild the extra prompts vector store from examples_data.py"""
+        print(f"Creating new FAISS index for extra prompts at {EXTRA_PROMPT_INDEX_PATH}")
+        extra_docs = self._create_documents_from_extra_prompts()
+        self.extra_prompts_store = FAISS.from_documents(extra_docs, self.embeddings)
+        self.extra_prompts_store.save_local(EXTRA_PROMPT_INDEX_PATH)
+        print(f"✅ Extra prompts vector store created with {len(extra_docs)} documents")
+    
+    def reload_stores(self):
+        """
+        Clear existing vector stores and rebuild them from examples_data.py.
+        This is useful when examples_data.py is updated.
+        
+        Returns:
+            dict: Status of the reload operation
+        """
+        print(f"\n{'='*80}")
+        print(f"🔄 RELOADING VECTOR STORES")
+        print(f"{'='*80}")
+        
+        try:
+            # Clear existing stores
+            if os.path.exists(EXAMPLES_INDEX_PATH):
+                shutil.rmtree(EXAMPLES_INDEX_PATH)
+                print(f"🗑️  Cleared examples index: {EXAMPLES_INDEX_PATH}")
+            
+            if os.path.exists(EXTRA_PROMPT_INDEX_PATH):
+                shutil.rmtree(EXTRA_PROMPT_INDEX_PATH)
+                print(f"🗑️  Cleared extra prompts index: {EXTRA_PROMPT_INDEX_PATH}")
+            
+            # Rebuild stores
+            self._rebuild_examples_store()
+            self._rebuild_extra_prompts_store()
+            
+            print(f"{'='*80}")
+            print(f"✅ Vector stores reloaded successfully!")
+            print(f"{'='*80}\n")
+            
+            return {
+                "status": "success",
+                "message": "Vector stores reloaded successfully",
+                "examples_count": len(self._create_documents_from_examples()),
+                "extra_prompts_count": len(self._create_documents_from_extra_prompts())
+            }
+        except Exception as e:
+            error_msg = f"Error reloading vector stores: {str(e)}"
+            print(f"❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return {
+                "status": "error",
+                "message": error_msg
+            }
     
     def search_examples(self, query: str, k: int = 3) -> List[Document]:
         """

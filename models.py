@@ -37,3 +37,12 @@ class HealthCheckResponse(BaseModel):
     llm: dict
     timestamp: str
 
+
+class ReloadVectorStoreResponse(BaseModel):
+    """
+    Response model for the /reload-vector-store API endpoint.
+    """
+    status: str
+    message: str
+    examples_count: Optional[int] = None
+    extra_prompts_count: Optional[int] = None
