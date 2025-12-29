@@ -211,6 +211,13 @@ EXTRA_PROMPT_DATA = [
         },
     },
     {
+        "content": "device_current_data (CD) - Contains current data of devices like temperature, battery, dwell-time, event-time(location event-time), free-fall-event-time, shock-event-time, facility-id, facility-type. Join field: CD.device_id = D.device_id and ud.device = cd.device_id ",
+        "metadata": {
+            "keywords": ["device_current_data", "temperature", "battery", "dwell-time", "event-time", "free-fall-event-time", "shock-event-time", "facility-id", "facility-type"],
+            "type": "schema_info",
+        },
+    },
+    {
         "content": "Facility type LHS to RHS conversion: manufacturer -> M, retailer -> R. Facility type columns has values like M, R, U, D, etc.",
         "metadata": {
             "keywords": [
@@ -259,10 +266,10 @@ EXTRA_PROMPT_DATA = [
         },
     },
     {
-        "content": "incoming_message_history_K (IK) - Use for get Location history (lat-long) of devices. It also contain dwell-time(how long device is there in same location), move mark (first entry at which device has change it's location). Join field: IK.device_id = D.Device_ID, IK.facility_id = F.facility_id",
+        "content": "incoming_message_history_k (IK) - Use for get Location history (lat-long) of devices. It also contain dwell-time(how long device is there in same location), move mark (first entry at which device has change it's location). Join field: IK.device_id = D.device_id, IK.facility_id = F.facility_id",
         "metadata": {
             "keywords": [
-                "incoming_message_history_k",
+                "incoming_message_history_k (IK)",
                 "location",
                 "latitude",
                 "longitude",
