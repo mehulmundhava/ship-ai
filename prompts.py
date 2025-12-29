@@ -117,7 +117,7 @@ def get_system_prompt(
 
             Available tools:
             1. get_few_shot_examples — use ONLY if you need additional examples beyond what's provided below
-            2. execute_db_query — execute validated SQL
+            2. execute_db_query — execute SQL queries against the database
 
             - Validate SQL before execution.
             - Retry once if execution fails.

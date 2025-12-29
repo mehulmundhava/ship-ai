@@ -54,6 +54,8 @@ class AgentState(TypedDict):
     final_answer: Optional[str]
     iteration_count: int  # Track iterations to prevent infinite loops
     token_usage: Optional[Dict[str, int]]  # Track token usage: input, output, total
+    query_validated: Optional[bool]  # Track if user query has been validated
+    llm_call_history: Optional[List[Dict[str, Any]]]  # Track what was sent/received for each LLM call
 
 
 class SQLAgentGraph:
@@ -89,6 +91,7 @@ class SQLAgentGraph:
         self.get_examples_tool = create_get_few_shot_examples_tool(vector_store_manager)
         self.execute_db_query_tool = create_execute_db_query_tool(db, vector_store_manager)
         
+        # Main tools for LLM (security guard is handled separately as direct LLM call)
         self.tools = [self.get_examples_tool, self.execute_db_query_tool]
         
         # Bind tools to LLM
@@ -199,8 +202,139 @@ class SQLAgentGraph:
         has_system = any(isinstance(m, SystemMessage) for m in messages)
         has_human = any(isinstance(m, HumanMessage) for m in messages)
         
+        # Check if user query validation has been completed
+        query_validated = state.get("query_validated", False)
+        
         if not messages or not has_system or not has_human:
-            # Initialize messages if empty or missing required components
+            # FIRST: Validate user query with security guard LLM call (saves tokens)
+            if not query_validated:
+                print(f"\n{'='*80}")
+                print(f"🔍 STEP 1: Security Guard - Validating user query")
+                print(f"{'='*80}")
+                
+                # Security guard prompt - minimal and focused
+                security_guard_prompt = """You are a Database Security Guard. Your only job is to classify user questions.
+
+RULES:
+1. SAFE: Questions about device metrics (battery, location, temperature, counts, dwell time, journeys, facilities, sensors, alerts, geofencing, device details).
+2. RISKY: Questions asking for:
+   - Raw table data (e.g., "give me admin entry data", "show me user assignment rows")
+   - System schemas, table structures, or database internals
+   - Admin records, user records, or user assignment records
+   - Direct access to sensitive system tables (admin, user_device_assignment, etc.)
+   - Questions with patterns like "entry data", "row data", "table data", "list data" from sensitive tables
+
+If the question is RISKY, respond with ONLY the word 'BLOCK'.
+If the question is SAFE, respond with ONLY the word 'ALLOW'.
+
+Respond with ONLY one word: either 'BLOCK' or 'ALLOW'."""
+                
+                user_question = state["question"]
+                security_messages = [
+                    SystemMessage(content=security_guard_prompt),
+                    HumanMessage(content=user_question)
+                ]
+                
+                print(f"🤖 Calling Security Guard LLM...")
+                security_response = self.llm.invoke(security_messages)
+                security_decision = security_response.content.strip().upper() if hasattr(security_response, 'content') else ""
+                
+                # Track token usage for security guard call
+                security_token_usage = {"input": 0, "output": 0, "total": 0}
+                if hasattr(security_response, "response_metadata") and security_response.response_metadata:
+                    usage = security_response.response_metadata.get("token_usage", {})
+                    if usage:
+                        security_token_usage = {
+                            "input": usage.get("prompt_tokens", 0),
+                            "output": usage.get("completion_tokens", 0),
+                            "total": usage.get("total_tokens", 0)
+                        }
+                        print(f"📊 Security Guard Token Usage: Input={security_token_usage['input']}, Output={security_token_usage['output']}, Total={security_token_usage['total']}")
+                
+                print(f"   Security Decision: {security_decision}")
+                
+                # Check if query is blocked
+                if "BLOCK" in security_decision:
+                    error_msg = "Sorry, I cannot provide that information."
+                    print(f"❌ User query is BLOCKED by Security Guard. Stopping execution.")
+                    print(f"{'='*80}\n")
+                    
+                    # Update token usage
+                    current_token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
+                    updated_token_usage = {
+                        "input": current_token_usage.get("input", 0) + security_token_usage["input"],
+                        "output": current_token_usage.get("output", 0) + security_token_usage["output"],
+                        "total": current_token_usage.get("total", 0) + security_token_usage["total"]
+                    }
+                    
+                    # Record security guard call in history
+                    llm_call_history = state.get("llm_call_history", [])
+                    llm_call_history.append({
+                        "iteration": 1,
+                        "call_type": "security_guard",
+                        "input_messages": [{
+                            "type": "SystemMessage",
+                            "content_length": len(security_guard_prompt),
+                            "content_preview": security_guard_prompt[:200] + "...",
+                            "note": "Security guard prompt - minimal validation only"
+                        }, {
+                            "type": "HumanMessage",
+                            "content": user_question
+                        }],
+                        "input_message_count": 2,
+                        "output": {
+                            "content": security_decision,
+                            "has_tool_calls": False
+                        },
+                        "token_usage": security_token_usage
+                    })
+                    
+                    return {
+                        **state,
+                        "final_answer": error_msg,
+                        "query_validated": True,
+                        "token_usage": updated_token_usage,
+                        "llm_call_history": llm_call_history,
+                        "messages": [HumanMessage(content=state["question"])]  # Minimal message for graph
+                    }
+                else:
+                    print(f"✅ User query is ALLOWED by Security Guard. Proceeding with full prompt.")
+                    print(f"{'='*80}\n")
+                    # Mark as validated and continue with full prompt setup
+                    state["query_validated"] = True
+                    
+                    # Record security guard call in history (even for allowed queries)
+                    llm_call_history = state.get("llm_call_history", [])
+                    llm_call_history.append({
+                        "iteration": 1,
+                        "call_type": "security_guard",
+                        "input_messages": [{
+                            "type": "SystemMessage",
+                            "content_length": len(security_guard_prompt),
+                            "content_preview": security_guard_prompt[:200] + "...",
+                            "note": "Security guard prompt - minimal validation only"
+                        }, {
+                            "type": "HumanMessage",
+                            "content": user_question
+                        }],
+                        "input_message_count": 2,
+                        "output": {
+                            "content": security_decision,
+                            "has_tool_calls": False
+                        },
+                        "token_usage": security_token_usage
+                    })
+                    state["llm_call_history"] = llm_call_history
+                
+                # Update token usage from security guard call
+                current_token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
+                state["token_usage"] = {
+                    "input": current_token_usage.get("input", 0) + security_token_usage["input"],
+                    "output": current_token_usage.get("output", 0) + security_token_usage["output"],
+                    "total": current_token_usage.get("total", 0) + security_token_usage["total"]
+                }
+            
+            # STEP 2: Initialize messages with FULL prompt (only if query is validated)
             # Pre-load examples in the system prompt to reduce token usage
             system_prompt = get_system_prompt(
                 user_id=self.user_id,
@@ -219,8 +353,8 @@ class SQLAgentGraph:
             existing_tools = [m for m in messages if isinstance(m, ToolMessage)]
             
             messages = base_messages + existing_ai + existing_tools
-            print(f"📝 Initialized message sequence ({len(messages)} messages)")
-            log_message_sequence(messages, "Initial Messages Created")
+            print(f"📝 Initialized message sequence with FULL prompt ({len(messages)} messages)")
+            log_message_sequence(messages, "Initial Messages Created (After Validation)")
         else:
             # Messages are already in good shape, just validate the sequence
             print(f"📋 Processing {len(messages)} existing messages")
@@ -277,10 +411,20 @@ class SQLAgentGraph:
             for tm in tool_messages:
                 print(f"      - ToolMessage: name={getattr(tm, 'name', 'unknown')}, tool_call_id={getattr(tm, 'tool_call_id', 'unknown')}")
         
-        # Keep ALL messages - don't filter out ToolMessages
-        # The OpenAI API will validate the sequence, but we need to preserve tool results
-        # If there's an issue, it will be caught by the API and we'll handle it
-        messages = messages
+        # Filter out check_user_query_restriction tool messages from history
+        # This tool is only for validation and shouldn't be included in subsequent LLM calls
+        # to reduce token consumption
+        filtered_messages = []
+        for msg in messages:
+            if isinstance(msg, ToolMessage):
+                # Check if this is a check_user_query_restriction tool message
+                tool_name = getattr(msg, 'name', '')
+                if tool_name == 'check_user_query_restriction':
+                    print(f"   🔇 Filtering out check_user_query_restriction ToolMessage (not sent to LLM to save tokens)")
+                    continue
+            filtered_messages.append(msg)
+        
+        messages = filtered_messages
         
         # Invoke LLM with tools
         try:
@@ -301,18 +445,87 @@ class SQLAgentGraph:
             # Get model name in a provider-agnostic way
             model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
             print(f"🤖 Invoking LLM (model: {model_name})...")
+            
+            # Track what messages are being sent TO the LLM
+            iteration = state.get("iteration_count", 0) + 1
+            llm_call_history = state.get("llm_call_history", [])
+            
+            # Build input messages summary for this call
+            input_messages_summary = []
+            for msg in messages:
+                if isinstance(msg, SystemMessage):
+                    input_messages_summary.append({
+                        "type": "SystemMessage",
+                        "content_length": len(msg.content),
+                        "content_preview": msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+                    })
+                elif isinstance(msg, HumanMessage):
+                    input_messages_summary.append({
+                        "type": "HumanMessage",
+                        "content": msg.content
+                    })
+                elif isinstance(msg, AIMessage):
+                    input_messages_summary.append({
+                        "type": "AIMessage",
+                        "content": msg.content if msg.content else None,
+                        "has_tool_calls": bool(hasattr(msg, "tool_calls") and msg.tool_calls)
+                    })
+                elif isinstance(msg, ToolMessage):
+                    input_messages_summary.append({
+                        "type": "ToolMessage",
+                        "name": getattr(msg, "name", "unknown"),
+                        "content_length": len(msg.content),
+                        "content_preview": msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+                    })
+            
             response = self.llm_with_tools.invoke(messages)
             messages.append(response)
             
             # Track token usage
             token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
+            call_token_usage = {"input": 0, "output": 0, "total": 0}
             if hasattr(response, "response_metadata") and response.response_metadata:
                 usage = response.response_metadata.get("token_usage", {})
                 if usage:
-                    token_usage["input"] = token_usage.get("input", 0) + usage.get("prompt_tokens", 0)
-                    token_usage["output"] = token_usage.get("output", 0) + usage.get("completion_tokens", 0)
-                    token_usage["total"] = token_usage.get("total", 0) + usage.get("total_tokens", 0)
-                    print(f"📊 Token Usage: Input={usage.get('prompt_tokens', 0)}, Output={usage.get('completion_tokens', 0)}, Total={usage.get('total_tokens', 0)}")
+                    call_token_usage = {
+                        "input": usage.get("prompt_tokens", 0),
+                        "output": usage.get("completion_tokens", 0),
+                        "total": usage.get("total_tokens", 0)
+                    }
+                    token_usage["input"] = token_usage.get("input", 0) + call_token_usage["input"]
+                    token_usage["output"] = token_usage.get("output", 0) + call_token_usage["output"]
+                    token_usage["total"] = token_usage.get("total", 0) + call_token_usage["total"]
+                    print(f"📊 Token Usage: Input={call_token_usage['input']}, Output={call_token_usage['output']}, Total={call_token_usage['total']}")
+            
+            # Record this LLM call in history
+            llm_call_info = {
+                "iteration": iteration,
+                "call_type": "agent_node",
+                "input_messages": input_messages_summary,
+                "input_message_count": len(messages),
+                "output": {
+                    "content": response.content if response.content else None,
+                    "has_tool_calls": bool(hasattr(response, "tool_calls") and response.tool_calls),
+                    "tool_calls": []
+                },
+                "token_usage": call_token_usage
+            }
+            
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                tool_calls_info = []
+                for tc in response.tool_calls:
+                    tool_call_info = {
+                        "name": tc.get("name"),
+                        "args": tc.get("args", {})
+                    }
+                    # Extract SQL query if it's execute_db_query
+                    if tc.get("name") == "execute_db_query":
+                        sql_query = tc.get("args", {}).get("query", "")
+                        tool_call_info["sql_query"] = sql_query
+                    tool_calls_info.append(tool_call_info)
+                llm_call_info["output"]["tool_calls"] = tool_calls_info
+            
+            llm_call_history.append(llm_call_info)
             
             # Log LLM response
             if hasattr(response, "tool_calls") and response.tool_calls:
@@ -376,7 +589,8 @@ class SQLAgentGraph:
             "sql_query": sql_query or state.get("sql_query"),
             "query_result": query_result or state.get("query_result"),
             "iteration_count": iteration_count,
-            "token_usage": current_token_usage
+            "token_usage": current_token_usage,
+            "llm_call_history": llm_call_history
         }
     
     def _should_format_after_tools(self, state: AgentState) -> str:
@@ -402,6 +616,16 @@ class SQLAgentGraph:
     
     def _should_continue(self, state: AgentState) -> str:
         """Determine if we should continue (call tools) or end."""
+        # Check if final_answer is already set (e.g., from early validation rejection)
+        final_answer = state.get("final_answer")
+        if final_answer:
+            print(f"\n{'='*80}")
+            print(f"✅ DECISION POINT - Final answer already set")
+            print(f"{'='*80}")
+            print(f"   Final answer: {final_answer[:100]}...")
+            print(f"✅ Decision: END - Final answer already generated")
+            return "end"
+        
         messages = state.get("messages", [])
         last_message = messages[-1] if messages else None
         iteration_count = state.get("iteration_count", 0)
@@ -526,18 +750,62 @@ class SQLAgentGraph:
             print(f"   Prompt length: {len(final_prompt)} characters")
             print(f"   Using MINIMAL prompt (no system prompt, no examples, no history)")
             
+            # Track what's being sent to LLM for final answer
+            llm_call_history = state.get("llm_call_history", [])
+            
             # Use HumanMessage format for proper LLM invocation
             from langchain_core.messages import HumanMessage
-            response = self.llm.invoke([HumanMessage(content=final_prompt)])
+            final_messages = [HumanMessage(content=final_prompt)]
+            response = self.llm.invoke(final_messages)
             final_answer = response.content if hasattr(response, 'content') else str(response)
             
             # Track token usage for this final call
+            call_token_usage = {"input": 0, "output": 0, "total": 0}
             if hasattr(response, "response_metadata") and response.response_metadata:
                 usage = response.response_metadata.get("token_usage", {})
                 if usage:
-                    print(f"📊 Final Answer Token Usage: Input={usage.get('prompt_tokens', 0)}, Output={usage.get('completion_tokens', 0)}, Total={usage.get('total_tokens', 0)}")
+                    call_token_usage = {
+                        "input": usage.get("prompt_tokens", 0),
+                        "output": usage.get("completion_tokens", 0),
+                        "total": usage.get("total_tokens", 0)
+                    }
+                    print(f"📊 Final Answer Token Usage: Input={call_token_usage['input']}, Output={call_token_usage['output']}, Total={call_token_usage['total']}")
+            
+            # Update state's token_usage with this call's tokens
+            current_token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
+            updated_token_usage = {
+                "input": current_token_usage.get("input", 0) + call_token_usage["input"],
+                "output": current_token_usage.get("output", 0) + call_token_usage["output"],
+                "total": current_token_usage.get("total", 0) + call_token_usage["total"]
+            }
+            
+            # Record final answer LLM call in history
+            llm_call_info = {
+                "iteration": state.get("iteration_count", 0) + 1,
+                "call_type": "format_answer",
+                "input_messages": [{
+                    "type": "HumanMessage",
+                    "content": final_prompt,
+                    "content_length": len(final_prompt),
+                    "note": "Minimal prompt - only question, SQL, and results (no system prompt, no examples, no history)"
+                }],
+                "input_message_count": 1,
+                "output": {
+                    "content": final_answer,
+                    "has_tool_calls": False
+                },
+                "token_usage": call_token_usage
+            }
+            llm_call_history.append(llm_call_info)
             
             print(f"✅ Final Answer Generated: {final_answer[:200]}...")
+            
+            return {
+                **state,
+                "final_answer": final_answer,
+                "llm_call_history": llm_call_history,
+                "token_usage": updated_token_usage
+            }
         elif query_result and query_result.startswith("::::::"):
             # Empty result
             final_answer = f"Based on the query, there are no results matching your criteria for the question: {state['question']}"
@@ -590,7 +858,9 @@ class SQLAgentGraph:
             "query_result": None,
             "final_answer": None,
             "iteration_count": 0,
-            "token_usage": {"input": 0, "output": 0, "total": 0}
+            "token_usage": {"input": 0, "output": 0, "total": 0},
+            "query_validated": False,
+            "llm_call_history": []
         }
         
         # Run the graph
@@ -646,8 +916,21 @@ class SQLAgentGraph:
         """Build comprehensive debug information including message history and token usage."""
         messages = state.get("messages", [])
         token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
+        llm_call_history = state.get("llm_call_history", [])
         
-        # Build message history
+        # Calculate token usage from llm_call_history as source of truth
+        calculated_token_usage = {"input": 0, "output": 0, "total": 0}
+        for call in llm_call_history:
+            call_usage = call.get("token_usage", {})
+            calculated_token_usage["input"] += call_usage.get("input", 0)
+            calculated_token_usage["output"] += call_usage.get("output", 0)
+            calculated_token_usage["total"] += call_usage.get("total", 0)
+        
+        # Use calculated tokens if available, otherwise fall back to state token_usage
+        # This ensures totals match llm_call_history
+        final_token_usage = calculated_token_usage if calculated_token_usage["total"] > 0 else token_usage
+        
+        # Build message history (for backward compatibility)
         message_history = []
         for i, msg in enumerate(messages):
             msg_info = {
@@ -691,18 +974,37 @@ class SQLAgentGraph:
             
             message_history.append(msg_info)
         
+        # Extract SQL query from llm_call_history if not already set
+        sql_query_from_history = state.get("sql_query")
+        if not sql_query_from_history:
+            # Try to find SQL query in llm_call_history
+            for call in llm_call_history:
+                if call.get("call_type") == "agent_node":
+                    tool_calls = call.get("output", {}).get("tool_calls", [])
+                    for tc in tool_calls:
+                        if tc.get("name") == "execute_db_query":
+                            sql_query_from_history = tc.get("sql_query", "")
+                            break
+                    if sql_query_from_history:
+                        break
+        
         debug_info = {
             "question": question,
             "user_id": state.get("user_id"),
             "total_messages": len(messages),
             "message_history": message_history,
+            "llm_call_history": llm_call_history,  # Detailed LLM call tracking with all steps:
+            # - security_guard: Query validation (if query is blocked/allowed)
+            # - agent_node: SQL query generation (includes tool_calls with SQL queries)
+            # - format_answer: Human-readable answer generation
             "token_usage": {
-                "input_tokens": token_usage.get("input", 0),
-                "output_tokens": token_usage.get("output", 0),
-                "total_tokens": token_usage.get("total", 0)
+                "input_tokens": final_token_usage.get("input", 0),
+                "output_tokens": final_token_usage.get("output", 0),
+                "total_tokens": final_token_usage.get("total", 0)
             },
+            "token_usage_calculated_from_llm_calls": calculated_token_usage["total"] > 0,  # Flag indicating if totals are from llm_call_history
             "iterations": state.get("iteration_count", 0),
-            "sql_query": state.get("sql_query"),
+            "sql_query": sql_query_from_history or state.get("sql_query"),
             "query_result": state.get("query_result", "")
         }
         
