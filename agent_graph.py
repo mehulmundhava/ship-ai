@@ -207,25 +207,38 @@ class SQLAgentGraph:
         
         if not messages or not has_system or not has_human:
             # FIRST: Validate user query with security guard LLM call (saves tokens)
-            if not query_validated:
+            # Only validate for non-admin users (admin can query across all users)
+            if not query_validated and str(self.user_id).lower() != "admin":
                 print(f"\n{'='*80}")
-                print(f"🔍 STEP 1: Security Guard - Validating user query")
+                print(f"🔍 STEP 1: Security Guard - Validating user query (User ID: {self.user_id})")
                 print(f"{'='*80}")
                 
                 # Security guard prompt - minimal and focused
-                security_guard_prompt = """You are a Database Security Guard. Your only job is to classify user questions.
+                security_guard_prompt = f"""You are a Database Security Guard. Your only job is to classify user questions.
+
+IMPORTANT: The current user_id is {self.user_id}. This user can ONLY access their own data.
 
 RULES:
-1. SAFE: Questions about device metrics (battery, location, temperature, counts, dwell time, journeys, facilities, sensors, alerts, geofencing, device details).
+1. SAFE: Questions about device metrics for the current user (battery, location, temperature, counts, dwell time, journeys, facilities, sensors, alerts, geofencing, device details) WITHOUT mentioning other user IDs.
 2. RISKY: Questions asking for:
+   - Data for another user (e.g., "give me logs for user 63", "show me data for user 45", "count for user 27")
+   - Any question that mentions a different user_id than {self.user_id}
    - Raw table data (e.g., "give me admin entry data", "show me user assignment rows")
    - System schemas, table structures, or database internals
    - Admin records, user records, or user assignment records
    - Direct access to sensitive system tables (admin, user_device_assignment, etc.)
    - Questions with patterns like "entry data", "row data", "table data", "list data" from sensitive tables
 
-If the question is RISKY, respond with ONLY the word 'BLOCK'.
-If the question is SAFE, respond with ONLY the word 'ALLOW'.
+CROSS-USER ACCESS RULE:
+- If the question mentions any user_id other than {self.user_id}, it MUST be BLOCKED.
+- Examples of BLOCKED questions:
+  * "give me logs counts for user 63" (when current user is {self.user_id})
+  * "show me data for user 45"
+  * "count devices for user 27"
+  * Any question containing "user X" where X is not {self.user_id}
+
+If the question is RISKY or asks for another user's data, respond with ONLY the word 'BLOCK'.
+If the question is SAFE and only asks about the current user's data, respond with ONLY the word 'ALLOW'.
 
 Respond with ONLY one word: either 'BLOCK' or 'ALLOW'."""
                 
@@ -333,6 +346,14 @@ Respond with ONLY one word: either 'BLOCK' or 'ALLOW'."""
                     "output": current_token_usage.get("output", 0) + security_token_usage["output"],
                     "total": current_token_usage.get("total", 0) + security_token_usage["total"]
                 }
+            elif not query_validated and str(self.user_id).lower() == "admin":
+                # Admin users skip security guard validation
+                print(f"\n{'='*80}")
+                print(f"🔍 STEP 1: Skipping Security Guard (Admin user)")
+                print(f"{'='*80}")
+                print(f"✅ Admin user - no validation needed. Proceeding with full prompt.")
+                print(f"{'='*80}\n")
+                state["query_validated"] = True
             
             # STEP 2: Initialize messages with FULL prompt (only if query is validated)
             # Pre-load examples in the system prompt to reduce token usage
