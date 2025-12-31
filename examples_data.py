@@ -2,8 +2,11 @@
 Example Data for Vector Store
 
 This module contains all the example queries and extra prompt data
-that were previously embedded in the long prompt. These are stored
-as arrays and will be loaded into FAISS vector store for retrieval.
+that were previously embedded in the long prompt. 
+
+NOTE: This file is kept for reference only. The actual data should be
+loaded into PostgreSQL tables (ai_vector_examples and ai_vector_extra_prompts)
+with their embeddings pre-computed and stored in the minilm_embedding columns.
 """
 
 # Example SQL queries with their corresponding questions

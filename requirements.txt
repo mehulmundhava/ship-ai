@@ -12,8 +12,9 @@ langchain-core==0.3.65
 langchain-openai==0.3.23
 langchain-groq==0.2.1
 
-# Vector Store (FAISS)
-faiss-cpu==1.8.0.post1
+# Vector Store (PostgreSQL pgvector)
+# Note: pgvector extension must be installed in PostgreSQL database
+# Install with: CREATE EXTENSION IF NOT EXISTS vector;
 
 # Hugging Face Embeddings
 sentence-transformers==2.7.0

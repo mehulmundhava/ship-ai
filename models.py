@@ -46,3 +46,21 @@ class ReloadVectorStoreResponse(BaseModel):
     message: str
     examples_count: Optional[int] = None
     extra_prompts_count: Optional[int] = None
+
+
+class GenerateEmbeddingsRequest(BaseModel):
+    """
+    Request model for embedding generation API endpoints.
+    """
+    id: Optional[int] = None
+
+
+class GenerateEmbeddingsResponse(BaseModel):
+    """
+    Response model for embedding generation API endpoints.
+    """
+    status: str
+    message: str
+    processed_count: Optional[int] = None
+    updated_ids: Optional[List[int]] = None
+    errors: Optional[List[str]] = None

@@ -2,7 +2,7 @@
 LangGraph Agent Tools
 
 This module defines tools that the agent can use:
-1. get_few_shot_examples - Retrieves similar examples from FAISS
+1. get_few_shot_examples - Retrieves similar examples from PostgreSQL vector store (pgvector)
 2. execute_db_query - Executes SQL queries against PostgreSQL
 """
 

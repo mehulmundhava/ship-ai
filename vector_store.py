@@ -1,37 +1,33 @@
 """
-FAISS Vector Store Manager
+PostgreSQL Vector Store Manager
 
-This module handles FAISS vector store initialization and management.
-It loads example queries and extra prompt data into FAISS for semantic search.
+This module handles PostgreSQL vector store initialization and management.
+It uses pgvector extension for semantic search on example queries and extra prompt data.
 Uses Hugging Face embeddings instead of OpenAI for cost efficiency.
 """
 
 import os
-import shutil
-from typing import List, Dict
+import json
+from typing import List, Dict, Optional
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
 from dotenv import load_dotenv
-from examples_data import SAMPLE_EXAMPLES, EXTRA_PROMPT_DATA
+from sqlalchemy import text
+from db import sync_engine
 
 # Load environment variables
 load_dotenv()
 
-# Path to store FAISS index
-FAISS_INDEX_PATH = "./faiss_index"
-EXAMPLES_INDEX_PATH = os.path.join(FAISS_INDEX_PATH, "examples")
-EXTRA_PROMPT_INDEX_PATH = os.path.join(FAISS_INDEX_PATH, "extra_prompts")
-
 # Hugging Face model for embeddings (sentence-transformers model)
 # Using a good general-purpose model for semantic search
+# This model produces 384-dimensional vectors (matching the VECTOR(384) in PostgreSQL)
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 
 
 class VectorStoreManager:
     """
-    Manages FAISS vector stores for examples and extra prompt data.
-    Uses Hugging Face embeddings for semantic search.
+    Manages PostgreSQL vector stores for examples and extra prompt data.
+    Uses Hugging Face embeddings and pgvector for semantic search.
     """
     
     def __init__(self, model_name: str = None):
@@ -53,142 +49,63 @@ class VectorStoreManager:
             encode_kwargs={'normalize_embeddings': True}  # Normalize for better similarity
         )
         
-        self.examples_store = None
-        self.extra_prompts_store = None
         self.model_name = model_name
-    
-    def _create_documents_from_examples(self) -> List[Document]:
-        """Convert example data to Document objects."""
-        documents = []
-        for example in SAMPLE_EXAMPLES:
-            # Combine question and SQL for better semantic search
-            content = f"Question: {example['question']}\n\nSQL Query:\n{example['sql']}"
-            doc = Document(
-                page_content=content,
-                metadata=example.get("metadata", {})
-            )
-            documents.append(doc)
-        return documents
-    
-    def _create_documents_from_extra_prompts(self) -> List[Document]:
-        """Convert extra prompt data to Document objects."""
-        documents = []
-        for item in EXTRA_PROMPT_DATA:
-            doc = Document(
-                page_content=item["content"],
-                metadata=item.get("metadata", {})
-            )
-            documents.append(doc)
-        return documents
-    
-    def _index_exists(self, index_path: str) -> bool:
-        """Check if FAISS index already exists."""
-        return os.path.exists(index_path) and os.path.isdir(index_path)
+        self.engine = sync_engine
     
     def initialize_stores(self):
         """
-        Initialize FAISS vector stores.
-        Creates indexes if they don't exist, otherwise loads existing ones.
+        Initialize PostgreSQL vector stores.
+        Verifies that tables exist and are accessible.
+        Note: Data should already be loaded into PostgreSQL tables.
         """
-        # Create directory if it doesn't exist
-        os.makedirs(FAISS_INDEX_PATH, exist_ok=True)
-        
-        # Initialize examples store
-        if self._index_exists(EXAMPLES_INDEX_PATH):
-            print(f"Loading existing FAISS index from {EXAMPLES_INDEX_PATH}")
-            try:
-                self.examples_store = FAISS.load_local(
-                    EXAMPLES_INDEX_PATH,
-                    self.embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                print(f"✅ Examples vector store loaded successfully")
-            except Exception as e:
-                print(f"⚠️  Error loading examples store: {e}. Rebuilding...")
-                self._rebuild_examples_store()
-        else:
-            self._rebuild_examples_store()
-        
-        # Initialize extra prompts store
-        if self._index_exists(EXTRA_PROMPT_INDEX_PATH):
-            print(f"Loading existing FAISS index from {EXTRA_PROMPT_INDEX_PATH}")
-            try:
-                self.extra_prompts_store = FAISS.load_local(
-                    EXTRA_PROMPT_INDEX_PATH,
-                    self.embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                print(f"✅ Extra prompts vector store loaded successfully")
-            except Exception as e:
-                print(f"⚠️  Error loading extra prompts store: {e}. Rebuilding...")
-                self._rebuild_extra_prompts_store()
-        else:
-            self._rebuild_extra_prompts_store()
-    
-    def _rebuild_examples_store(self):
-        """Rebuild the examples vector store from examples_data.py"""
-        print(f"Creating new FAISS index for examples at {EXAMPLES_INDEX_PATH}")
-        example_docs = self._create_documents_from_examples()
-        self.examples_store = FAISS.from_documents(example_docs, self.embeddings)
-        self.examples_store.save_local(EXAMPLES_INDEX_PATH)
-        print(f"✅ Examples vector store created with {len(example_docs)} documents")
-    
-    def _rebuild_extra_prompts_store(self):
-        """Rebuild the extra prompts vector store from examples_data.py"""
-        print(f"Creating new FAISS index for extra prompts at {EXTRA_PROMPT_INDEX_PATH}")
-        extra_docs = self._create_documents_from_extra_prompts()
-        self.extra_prompts_store = FAISS.from_documents(extra_docs, self.embeddings)
-        self.extra_prompts_store.save_local(EXTRA_PROMPT_INDEX_PATH)
-        print(f"✅ Extra prompts vector store created with {len(extra_docs)} documents")
-    
-    def reload_stores(self):
-        """
-        Clear existing vector stores and rebuild them from examples_data.py.
-        This is useful when examples_data.py is updated.
-        
-        Returns:
-            dict: Status of the reload operation
-        """
-        print(f"\n{'='*80}")
-        print(f"🔄 RELOADING VECTOR STORES")
-        print(f"{'='*80}")
+        print(f"🔍 Verifying PostgreSQL vector store tables...")
         
         try:
-            # Clear existing stores
-            if os.path.exists(EXAMPLES_INDEX_PATH):
-                shutil.rmtree(EXAMPLES_INDEX_PATH)
-                print(f"🗑️  Cleared examples index: {EXAMPLES_INDEX_PATH}")
-            
-            if os.path.exists(EXTRA_PROMPT_INDEX_PATH):
-                shutil.rmtree(EXTRA_PROMPT_INDEX_PATH)
-                print(f"🗑️  Cleared extra prompts index: {EXTRA_PROMPT_INDEX_PATH}")
-            
-            # Rebuild stores
-            self._rebuild_examples_store()
-            self._rebuild_extra_prompts_store()
-            
-            print(f"{'='*80}")
-            print(f"✅ Vector stores reloaded successfully!")
-            print(f"{'='*80}\n")
-            
-            return {
-                "status": "success",
-                "message": "Vector stores reloaded successfully",
-                "examples_count": len(self._create_documents_from_examples()),
-                "extra_prompts_count": len(self._create_documents_from_extra_prompts())
-            }
+            with self.engine.connect() as conn:
+                # Check if examples table exists and has data
+                result = conn.execute(text("""
+                    SELECT COUNT(*) as count 
+                    FROM ai_vector_examples
+                """))
+                examples_count = result.fetchone()[0]
+                print(f"✅ Examples table accessible: {examples_count} records")
+                
+                # Check if extra prompts table exists and has data
+                result = conn.execute(text("""
+                    SELECT COUNT(*) as count 
+                    FROM ai_vector_extra_prompts
+                """))
+                extra_prompts_count = result.fetchone()[0]
+                print(f"✅ Extra prompts table accessible: {extra_prompts_count} records")
+                
+                print(f"✅ PostgreSQL vector stores initialized successfully")
         except Exception as e:
-            error_msg = f"Error reloading vector stores: {str(e)}"
-            print(f"❌ {error_msg}")
-            print(f"{'='*80}\n")
-            return {
-                "status": "error",
-                "message": error_msg
-            }
+            print(f"⚠️  Warning: Could not verify vector store tables: {e}")
+            print("   Make sure the tables exist and data is loaded into them.")
+            raise
+    
+    def embed_query(self, query: str) -> List[float]:
+        """
+        Generate embedding vector for a query string.
+        
+        Args:
+            query: Query string to embed
+            
+        Returns:
+            List of floats representing the embedding vector
+        """
+        embedding = self.embeddings.embed_query(query)
+        return embedding
+    
+    def _embed_query(self, query: str) -> List[float]:
+        """
+        Alias for embed_query (kept for backward compatibility).
+        """
+        return self.embed_query(query)
     
     def search_examples(self, query: str, k: int = 3) -> List[Document]:
         """
-        Search for similar examples in the vector store.
+        Search for similar examples in the PostgreSQL vector store.
         
         Args:
             query: Search query
@@ -197,28 +114,84 @@ class VectorStoreManager:
         Returns:
             List of similar example documents
         """
-        if not self.examples_store:
-            print(f"⚠️  Examples store not initialized")
-            return []
-        
         print(f"\n{'='*80}")
         print(f"🔍 VECTOR STORE SEARCH - Examples")
         print(f"{'='*80}")
         print(f"   Query: {query}")
         print(f"   K: {k}")
         
-        retriever = self.examples_store.as_retriever(search_kwargs={"k": k})
-        results = retriever.invoke(query)
-        
-        print(f"   Found {len(results)} results:")
-        for i, doc in enumerate(results, 1):
-            content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-            print(f"   [{i}] {content_preview}")
-            if doc.metadata:
-                print(f"       Metadata: {doc.metadata}")
-        print(f"{'='*80}\n")
-        
-        return results
+        try:
+            # Generate embedding for the query
+            query_embedding = self.embed_query(query)
+            
+            # Convert to PostgreSQL array format string for vector type
+            # pgvector expects the format: '[1,2,3]'::vector
+            embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+            
+            # Search using pgvector L2 distance (vector_l2_ops)
+            # Using ORDER BY ... LIMIT for efficient similarity search
+            # Note: We use string formatting for the vector literal as it's a constant value
+            # The k parameter is safe as it's an integer from our code
+            search_query = text(f"""
+                SELECT 
+                    id,
+                    question,
+                    sql_query,
+                    metadata,
+                    minilm_embedding <-> '{embedding_str}'::vector AS distance
+                FROM ai_vector_examples
+                WHERE minilm_embedding IS NOT NULL
+                ORDER BY minilm_embedding <-> '{embedding_str}'::vector
+                LIMIT :k
+            """)
+            
+            with self.engine.connect() as conn:
+                result = conn.execute(search_query, {"k": k})
+                rows = result.fetchall()
+            
+            # Convert results to Document objects
+            documents = []
+            for row in rows:
+                # Combine question and SQL for the document content
+                content = f"Question: {row.question}\n\nSQL Query:\n{row.sql_query}"
+                
+                # Parse metadata - JSONB columns are typically returned as dicts by psycopg2
+                # But handle string case for safety
+                if isinstance(row.metadata, dict):
+                    metadata = row.metadata.copy()
+                elif isinstance(row.metadata, str):
+                    try:
+                        metadata = json.loads(row.metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                else:
+                    metadata = {}
+                metadata['distance'] = float(row.distance) if row.distance else None
+                metadata['id'] = row.id
+                
+                doc = Document(
+                    page_content=content,
+                    metadata=metadata
+                )
+                documents.append(doc)
+            
+            print(f"   Found {len(documents)} results:")
+            for i, doc in enumerate(documents, 1):
+                content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
+                print(f"   [{i}] {content_preview}")
+                if doc.metadata:
+                    distance = doc.metadata.get('distance')
+                    if distance is not None:
+                        print(f"       Distance: {distance:.4f}")
+            print(f"{'='*80}\n")
+            
+            return documents
+            
+        except Exception as e:
+            print(f"❌ Error searching examples: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
     
     def search_extra_prompts(self, query: str, k: int = 2) -> List[Document]:
         """
@@ -231,26 +204,124 @@ class VectorStoreManager:
         Returns:
             List of relevant prompt documents
         """
-        if not self.extra_prompts_store:
-            print(f"⚠️  Extra prompts store not initialized")
-            return []
-        
         print(f"\n{'='*80}")
         print(f"🔍 VECTOR STORE SEARCH - Extra Prompts")
         print(f"{'='*80}")
         print(f"   Query: {query}")
         print(f"   K: {k}")
         
-        retriever = self.extra_prompts_store.as_retriever(search_kwargs={"k": k})
-        results = retriever.invoke(query)
+        try:
+            # Generate embedding for the query
+            query_embedding = self.embed_query(query)
+            
+            # Convert to PostgreSQL array format string for vector type
+            # pgvector expects the format: '[1,2,3]'::vector
+            embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+            
+            # Search using pgvector L2 distance
+            # Note: We use string formatting for the vector literal as it's a constant value
+            # The k parameter is safe as it's an integer from our code
+            search_query = text(f"""
+                SELECT 
+                    id,
+                    content,
+                    note_type,
+                    metadata,
+                    minilm_embedding <-> '{embedding_str}'::vector AS distance
+                FROM ai_vector_extra_prompts
+                WHERE minilm_embedding IS NOT NULL
+                ORDER BY minilm_embedding <-> '{embedding_str}'::vector
+                LIMIT :k
+            """)
+            
+            with self.engine.connect() as conn:
+                result = conn.execute(search_query, {"k": k})
+                rows = result.fetchall()
+            
+            # Convert results to Document objects
+            documents = []
+            for row in rows:
+                # Parse metadata - JSONB columns are typically returned as dicts by psycopg2
+                # But handle string case for safety
+                if isinstance(row.metadata, dict):
+                    metadata = row.metadata.copy()
+                elif isinstance(row.metadata, str):
+                    try:
+                        metadata = json.loads(row.metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                else:
+                    metadata = {}
+                if row.note_type:
+                    metadata['note_type'] = row.note_type
+                metadata['distance'] = float(row.distance) if row.distance else None
+                metadata['id'] = row.id
+                
+                doc = Document(
+                    page_content=row.content,
+                    metadata=metadata
+                )
+                documents.append(doc)
+            
+            print(f"   Found {len(documents)} results:")
+            for i, doc in enumerate(documents, 1):
+                content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
+                print(f"   [{i}] {content_preview}")
+                if doc.metadata:
+                    distance = doc.metadata.get('distance')
+                    if distance is not None:
+                        print(f"       Distance: {distance:.4f}")
+            print(f"{'='*80}\n")
+            
+            return documents
+            
+        except Exception as e:
+            print(f"❌ Error searching extra prompts: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def reload_stores(self):
+        """
+        Reload vector stores from PostgreSQL.
+        Note: This method is kept for API compatibility, but since data is
+        stored in PostgreSQL, it just verifies the tables are accessible.
         
-        print(f"   Found {len(results)} results:")
-        for i, doc in enumerate(results, 1):
-            content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-            print(f"   [{i}] {content_preview}")
-            if doc.metadata:
-                print(f"       Metadata: {doc.metadata}")
-        print(f"{'='*80}\n")
+        Returns:
+            dict: Status of the reload operation
+        """
+        print(f"\n{'='*80}")
+        print(f"🔄 RELOADING VECTOR STORES")
+        print(f"{'='*80}")
         
-        return results
-
+        try:
+            with self.engine.connect() as conn:
+                # Count examples
+                result = conn.execute(text("SELECT COUNT(*) FROM ai_vector_examples"))
+                examples_count = result.fetchone()[0]
+                
+                # Count extra prompts
+                result = conn.execute(text("SELECT COUNT(*) FROM ai_vector_extra_prompts"))
+                extra_prompts_count = result.fetchone()[0]
+            
+            print(f"✅ Vector stores verified:")
+            print(f"   Examples: {examples_count} records")
+            print(f"   Extra Prompts: {extra_prompts_count} records")
+            print(f"{'='*80}")
+            print(f"✅ Vector stores reloaded successfully!")
+            print(f"{'='*80}\n")
+            
+            return {
+                "status": "success",
+                "message": "Vector stores verified successfully",
+                "examples_count": examples_count,
+                "extra_prompts_count": extra_prompts_count
+            }
+        except Exception as e:
+            error_msg = f"Error reloading vector stores: {str(e)}"
+            print(f"❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return {
+                "status": "error",
+                "message": error_msg
+            }

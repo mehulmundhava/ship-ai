@@ -2,7 +2,7 @@
 System Prompts for SQL Agent
 
 This module contains system prompts with optional pre-loaded examples.
-Examples are retrieved from FAISS vector store and embedded in the initial prompt
+Examples are retrieved from PostgreSQL vector store (pgvector) and embedded in the initial prompt
 to reduce token usage by eliminating the need for a separate tool call.
 """
 

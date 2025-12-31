@@ -3,7 +3,7 @@
 A modern AI-powered application that converts natural language questions into SQL queries using **LangGraph** and **Agentic RAG**. This project re-architects the original `ship-ai` to use:
 
 - **LangGraph** instead of LangChain for agent orchestration
-- **FAISS vector store** for storing example queries and business rules
+- **PostgreSQL pgvector** for storing example queries and business rules
 - **Conditional tool calling** - LLM decides when to retrieve examples vs. execute queries
 - **Reduced token consumption** by moving long prompts to vector store
 
@@ -11,12 +11,12 @@ A modern AI-powered application that converts natural language questions into SQ
 
 - **Multi-Provider LLM Support**: Supports both OpenAI and Groq (configurable via environment variable)
 - **Free Embeddings**: Uses Hugging Face embeddings (no API key required!)
-- **Agentic RAG**: LLM conditionally retrieves examples from FAISS when needed
-- **Hybrid Storage**: FAISS for examples, PostgreSQL for data execution
+- **Agentic RAG**: LLM conditionally retrieves examples from PostgreSQL vector store when needed
+- **Hybrid Storage**: PostgreSQL pgvector for examples, PostgreSQL for data execution
 - **Token Optimization**: Long prompts moved to vector store, retrieved only when needed
 - **LangGraph Workflow**: State-based agent with conditional tool calling
 - **PostgreSQL Integration**: Full SQL query generation and execution
-- **Vector Store Management**: API endpoint to reload vector stores when examples are updated
+- **Vector Store Management**: Scripts and APIs to load data and generate embeddings
 
 ## 🏗️ Architecture
 
@@ -28,7 +28,7 @@ FastAPI /chat endpoint
 LangGraph Agent
     ↓
 [Conditional Decision]
-    ├─→ get_few_shot_examples (FAISS) → Retrieve examples
+    ├─→ get_few_shot_examples (PostgreSQL pgvector) → Retrieve examples
     └─→ execute_db_query (PostgreSQL) → Execute SQL
     ↓
 Natural Language Answer + SQL Query
@@ -38,17 +38,18 @@ Natural Language Answer + SQL Query
 
 ```
 ship-RAG-ai/
-├── main.py                 # FastAPI application
-├── agent_graph.py          # LangGraph agent implementation
-├── agent_tools.py          # Tool definitions (FAISS + PostgreSQL)
-├── vector_store.py         # FAISS vector store manager
-├── examples_data.py        # Example queries and business rules
-├── prompts.py              # Concise system prompts
-├── db.py                   # PostgreSQL connection
-├── llm_model.py            # LLM model wrapper
-├── models.py               # Pydantic models
-├── requirements.txt        # Dependencies
-└── README.md               # This file
+├── main.py                      # FastAPI application
+├── agent_graph.py               # LangGraph agent implementation
+├── agent_tools.py               # Tool definitions (pgvector + PostgreSQL)
+├── vector_store.py              # PostgreSQL pgvector store manager
+├── examples_data.py             # Example queries and business rules (reference)
+├── load_examples_data.py        # Script to load data into PostgreSQL tables
+├── prompts.py                   # Concise system prompts
+├── db.py                        # PostgreSQL connection
+├── llm_model.py                 # LLM model wrapper
+├── models.py                    # Pydantic models
+├── requirements.txt             # Dependencies
+└── README.md                    # This file
 ```
 
 ## 🚀 Setup & Installation
@@ -56,17 +57,62 @@ ship-RAG-ai/
 ### Prerequisites
 
 - Python 3.12+
-- PostgreSQL database
+- PostgreSQL database with **pgvector extension**
 - OpenAI API key **OR** Groq API key (choose one for LLM)
 - **No API key needed for embeddings!** Uses free Hugging Face models
 
-### Step 1: Install Dependencies
+### Step 1: Install PostgreSQL pgvector Extension
+
+First, ensure the pgvector extension is installed in your PostgreSQL database:
+
+```sql
+-- Connect to your database
+\c your_database_name
+
+-- Install pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+### Step 2: Create Vector Store Tables
+
+Create the required tables in your PostgreSQL database:
+
+```sql
+-- Table for Few-Shot Examples (Questions & SQL)
+CREATE TABLE IF NOT EXISTS ai_vector_examples (
+    id BIGSERIAL PRIMARY KEY,
+    question TEXT NOT NULL,
+    sql_query TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}',
+    minilm_embedding VECTOR(384),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table for Extra Prompt Data (Context & Notes)
+CREATE TABLE IF NOT EXISTS ai_vector_extra_prompts (
+    id BIGSERIAL PRIMARY KEY,
+    content TEXT NOT NULL,
+    note_type VARCHAR(50), 
+    metadata JSONB DEFAULT '{}',
+    minilm_embedding VECTOR(384),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- HNSW Indexes for fast similarity search
+CREATE INDEX IF NOT EXISTS idx_ai_examples_minilm ON ai_vector_examples 
+USING hnsw (minilm_embedding vector_l2_ops);
+
+CREATE INDEX IF NOT EXISTS idx_ai_extra_minilm ON ai_vector_extra_prompts 
+USING hnsw (minilm_embedding vector_l2_ops);
+```
+
+### Step 3: Install Python Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Step 2: Configure Environment Variables
+### Step 4: Configure Environment Variables
 
 Create a `.env` file in the project root:
 
@@ -94,13 +140,55 @@ GROQ_API_KEY="your_groq_api_key"
 # Embedding Model Configuration (optional)
 # Uses Hugging Face embeddings - no API key required!
 # Default: "sentence-transformers/all-MiniLM-L6-v2"
-# You can use other models like:
-# - "sentence-transformers/all-mpnet-base-v2" (better quality, slower)
-# - "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" (multilingual)
+# This model produces 384-dimensional vectors (matching VECTOR(384) in PostgreSQL)
 EMBEDDING_MODEL_NAME="sentence-transformers/all-MiniLM-L6-v2"
 ```
 
-### Step 3: Start the Application
+### Step 5: Load Data into PostgreSQL Tables
+
+Load example data from `examples_data.py` into PostgreSQL tables:
+
+```bash
+python load_examples_data.py
+```
+
+This script will:
+- Load `SAMPLE_EXAMPLES` into `ai_vector_examples` table
+- Load `EXTRA_PROMPT_DATA` into `ai_vector_extra_prompts` table
+- Update existing records if they already exist (by question/content)
+- **Note**: This does NOT generate embeddings - use API endpoints for that
+
+### Step 6: Generate Embeddings
+
+After loading data, generate embeddings using the API endpoints:
+
+**For all records with NULL embeddings:**
+```bash
+# Examples table
+curl -X POST http://localhost:3009/generate-embeddings-examples \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Extra prompts table
+curl -X POST http://localhost:3009/generate-embeddings-extra-prompts \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**For a specific record:**
+```bash
+# Examples table - ID 5
+curl -X POST http://localhost:3009/generate-embeddings-examples \
+  -H "Content-Type: application/json" \
+  -d '{"id": 5}'
+
+# Extra prompts table - ID 3
+curl -X POST http://localhost:3009/generate-embeddings-extra-prompts \
+  -H "Content-Type: application/json" \
+  -d '{"id": 3}'
+```
+
+### Step 7: Start the Application
 
 ```bash
 # Using uvicorn directly
@@ -112,7 +200,7 @@ uvicorn main:app --host 0.0.0.0 --port 3009 --reload
 
 The API will be available at: `http://localhost:3009`
 
-### Step 4: Switching LLM Providers
+### Step 8: Switching LLM Providers
 
 The application supports both **OpenAI** and **Groq** LLM providers. Switch between them using the `LLM_PROVIDER` environment variable:
 
@@ -126,8 +214,6 @@ API_KEY="your_openai_api_key"
 ```env
 LLM_PROVIDER="GROQ"
 GROQ_API_KEY="your_groq_api_key"
-# Note: OpenAI API key is still required for embeddings (vector store)
-API_KEY="your_openai_api_key"
 ```
 
 **Available Groq Models:**
@@ -135,13 +221,13 @@ API_KEY="your_openai_api_key"
 - `llama-3.1-8b-versatile` - Faster, lighter model
 - `mixtral-8x7b-32768` - Alternative option
 
-**Embeddings:** The application uses **Hugging Face embeddings** (no API key required!) for the vector store. The default model is `sentence-transformers/all-MiniLM-L6-v2`, which provides good quality semantic search without any API costs.
-
-You can customize the model by modifying `llm_model.py` or passing a `model` parameter to `get_llm_model()`.
+**Embeddings:** The application uses **Hugging Face embeddings** (no API key required!) for the vector store. The default model is `sentence-transformers/all-MiniLM-L6-v2`, which produces 384-dimensional vectors matching the `VECTOR(384)` column type in PostgreSQL.
 
 ## 📖 Usage
 
 ### API Endpoint: `POST /chat`
+
+Main endpoint for natural language to SQL conversion.
 
 **Request:**
 ```json
@@ -157,17 +243,88 @@ You can customize the model by modifying `llm_model.py` or passing a `model` par
 {
   "token_id": "Test123",
   "answer": "There are 15 devices with current temperature above 10 degrees Celsius.",
-  "sql_query": "SELECT COUNT(*) as device_count FROM Device_Details_Table D INNER JOIN user_device_assignment ud ON D.SNo = ud.device_id LEFT JOIN incoming_message_history_K ik ON D.latest_incoming_message_id = ik.SNo WHERE ud.user_id = '27' AND ik.temperature > 10",
-  "debug": "Received 0 messages in history"
+  "sql_query": "SELECT COUNT(*) as device_count FROM device_current_data cd JOIN user_device_assignment ud ON cd.device_id = ud.device WHERE ud.user_id = '27' AND cd.temperature > 10",
+  "debug": {
+    "question": "...",
+    "total_messages": 5,
+    "token_usage": {
+      "input_tokens": 1234,
+      "output_tokens": 567,
+      "total_tokens": 1801
+    }
+  }
 }
 ```
 
+### API Endpoint: `POST /generate-embeddings-examples`
+
+Generate embeddings for records in `ai_vector_examples` table.
+
+**Request (all NULL embeddings):**
+```bash
+curl -X POST http://localhost:3009/generate-embeddings-examples \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**Request (specific ID):**
+```bash
+curl -X POST http://localhost:3009/generate-embeddings-examples \
+  -H "Content-Type: application/json" \
+  -d '{"id": 5}'
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Successfully processed 10 record(s)",
+  "processed_count": 10,
+  "updated_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "errors": null
+}
+```
+
+**Behavior:**
+- **Without `id`**: Processes all records with NULL/empty embeddings
+- **With `id`**: Updates embedding for that specific record (replaces if exists)
+
+### API Endpoint: `POST /generate-embeddings-extra-prompts`
+
+Generate embeddings for records in `ai_vector_extra_prompts` table.
+
+**Request (all NULL embeddings):**
+```bash
+curl -X POST http://localhost:3009/generate-embeddings-extra-prompts \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**Request (specific ID):**
+```bash
+curl -X POST http://localhost:3009/generate-embeddings-extra-prompts \
+  -H "Content-Type: application/json" \
+  -d '{"id": 3}'
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Successfully processed 12 record(s)",
+  "processed_count": 12,
+  "updated_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+  "errors": null
+}
+```
+
+**Behavior:**
+- **Without `id`**: Processes all records with NULL/empty embeddings
+- **With `id`**: Updates embedding for that specific record (replaces if exists)
+
 ### API Endpoint: `POST /reload-vector-store`
 
-Reload the vector store from `examples_data.py`. Useful when:
-- You've updated `examples_data.py` with new examples
-- You want to switch embedding models
-- Vector stores need to be rebuilt
+Verify PostgreSQL vector store tables and return record counts.
 
 **Request:**
 ```bash
@@ -178,10 +335,40 @@ curl -X POST http://localhost:3009/reload-vector-store
 ```json
 {
   "status": "success",
-  "message": "Vector stores reloaded successfully",
+  "message": "Vector stores verified successfully",
   "examples_count": 10,
   "extra_prompts_count": 12
 }
+```
+
+### Script: `load_examples_data.py`
+
+Load data from `examples_data.py` into PostgreSQL tables.
+
+**Usage:**
+```bash
+python load_examples_data.py
+```
+
+**What it does:**
+- Loads `SAMPLE_EXAMPLES` into `ai_vector_examples` table
+- Loads `EXTRA_PROMPT_DATA` into `ai_vector_extra_prompts` table
+- Checks for existing records (by question/content) and updates or inserts accordingly
+- Does NOT generate embeddings (use API endpoints for that)
+
+**Output:**
+```
+🚀 LOADING EXAMPLE DATA INTO POSTGRESQL
+================================================================================
+📥 LOADING EXAMPLES DATA INTO ai_vector_examples
+================================================================================
+   ✓ Inserted: Can you provide the number of 'manufacturer to retailer'...
+   ✓ Inserted: Count devices that have current temperature more than...
+   ...
+
+✅ Examples data loaded successfully!
+   Inserted: 10 records
+   Updated: 0 records
 ```
 
 ### Interactive API Documentation
@@ -191,27 +378,26 @@ curl -X POST http://localhost:3009/reload-vector-store
 
 ## 🔄 How It Works
 
-### 1. Vector Store Initialization
+### 1. Vector Store Setup
 
-On first startup, the application:
-- Loads example queries from `examples_data.py`
-- Loads business rules and schema info
-- Uses Hugging Face embeddings (no API key needed!)
-- Creates FAISS indexes (saved to `./faiss_index/`)
-- On subsequent startups, loads existing indexes
+**Initial Setup:**
+1. Create PostgreSQL tables with pgvector extension
+2. Load data using `load_examples_data.py` script
+3. Generate embeddings using API endpoints
+4. Application uses PostgreSQL for vector similarity search
 
-**To reload vector stores after updating `examples_data.py`:**
-```bash
-POST /reload-vector-store
-```
-This clears existing indexes and rebuilds them with the latest data.
+**Data Flow:**
+- Example queries stored in `ai_vector_examples` table
+- Business rules stored in `ai_vector_extra_prompts` table
+- Embeddings generated using Hugging Face model (384 dimensions)
+- HNSW indexes for fast similarity search
 
 ### 2. Agent Workflow
 
 1. **User asks a question** → FastAPI receives request
 2. **LangGraph agent decides** → Should I retrieve examples?
 3. **Conditional tool calling**:
-   - If complex → Call `get_few_shot_examples` (FAISS search)
+   - If complex → Call `get_few_shot_examples` (PostgreSQL pgvector search)
    - Generate SQL → Call `execute_db_query` (PostgreSQL)
 4. **Format answer** → Natural language response
 
@@ -228,18 +414,24 @@ This clears existing indexes and rebuilds them with the latest data.
 - State management for conversation flow
 
 ### `agent_tools.py`
-- `get_few_shot_examples`: FAISS semantic search
+- `get_few_shot_examples`: PostgreSQL pgvector semantic search
 - `execute_db_query`: PostgreSQL query execution
 
 ### `vector_store.py`
-- FAISS index management
-- Startup initialization with existence check
-- Separate indexes for examples and business rules
+- PostgreSQL pgvector store manager
+- Embedding generation using Hugging Face
+- Vector similarity search using L2 distance
+
+### `load_examples_data.py`
+- Script to load data from `examples_data.py` into PostgreSQL
+- Handles insert/update logic
+- Does not generate embeddings
 
 ### `examples_data.py`
-- All example queries (moved from prompt)
+- All example queries (reference only)
 - Business rules and schema descriptions
 - Metadata for better retrieval
+- **Note**: Data should be loaded into PostgreSQL tables
 
 ## 🔒 Security
 
@@ -253,27 +445,108 @@ This clears existing indexes and rebuilds them with the latest data.
 | Feature | ship-ai | ship-RAG-ai |
 |---------|---------|------------|
 | Framework | LangChain | LangGraph |
-| Examples | In prompt | FAISS vector store |
+| Vector Store | N/A | PostgreSQL pgvector |
+| Examples | In prompt | PostgreSQL vector store |
 | Token Usage | High (~20k chars) | Optimized (~5k base) |
 | Tool Calling | Fixed sequence | Conditional |
 | State Management | Chain-based | Graph-based |
 
 ## 🐛 Troubleshooting
 
-### FAISS Index Not Found
-- First run creates indexes automatically
-- Check `./faiss_index/` directory exists
-- Ensure write permissions
+### PostgreSQL pgvector Extension Not Found
+
+```sql
+-- Check if extension is installed
+SELECT * FROM pg_extension WHERE extname = 'vector';
+
+-- If not installed, run:
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+### Vector Store Tables Not Found
+
+```sql
+-- Check if tables exist
+SELECT table_name FROM information_schema.tables 
+WHERE table_schema = 'public' 
+AND table_name IN ('ai_vector_examples', 'ai_vector_extra_prompts');
+
+-- If missing, create them (see Step 2 in Setup)
+```
+
+### No Embeddings Generated
+
+- Ensure data is loaded: `python load_examples_data.py`
+- Generate embeddings using API endpoints
+- Check that `minilm_embedding` column is not NULL after generation
 
 ### Database Connection Issues
+
 - Verify `.env` file has correct credentials
 - Check PostgreSQL server is running
 - Test connection: `python -c "from db import sync_engine; print('OK')"`
+- Ensure pgvector extension is installed
 
-### OpenAI API Errors
-- Verify `API_KEY` in `.env`
+### Embedding Generation Errors
+
+- Verify Hugging Face model is accessible
+- Check that embedding model produces 384-dimensional vectors
+- Ensure PostgreSQL connection is working
+- Check logs for specific error messages
+
+### OpenAI/Groq API Errors
+
+- Verify `API_KEY` or `GROQ_API_KEY` in `.env`
 - Check API quota/credits
 - Ensure network connectivity
+
+## 📝 Workflow Summary
+
+### Complete Setup Workflow
+
+1. **Install PostgreSQL pgvector extension**
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   ```
+
+2. **Create tables** (see Step 2 in Setup)
+
+3. **Install Python dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Configure `.env` file**
+
+5. **Load data into PostgreSQL**
+   ```bash
+   python load_examples_data.py
+   ```
+
+6. **Generate embeddings**
+   ```bash
+   # Start the application first
+   uvicorn main:app --host 0.0.0.0 --port 3009
+   
+   # Then generate embeddings (in another terminal)
+   curl -X POST http://localhost:3009/generate-embeddings-examples -H "Content-Type: application/json" -d '{}'
+   curl -X POST http://localhost:3009/generate-embeddings-extra-prompts -H "Content-Type: application/json" -d '{}'
+   ```
+
+7. **Start using the API!**
+
+### Updating Data
+
+1. **Update `examples_data.py`** with new examples
+2. **Reload data**: `python load_examples_data.py`
+3. **Regenerate embeddings** for new/updated records:
+   ```bash
+   # For all NULL embeddings
+   curl -X POST http://localhost:3009/generate-embeddings-examples -H "Content-Type: application/json" -d '{}'
+   
+   # Or for specific ID
+   curl -X POST http://localhost:3009/generate-embeddings-examples -H "Content-Type: application/json" -d '{"id": 15}'
+   ```
 
 ## 📝 License
 
@@ -282,6 +555,5 @@ This clears existing indexes and rebuilds them with the latest data.
 ## 🙏 Acknowledgments
 
 - Built on LangGraph for agent orchestration
-- Uses FAISS for efficient vector search
+- Uses PostgreSQL pgvector for efficient vector search
 - Original architecture from `ship-ai` project
-
