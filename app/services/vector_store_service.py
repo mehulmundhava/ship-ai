@@ -7,7 +7,7 @@ Uses Hugging Face embeddings instead of OpenAI for cost efficiency.
 """
 
 import json
-from typing import List
+from typing import List, Optional
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.schema import Document
 from sqlalchemy import text
@@ -94,13 +94,14 @@ class VectorStoreService:
         """
         return self.embed_query(query)
     
-    def search_examples(self, query: str, k: int = 3) -> List[Document]:
+    def search_examples(self, query: str, k: int = 3, example_id: Optional[int] = None) -> List[Document]:
         """
         Search for similar examples in the PostgreSQL vector store.
         
         Args:
             query: Search query
             k: Number of results to return
+            example_id: Optional specific example ID to filter by (to check distance)
             
         Returns:
             List of similar example documents
@@ -110,6 +111,8 @@ class VectorStoreService:
         print(f"{'='*80}")
         print(f"   Query: {query}")
         print(f"   K: {k}")
+        if example_id:
+            print(f"   Filtering by ID: {example_id}")
         
         try:
             # Generate embedding for the query
@@ -118,6 +121,17 @@ class VectorStoreService:
             # Convert to PostgreSQL array format string for vector type
             # pgvector expects the format: '[1,2,3]'::vector
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+            
+            # Build WHERE conditions
+            where_conditions = ["minilm_embedding IS NOT NULL"]
+            query_params = {"k": k}
+            
+            # Add ID filter if provided
+            if example_id is not None:
+                where_conditions.append("id = :example_id")
+                query_params["example_id"] = example_id
+            
+            where_clause = " AND ".join(where_conditions)
             
             # Search using pgvector L2 distance (vector_l2_ops)
             # Using ORDER BY ... LIMIT for efficient similarity search
@@ -131,13 +145,13 @@ class VectorStoreService:
                     metadata,
                     minilm_embedding <-> '{embedding_str}'::vector AS distance
                 FROM ai_vector_examples
-                WHERE minilm_embedding IS NOT NULL
+                WHERE {where_clause}
                 ORDER BY minilm_embedding <-> '{embedding_str}'::vector
                 LIMIT :k
             """)
             
             with self.engine.connect() as conn:
-                result = conn.execute(search_query, {"k": k})
+                result = conn.execute(search_query, query_params)
                 rows = result.fetchall()
             
             # Convert results to Document objects
@@ -184,13 +198,14 @@ class VectorStoreService:
             traceback.print_exc()
             return []
     
-    def search_extra_prompts(self, query: str, k: int = 2) -> List[Document]:
+    def search_extra_prompts(self, query: str, k: int = 2, extra_prompts_id: Optional[int] = None) -> List[Document]:
         """
         Search for relevant extra prompt data.
         
         Args:
             query: Search query
             k: Number of results to return
+            extra_prompts_id: Optional specific extra prompt ID to filter by (to check distance)
             
         Returns:
             List of relevant prompt documents
@@ -200,6 +215,8 @@ class VectorStoreService:
         print(f"{'='*80}")
         print(f"   Query: {query}")
         print(f"   K: {k}")
+        if extra_prompts_id:
+            print(f"   Filtering by ID: {extra_prompts_id}")
         
         try:
             # Generate embedding for the query
@@ -208,6 +225,17 @@ class VectorStoreService:
             # Convert to PostgreSQL array format string for vector type
             # pgvector expects the format: '[1,2,3]'::vector
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+            
+            # Build WHERE conditions
+            where_conditions = ["minilm_embedding IS NOT NULL"]
+            query_params = {"k": k}
+            
+            # Add ID filter if provided
+            if extra_prompts_id is not None:
+                where_conditions.append("id = :extra_prompts_id")
+                query_params["extra_prompts_id"] = extra_prompts_id
+            
+            where_clause = " AND ".join(where_conditions)
             
             # Search using pgvector L2 distance
             # Note: We use string formatting for the vector literal as it's a constant value
@@ -220,13 +248,13 @@ class VectorStoreService:
                     metadata,
                     minilm_embedding <-> '{embedding_str}'::vector AS distance
                 FROM ai_vector_extra_prompts
-                WHERE minilm_embedding IS NOT NULL
+                WHERE {where_clause}
                 ORDER BY minilm_embedding <-> '{embedding_str}'::vector
                 LIMIT :k
             """)
             
             with self.engine.connect() as conn:
-                result = conn.execute(search_query, {"k": k})
+                result = conn.execute(search_query, query_params)
                 rows = result.fetchall()
             
             # Convert results to Document objects

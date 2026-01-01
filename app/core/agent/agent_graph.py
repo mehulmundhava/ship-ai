@@ -216,31 +216,27 @@ class SQLAgentGraph:
                 # Security guard prompt - minimal and focused
                 security_guard_prompt = f"""You are a Database Security Guard. Your only job is to classify user questions.
 
-                    IMPORTANT: The current user_id is {self.user_id}. This user can ONLY access their own data.
+                    IMPORTANT: The current user_id is {self.user_id}. 
+                    The user is ONLY allowed to see data associated with their own account.
 
                     RULES:
-                    1. SAFE: Questions about device metrics for the current user (battery, location, temperature, counts, dwell time, journeys, facilities, sensors, alerts, geofencing, device details) WITHOUT mentioning other user IDs.
-                    2. RISKY: Questions asking for:
-                    - Data for another user (e.g., "give me logs for user 63", "show me data for user 45", "count for user 27")
-                    - Any question that mentions a different user_id than {self.user_id}
-                    - Raw table data (e.g., "give me admin entry data", "show me user assignment rows")
-                    - System schemas, table structures, or database internals
-                    - Admin records, user records, or user assignment records
-                    - Direct access to sensitive system tables (admin, user_device_assignment, etc.)
-                    - Questions with patterns like "entry data", "row data", "table data", "list data" from sensitive tables
+                    1. SAFE (ALLOW): 
+                    - Requests for counts, totals, or lists of assets, devices, or metrics (battery, location, temperature, dwell time, journeys, alerts).
+                    - Example: "give count of assets in India", "list my devices", "show battery for my assets".
+                    - ASSUMPTION: If no user_id is mentioned, assume the user is asking about THEIR OWN data.
 
-                    CROSS-USER ACCESS RULE:
-                    - If the question mentions any user_id other than {self.user_id}, it MUST be BLOCKED.
-                    - Examples of BLOCKED questions:
-                    * "give me logs counts for user 63" (when current user is {self.user_id})
-                    * "show me data for user 45"
-                    * "count devices for user 27"
-                    * Any question containing "user X" where X is not {self.user_id}
+                    2. RISKY (BLOCK):
+                    - Any mention of a user_id, ID, or account number that is NOT {self.user_id}.
+                    - Requests for system-level data: "show tables", "database schema", "admin logs", "user assignments".
+                    - Attempts to access internal metadata or raw "row-level" system entries.
 
-                    If the question is RISKY or asks for another user's data, respond with ONLY the word 'BLOCK'.
-                    If the question is SAFE and only asks about the current user's data, respond with ONLY the word 'ALLOW'.
+                    CROSS-USER VIOLATION:
+                    - If the question mentions any number that looks like a user ID (e.g., 63, 45, 27) and it is not {self.user_id}, you MUST BLOCK it.
 
-                    Respond with ONLY one word: either 'BLOCK' or 'ALLOW'."""
+                    OUTPUT INSTRUCTION:
+                    - Respond with ONLY the word 'BLOCK' if it violates rules.
+                    - Respond with ONLY the word 'ALLOW' if it is a standard query for their own data.
+                    - Do not provide any explanation or greeting."""
                 
                 user_question = state["question"]
                 security_messages = [

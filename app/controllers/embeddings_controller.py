@@ -5,6 +5,7 @@ Handles embedding generation endpoints for vector store tables.
 Uses update database connection for write operations.
 """
 
+import json
 from sqlalchemy import text
 from app.config.database import sync_engine_update
 from app.models.schemas import (
@@ -86,7 +87,7 @@ def generate_embeddings_examples(
             if payload.id:
                 # Process specific ID
                 query = text("""
-                    SELECT id, question, sql_query
+                    SELECT id, question, sql_query, metadata
                     FROM ai_vector_examples
                     WHERE id = :id
                 """)
@@ -102,7 +103,7 @@ def generate_embeddings_examples(
             else:
                 # Process all records with NULL embeddings
                 query = text("""
-                    SELECT id, question, sql_query
+                    SELECT id, question, sql_query, metadata
                     FROM ai_vector_examples
                     WHERE minilm_embedding IS NULL
                 """)
@@ -122,14 +123,31 @@ def generate_embeddings_examples(
             for row in rows:
                 try:
                     record_id = row.id
-                    question = row.question
-                    sql_query = row.sql_query
                     
-                    # Combine question and SQL for embedding (same format as search)
-                    content = f"Question: {question}\n\nSQL Query:\n{sql_query}"
+                    # Extract keywords from metadata for embedding
+                    metadata = row.metadata if row.metadata else {}
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except (json.JSONDecodeError, TypeError):
+                            metadata = {}
                     
-                    # Generate embedding
-                    embedding = vector_store.embed_query(content)
+                    keywords = metadata.get('keywords', [])
+                    if not keywords or not isinstance(keywords, list) or len(keywords) == 0:
+                        # Skip records without keywords
+                        print(f"   ⚠️  Skipping ID {record_id}: No keywords found in metadata")
+                        continue
+                    
+                    # Join keywords with spaces to create embedding text
+                    embedding_text = ' '.join(str(kw) for kw in keywords if kw)
+                    
+                    if not embedding_text.strip():
+                        # Skip if keywords are empty strings
+                        print(f"   ⚠️  Skipping ID {record_id}: Keywords are empty")
+                        continue
+                    
+                    # Generate embedding from keywords only
+                    embedding = vector_store.embed_query(embedding_text)
                     
                     # Convert to PostgreSQL array format string
                     embedding_str = '[' + ','.join(map(str, embedding)) + ']'
@@ -148,7 +166,8 @@ def generate_embeddings_examples(
                     
                     processed_count += 1
                     updated_ids.append(record_id)
-                    print(f"   ✓ Processed ID {record_id}: {question[:50]}...")
+                    keywords_preview = ', '.join(str(kw) for kw in keywords[:5])
+                    print(f"   ✓ Processed ID {record_id}: Keywords: {keywords_preview}...")
                     
                 except Exception as e:
                     error_msg = f"Error processing ID {row.id}: {str(e)}"
@@ -217,7 +236,7 @@ def generate_embeddings_extra_prompts(
             if payload.id:
                 # Process specific ID
                 query = text("""
-                    SELECT id, content
+                    SELECT id, content, metadata
                     FROM ai_vector_extra_prompts
                     WHERE id = :id
                 """)
@@ -233,7 +252,7 @@ def generate_embeddings_extra_prompts(
             else:
                 # Process all records with NULL embeddings
                 query = text("""
-                    SELECT id, content
+                    SELECT id, content, metadata
                     FROM ai_vector_extra_prompts
                     WHERE minilm_embedding IS NULL
                 """)
@@ -253,10 +272,31 @@ def generate_embeddings_extra_prompts(
             for row in rows:
                 try:
                     record_id = row.id
-                    content = row.content
                     
-                    # Generate embedding directly from content
-                    embedding = vector_store.embed_query(content)
+                    # Extract keywords from metadata for embedding
+                    metadata = row.metadata if row.metadata else {}
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except (json.JSONDecodeError, TypeError):
+                            metadata = {}
+                    
+                    keywords = metadata.get('keywords', [])
+                    if not keywords or not isinstance(keywords, list) or len(keywords) == 0:
+                        # Skip records without keywords
+                        print(f"   ⚠️  Skipping ID {record_id}: No keywords found in metadata")
+                        continue
+                    
+                    # Join keywords with spaces to create embedding text
+                    embedding_text = ' '.join(str(kw) for kw in keywords if kw)
+                    
+                    if not embedding_text.strip():
+                        # Skip if keywords are empty strings
+                        print(f"   ⚠️  Skipping ID {record_id}: Keywords are empty")
+                        continue
+                    
+                    # Generate embedding from keywords only
+                    embedding = vector_store.embed_query(embedding_text)
                     
                     # Convert to PostgreSQL array format string
                     embedding_str = '[' + ','.join(map(str, embedding)) + ']'
@@ -275,7 +315,8 @@ def generate_embeddings_extra_prompts(
                     
                     processed_count += 1
                     updated_ids.append(record_id)
-                    print(f"   ✓ Processed ID {record_id}: {content[:50]}...")
+                    keywords_preview = ', '.join(str(kw) for kw in keywords[:5])
+                    print(f"   ✓ Processed ID {record_id}: Keywords: {keywords_preview}...")
                     
                 except Exception as e:
                     error_msg = f"Error processing ID {row.id}: {str(e)}"

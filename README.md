@@ -419,6 +419,89 @@ curl -X POST http://localhost:3009/reload-vector-store
 }
 ```
 
+### API Endpoint: `POST /vector-search`
+
+Search the PostgreSQL vector store for similar examples and extra prompts based on a question.
+
+**Request:**
+```bash
+curl -X POST http://localhost:3009/vector-search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Count devices with temperature > 10",
+    "search_type": "both",
+    "k_examples": 3,
+    "k_extra_prompts": 2
+  }'
+```
+
+**Request Parameters:**
+- `question` (required): The search query/question
+- `search_type` (optional): `"examples"`, `"extra_prompts"`, or `"both"` (default: `"both"`)
+- `k_examples` (optional): Number of example results to return (default: 3)
+- `k_extra_prompts` (optional): Number of extra prompt results to return (default: 2)
+- `example_id` (optional): Filter by specific example ID to check distance between question and that example
+- `extra_prompts_id` (optional): Filter by specific extra prompt ID to check distance between question and that prompt
+
+**Response:**
+```json
+{
+  "status": "success",
+  "question": "Count devices with temperature > 10",
+  "search_type": "both",
+  "examples": [
+    {
+      "id": 5,
+      "content": "Question: Count devices that have current temperature more than 10 degrees\n\nSQL Query:\nSELECT COUNT(*) FROM device_current_data...",
+      "distance": 0.1234,
+      "metadata": {
+        "id": 5,
+        "distance": 0.1234
+      }
+    }
+  ],
+  "extra_prompts": [
+    {
+      "id": 3,
+      "content": "When counting devices, always filter by user_id...",
+      "distance": 0.2345,
+      "metadata": {
+        "id": 3,
+        "note_type": "business_rule",
+        "distance": 0.2345
+      }
+    }
+  ],
+  "total_results": 5
+}
+```
+
+**Behavior:**
+- **search_type="examples"**: Returns only example search results
+- **search_type="extra_prompts"**: Returns only extra prompt search results
+- **search_type="both"**: Returns both types of results
+- Results are ordered by similarity (lower distance = more similar)
+- Each result includes the content, similarity distance, and metadata
+
+**Use Cases:**
+- Debug what examples are being retrieved for a specific question
+- Understand which business rules match a query
+- Test vector search functionality
+- Analyze similarity scores for different queries
+- Check distance between your question and a specific example/prompt by ID
+
+**Example with ID Filter:**
+```bash
+# Check distance between question and example ID 5
+curl -X POST http://localhost:3009/vector-search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Count devices with temperature > 10",
+    "search_type": "examples",
+    "example_id": 5
+  }'
+```
+
 ### Script: `scripts/load_examples_data.py`
 
 Load data from `scripts/examples_data.py` into PostgreSQL tables.

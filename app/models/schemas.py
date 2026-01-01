@@ -65,3 +65,37 @@ class GenerateEmbeddingsResponse(BaseModel):
     updated_ids: Optional[List[int]] = None
     errors: Optional[List[str]] = None
 
+
+class VectorSearchRequest(BaseModel):
+    """
+    Request model for the /vector-search API endpoint.
+    """
+    question: str
+    search_type: Optional[str] = "both"  # "examples", "extra_prompts", or "both"
+    k_examples: Optional[int] = 3  # Number of example results
+    k_extra_prompts: Optional[int] = 2  # Number of extra prompt results
+    example_id: Optional[int] = None  # Filter by specific example ID (to check distance)
+    extra_prompts_id: Optional[int] = None  # Filter by specific extra prompt ID (to check distance)
+
+
+class VectorSearchResult(BaseModel):
+    """
+    Individual search result item.
+    """
+    id: Optional[int] = None
+    content: str
+    distance: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class VectorSearchResponse(BaseModel):
+    """
+    Response model for the /vector-search API endpoint.
+    """
+    status: str
+    question: str
+    search_type: str
+    examples: Optional[List[VectorSearchResult]] = None
+    extra_prompts: Optional[List[VectorSearchResult]] = None
+    total_results: int
+
