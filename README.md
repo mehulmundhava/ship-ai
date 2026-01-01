@@ -154,6 +154,24 @@ USING hnsw (minilm_embedding vector_l2_ops);
 
 ### Step 3: Install Python Dependencies
 
+1. Install uv
+The user must have uv installed on their system.
+
+Windows: powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+2. Clone and Setup
+Once they have your code, they only need to run one command to install everything:
+uv sync
+
+3. Run the Project
+Since you added the start script to your pyproject.toml, they just run:
+uv run start
+
+
+  ---OR---
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -248,7 +266,10 @@ curl -X POST http://localhost:3009/generate-embeddings-extra-prompts \
 ### Step 7: Start the Application
 
 ```bash
-# Using the run.py script (recommended)
+# Using UV (recommended)
+uv run run.py
+
+# Using the run.py script
 python run.py
 
 # Or using uvicorn directly
