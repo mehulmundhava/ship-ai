@@ -64,3 +64,4 @@ class GenerateEmbeddingsResponse(BaseModel):
     processed_count: Optional[int] = None
     updated_ids: Optional[List[int]] = None
     errors: Optional[List[str]] = None
+

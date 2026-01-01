@@ -69,7 +69,7 @@ def create_get_few_shot_examples_tool(vector_store_manager):
     Create the get_few_shot_examples tool function.
     
     Args:
-        vector_store_manager: VectorStoreManager instance
+        vector_store_manager: VectorStoreService instance
         
     Returns:
         Tool function for retrieving examples
@@ -236,7 +236,7 @@ def create_check_user_query_restriction_tool():
         
         Args:
             user_question: The user's natural language question/request
-            
+        
         Returns:
             "User query is allowed. You can proceed." if allowed,
             or "Sorry, I cannot provide that information." if restricted
@@ -270,7 +270,7 @@ def create_execute_db_query_tool(db: SQLDatabase, vector_store_manager):
     
     Args:
         db: SQLDatabase instance
-        vector_store_manager: VectorStoreManager instance
+        vector_store_manager: VectorStoreService instance
         
     Returns:
         Tool function for executing SQL queries

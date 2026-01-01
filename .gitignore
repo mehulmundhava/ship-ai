@@ -26,6 +26,7 @@ faiss_index/
 # Logs
 *.log
 chat.log
+logs/
 
 # OS
 .DS_Store

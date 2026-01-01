@@ -38,18 +38,64 @@ Natural Language Answer + SQL Query
 
 ```
 ship-RAG-ai/
-├── main.py                      # FastAPI application
-├── agent_graph.py               # LangGraph agent implementation
-├── agent_tools.py               # Tool definitions (pgvector + PostgreSQL)
-├── vector_store.py              # PostgreSQL pgvector store manager
-├── examples_data.py             # Example queries and business rules (reference)
-├── load_examples_data.py        # Script to load data into PostgreSQL tables
-├── prompts.py                   # Concise system prompts
-├── db.py                        # PostgreSQL connection
-├── llm_model.py                 # LLM model wrapper
-├── models.py                    # Pydantic models
-├── requirements.txt             # Dependencies
-└── README.md                    # This file
+├── app/                         # Main application package
+│   ├── __init__.py
+│   ├── main.py                  # FastAPI application initialization
+│   │
+│   ├── api/                     # API routes
+│   │   ├── __init__.py          # Router aggregation
+│   │   └── routes/
+│   │       ├── __init__.py
+│   │       ├── chat.py          # Chat endpoint routes
+│   │       ├── embeddings.py    # Embedding generation routes
+│   │       └── health.py        # Health check routes
+│   │
+│   ├── config/                  # Configuration
+│   │   ├── __init__.py
+│   │   ├── settings.py          # Environment variables & settings
+│   │   └── database.py          # Database connection management
+│   │
+│   ├── controllers/             # Business logic controllers
+│   │   ├── __init__.py
+│   │   ├── chat_controller.py   # Chat endpoint logic
+│   │   ├── embeddings_controller.py  # Embedding generation logic
+│   │   └── health_controller.py # Health check logic
+│   │
+│   ├── core/                    # Core agent logic
+│   │   ├── __init__.py
+│   │   ├── prompts.py           # System prompts
+│   │   └── agent/
+│   │       ├── __init__.py
+│   │       ├── agent_graph.py   # LangGraph agent implementation
+│   │       └── agent_tools.py   # Tool definitions (pgvector + PostgreSQL)
+│   │
+│   ├── models/                  # Data models
+│   │   ├── __init__.py
+│   │   └── schemas.py           # Pydantic request/response models
+│   │
+│   ├── services/                # Business services
+│   │   ├── __init__.py
+│   │   ├── llm_service.py       # LLM model wrapper
+│   │   └── vector_store_service.py  # PostgreSQL pgvector store manager
+│   │
+│   ├── helpers/                  # Helper utilities
+│   │   ├── __init__.py
+│   │   └── validators.py        # Validation helpers
+│   │
+│   └── utils/                   # Utility functions
+│       ├── __init__.py
+│       └── logger.py            # Logging utility
+│
+├── scripts/                     # Utility scripts
+│   ├── examples_data.py         # Example queries and business rules
+│   └── load_examples_data.py    # Script to load data into PostgreSQL
+│
+├── logs/                        # Application logs (auto-generated)
+├── run.py                       # Application runner script
+├── requirements.txt             # Python dependencies
+├── README.md                    # This file
+├── MIGRATION_NOTES.md           # Migration documentation
+└── DATABASE_CONNECTIONS.md      # Database connection documentation
 ```
 
 ## 🚀 Setup & Installation
@@ -117,13 +163,18 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```env
-# Database Configuration
+# Database Configuration - Read-only user (for health, chat endpoints)
 HOST="your_postgresql_host"
 PORT="5432"
 DATABASE="your_database_name"
-USER="your_postgresql_username"
-PASSWORD="your_postgresql_password"
+USER="your_readonly_username"
+PASSWORD="your_readonly_password"
 SSL_MODE="prefer"
+
+# Database Configuration - Update user (for embedding generation routes)
+# Optional but recommended for security
+UPDATE_USER="your_update_username"
+UPDATE_PASSWORD="your_update_password"
 
 # LLM Provider Configuration
 # Set LLM_PROVIDER to "OPENAI" or "GROQ" (default: "OPENAI")
@@ -144,12 +195,18 @@ GROQ_API_KEY="your_groq_api_key"
 EMBEDDING_MODEL_NAME="sentence-transformers/all-MiniLM-L6-v2"
 ```
 
+**Note:** The application uses two separate database connections for security:
+- **Read-only connection** (`USER`/`PASSWORD`): Used for health checks and chat endpoints
+- **Update connection** (`UPDATE_USER`/`UPDATE_PASSWORD`): Used for embedding generation routes
+
+If `UPDATE_USER` and `UPDATE_PASSWORD` are not set, the application will fall back to using the read-only connection (not recommended for production). See `DATABASE_CONNECTIONS.md` for more details.
+
 ### Step 5: Load Data into PostgreSQL Tables
 
-Load example data from `examples_data.py` into PostgreSQL tables:
+Load example data from `scripts/examples_data.py` into PostgreSQL tables:
 
 ```bash
-python load_examples_data.py
+python scripts/load_examples_data.py
 ```
 
 This script will:
@@ -191,11 +248,11 @@ curl -X POST http://localhost:3009/generate-embeddings-extra-prompts \
 ### Step 7: Start the Application
 
 ```bash
-# Using uvicorn directly
-uvicorn main:app --host 0.0.0.0 --port 3009
+# Using the run.py script (recommended)
+python run.py
 
-# Or with auto-reload for development
-uvicorn main:app --host 0.0.0.0 --port 3009 --reload
+# Or using uvicorn directly
+uvicorn app.main:app --host 0.0.0.0 --port 3009 --reload
 ```
 
 The API will be available at: `http://localhost:3009`
@@ -341,19 +398,20 @@ curl -X POST http://localhost:3009/reload-vector-store
 }
 ```
 
-### Script: `load_examples_data.py`
+### Script: `scripts/load_examples_data.py`
 
-Load data from `examples_data.py` into PostgreSQL tables.
+Load data from `scripts/examples_data.py` into PostgreSQL tables.
 
 **Usage:**
 ```bash
-python load_examples_data.py
+python scripts/load_examples_data.py
 ```
 
 **What it does:**
 - Loads `SAMPLE_EXAMPLES` into `ai_vector_examples` table
 - Loads `EXTRA_PROMPT_DATA` into `ai_vector_extra_prompts` table
 - Checks for existing records (by question/content) and updates or inserts accordingly
+- Uses the update database connection (`UPDATE_USER`/`UPDATE_PASSWORD`) for write operations
 - Does NOT generate embeddings (use API endpoints for that)
 
 **Output:**
@@ -408,26 +466,38 @@ python load_examples_data.py
 
 ## 🛠️ Key Components
 
-### `agent_graph.py`
+### `app/core/agent/agent_graph.py`
 - LangGraph state machine
 - Conditional tool calling logic
 - State management for conversation flow
 
-### `agent_tools.py`
+### `app/core/agent/agent_tools.py`
 - `get_few_shot_examples`: PostgreSQL pgvector semantic search
 - `execute_db_query`: PostgreSQL query execution
 
-### `vector_store.py`
+### `app/services/vector_store_service.py`
 - PostgreSQL pgvector store manager
 - Embedding generation using Hugging Face
 - Vector similarity search using L2 distance
+- Uses read-only database connection
 
-### `load_examples_data.py`
-- Script to load data from `examples_data.py` into PostgreSQL
-- Handles insert/update logic
+### `app/config/database.py`
+- Manages two separate database connections:
+  - `sync_engine`: Read-only connection (for health, chat endpoints)
+  - `sync_engine_update`: Update connection (for embedding generation)
+- Connection pooling and SSL support
+
+### `app/config/settings.py`
+- Centralized environment variable loading using Pydantic Settings
+- Validates database and LLM configuration
+- Supports fallback values for backward compatibility
+
+### `scripts/load_examples_data.py`
+- Script to load data from `scripts/examples_data.py` into PostgreSQL
+- Handles insert/update logic using update database connection
 - Does not generate embeddings
 
-### `examples_data.py`
+### `scripts/examples_data.py`
 - All example queries (reference only)
 - Business rules and schema descriptions
 - Metadata for better retrieval
@@ -484,8 +554,9 @@ AND table_name IN ('ai_vector_examples', 'ai_vector_extra_prompts');
 
 - Verify `.env` file has correct credentials
 - Check PostgreSQL server is running
-- Test connection: `python -c "from db import sync_engine; print('OK')"`
+- Test connection: `python -c "from app.config.database import sync_engine; print('OK')"`
 - Ensure pgvector extension is installed
+- Verify both `USER`/`PASSWORD` and `UPDATE_USER`/`UPDATE_PASSWORD` are set correctly
 
 ### Embedding Generation Errors
 
@@ -516,17 +587,17 @@ AND table_name IN ('ai_vector_examples', 'ai_vector_extra_prompts');
    pip install -r requirements.txt
    ```
 
-4. **Configure `.env` file**
+4. **Configure `.env` file** (include `UPDATE_USER` and `UPDATE_PASSWORD` for security)
 
 5. **Load data into PostgreSQL**
    ```bash
-   python load_examples_data.py
+   python scripts/load_examples_data.py
    ```
 
 6. **Generate embeddings**
    ```bash
    # Start the application first
-   uvicorn main:app --host 0.0.0.0 --port 3009
+   python run.py
    
    # Then generate embeddings (in another terminal)
    curl -X POST http://localhost:3009/generate-embeddings-examples -H "Content-Type: application/json" -d '{}'
@@ -537,8 +608,8 @@ AND table_name IN ('ai_vector_examples', 'ai_vector_extra_prompts');
 
 ### Updating Data
 
-1. **Update `examples_data.py`** with new examples
-2. **Reload data**: `python load_examples_data.py`
+1. **Update `scripts/examples_data.py`** with new examples
+2. **Reload data**: `python scripts/load_examples_data.py`
 3. **Regenerate embeddings** for new/updated records:
    ```bash
    # For all NULL embeddings

@@ -1,5 +1,5 @@
 """
-LLM Model Wrapper Module
+LLM Service Module
 
 This module provides a unified interface for interacting with OpenAI and Groq LLMs.
 Supports switching between providers via LLM_PROVIDER environment variable.
@@ -7,8 +7,7 @@ Supports switching between providers via LLM_PROVIDER environment variable.
 
 from langchain_openai import ChatOpenAI
 from langchain_core.language_models import BaseChatModel
-from dotenv import load_dotenv
-import os
+from app.config.settings import settings
 
 # Optional Groq import - only needed if LLM_PROVIDER=GROQ
 try:
@@ -18,24 +17,21 @@ except ImportError:
     GROQ_AVAILABLE = False
     ChatGroq = None
 
-# Load environment variables
-load_dotenv()
 
-
-class LLMModel:
+class LLMService:
     """
-    Wrapper class for Large Language Model interactions.
+    Service class for Large Language Model interactions.
     Supports both OpenAI and Groq providers.
     """
     
     def __init__(self):
-        """Initialize the LLM model wrapper."""
-        self.provider = os.environ.get('LLM_PROVIDER', 'OPENAI').upper()
+        """Initialize the LLM service."""
+        self.provider = settings.llm_provider
         print(f"🔧 LLM Provider: {self.provider}")
     
     def get_provider(self) -> str:
         """
-        Get the active LLM provider from environment variable.
+        Get the active LLM provider from settings.
         
         Returns:
             str: 'OPENAI' or 'GROQ' (default: 'OPENAI')
@@ -48,7 +44,7 @@ class LLMModel:
         model: str = None
     ) -> BaseChatModel:
         """
-        Get LLM instance based on LLM_PROVIDER environment variable.
+        Get LLM instance based on LLM_PROVIDER setting.
         
         Args:
             temperature (float): Controls randomness in responses. Default: 0
@@ -94,7 +90,7 @@ class LLMModel:
         Returns:
             ChatOpenAI: Configured OpenAI LLM instance
         """
-        api_key = os.environ.get('API_KEY') or os.environ.get('OPENAI_API_KEY')
+        api_key = settings.openai_api_key
         if not api_key:
             raise ValueError(
                 "OpenAI API key not found. "
@@ -121,7 +117,7 @@ class LLMModel:
         Returns:
             ChatGroq: Configured Groq LLM instance
         """
-        api_key = os.environ.get('GROQ_API_KEY')
+        api_key = settings.groq_api_key
         if not api_key:
             raise ValueError(
                 "Groq API key not found. "

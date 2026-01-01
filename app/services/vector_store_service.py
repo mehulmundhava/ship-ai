@@ -1,32 +1,23 @@
 """
-PostgreSQL Vector Store Manager
+PostgreSQL Vector Store Service
 
 This module handles PostgreSQL vector store initialization and management.
 It uses pgvector extension for semantic search on example queries and extra prompt data.
 Uses Hugging Face embeddings instead of OpenAI for cost efficiency.
 """
 
-import os
 import json
-from typing import List, Dict, Optional
+from typing import List
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.schema import Document
-from dotenv import load_dotenv
 from sqlalchemy import text
-from db import sync_engine
-
-# Load environment variables
-load_dotenv()
-
-# Hugging Face model for embeddings (sentence-transformers model)
-# Using a good general-purpose model for semantic search
-# This model produces 384-dimensional vectors (matching the VECTOR(384) in PostgreSQL)
-EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+from app.config.database import sync_engine
+from app.config.settings import settings
 
 
-class VectorStoreManager:
+class VectorStoreService:
     """
-    Manages PostgreSQL vector stores for examples and extra prompt data.
+    Service for managing PostgreSQL vector stores for examples and extra prompt data.
     Uses Hugging Face embeddings and pgvector for semantic search.
     """
     
@@ -36,9 +27,9 @@ class VectorStoreManager:
         
         Args:
             model_name: Hugging Face model name for embeddings.
-                       Default: "sentence-transformers/all-MiniLM-L6-v2"
+                       Default: from settings
         """
-        model_name = model_name or EMBEDDING_MODEL_NAME
+        model_name = model_name or settings.embedding_model_name
         print(f"🔧 Initializing Hugging Face embeddings with model: {model_name}")
         
         # Initialize Hugging Face embeddings
@@ -325,3 +316,4 @@ class VectorStoreManager:
                 "status": "error",
                 "message": error_msg
             }
+

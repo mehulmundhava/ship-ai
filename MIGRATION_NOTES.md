@@ -26,7 +26,7 @@ This document explains the key changes and improvements in the new `ship-RAG-ai`
 - High token consumption
 
 **After (ship-RAG-ai):**
-- Examples stored in FAISS vector store
+- Examples stored in PostgreSQL pgvector (not FAISS)
 - Retrieved only when needed via semantic search
 - Base prompt reduced from ~20k to ~5k characters
 - Significant token savings
@@ -44,26 +44,68 @@ This document explains the key changes and improvements in the new `ship-RAG-ai`
 
 ## File Structure Changes
 
-### New Files
+### New Organized Structure
 
-- `agent_graph.py` - LangGraph state machine implementation
-- `agent_tools.py` - Tool definitions (FAISS + PostgreSQL)
-- `vector_store.py` - FAISS vector store management
-- `examples_data.py` - All examples and business rules (moved from prompt)
-- `prompts.py` - Concise system prompts (examples removed)
+The project has been restructured into a proper layered architecture:
+
+```
+app/
+├── api/routes/          # API route definitions
+├── controllers/         # Business logic controllers
+├── config/              # Configuration (settings, database)
+├── core/agent/          # LangGraph agent implementation
+├── models/              # Pydantic request/response models
+├── services/            # Business services (LLM, vector store)
+├── helpers/             # Helper utilities
+└── utils/               # Utility functions (logging)
+```
+
+### Key Files
+
+**Core Agent Logic:**
+- `app/core/agent/agent_graph.py` - LangGraph state machine implementation
+- `app/core/agent/agent_tools.py` - Tool definitions (PostgreSQL pgvector + PostgreSQL)
+- `app/core/prompts.py` - Concise system prompts (examples removed)
+
+**Services:**
+- `app/services/vector_store_service.py` - PostgreSQL pgvector store management
+- `app/services/llm_service.py` - LLM model wrapper (renamed from `llm_model.py`)
+
+**Configuration:**
+- `app/config/settings.py` - Centralized environment variable loading (Pydantic Settings)
+- `app/config/database.py` - Dual database connection management (read-only + update)
+
+**Controllers:**
+- `app/controllers/chat_controller.py` - Chat endpoint business logic
+- `app/controllers/embeddings_controller.py` - Embedding generation logic
+- `app/controllers/health_controller.py` - Health check logic
+
+**Data Models:**
+- `app/models/schemas.py` - Pydantic request/response models (renamed from `models.py`)
+
+**Scripts:**
+- `scripts/examples_data.py` - All examples and business rules (moved from root)
+- `scripts/load_examples_data.py` - Script to load data into PostgreSQL (moved from root)
 
 ### Removed/Replaced
 
-- `lc_sql_agent.py` → Replaced by `agent_graph.py`
-- `custom_toolkit.py` → Replaced by `agent_tools.py`
-- Long prompt in `lc_sql_agent.py` → Split into `prompts.py` + `examples_data.py`
+- `lc_sql_agent.py` → Replaced by `app/core/agent/agent_graph.py`
+- `custom_toolkit.py` → Replaced by `app/core/agent/agent_tools.py`
+- `db.py` → Replaced by `app/config/database.py` (with dual connection support)
+- `llm_model.py` → Renamed to `app/services/llm_service.py`
+- `models.py` → Renamed to `app/models/schemas.py`
+- `vector_store.py` → Renamed to `app/services/vector_store_service.py`
+- `main.py` → Moved to `app/main.py` (now only handles app initialization)
+- `prompts.py` → Moved to `app/core/prompts.py`
+- `examples_data.py` → Moved to `scripts/examples_data.py`
+- `load_examples_data.py` → Moved to `scripts/load_examples_data.py`
 
-### Unchanged
+### New Features
 
-- `db.py` - PostgreSQL connection (same logic)
-- `llm_model.py` - LLM wrapper (simplified)
-- `models.py` - Pydantic models (same)
-- `main.py` - FastAPI app (updated to use new agent)
+- **Dual Database Connections**: Separate read-only and update connections for security
+- **Organized Architecture**: Proper separation of concerns (routes, controllers, services)
+- **Centralized Configuration**: Pydantic Settings for environment variable management
+- **Structured Logging**: Logger utility in `app/utils/logger.py`
 
 ## Data Flow Comparison
 
@@ -91,17 +133,19 @@ LCSQLAgent (LangChain)
 ```
 User Question
   ↓
-FastAPI
+FastAPI (/chat endpoint)
+  ↓
+Chat Controller
   ↓
 SQLAgentGraph (LangGraph)
   ↓
 [Conditional Sequence]
   1. LLM call with concise prompt (5k chars)
   2. Decision: Need examples?
-     ├─ Yes → Tool: get_few_shot_examples (FAISS)
+     ├─ Yes → Tool: get_few_shot_examples (PostgreSQL pgvector)
      └─ No → Skip
   3. LLM call with examples (if retrieved)
-  4. Tool: execute_db_query (PostgreSQL)
+  4. Tool: execute_db_query (PostgreSQL - read-only connection)
   5. LLM call → Final answer
 ```
 
@@ -130,15 +174,18 @@ SQLAgentGraph (LangGraph)
 
 ### Environment Variables
 
-Same as original:
-- `HOST`, `DATABASE`, `USER`, `PASSWORD`, `SSL_MODE`
-- `API_KEY` (OpenAI)
+**Required:**
+- `HOST`, `DATABASE`, `USER`, `PASSWORD`, `SSL_MODE` - Database configuration (read-only user)
+- `API_KEY` or `OPENAI_API_KEY` (OpenAI) OR `GROQ_API_KEY` (Groq)
 
-### New Behavior
+**Optional but Recommended:**
+- `UPDATE_USER`, `UPDATE_PASSWORD` - Database user with update permissions (for embedding generation)
 
-- FAISS indexes created automatically on first run
-- Indexes stored in `./faiss_index/` directory
-- Subsequent runs load existing indexes (no re-creation)
+**New Behavior:**
+- PostgreSQL pgvector extension required (not FAISS)
+- Vector embeddings stored directly in PostgreSQL tables
+- Dual database connections: read-only for queries, update for embedding generation
+- Centralized configuration using Pydantic Settings
 
 ## API Compatibility
 
@@ -168,13 +215,14 @@ Response format is identical, so existing clients work without changes.
 
 3. **Start application:**
    ```bash
-   uvicorn main:app --host 0.0.0.0 --port 3009
+   python run.py
+   # Or: uvicorn app.main:app --host 0.0.0.0 --port 3009 --reload
    ```
 
 4. **First run:**
-   - Creates FAISS indexes automatically
-   - Takes a few seconds longer on first startup
-   - Subsequent runs are faster
+   - Load data: `python scripts/load_examples_data.py`
+   - Generate embeddings via API endpoints
+   - Application uses PostgreSQL pgvector (no local index files)
 
 ## Testing
 
@@ -200,9 +248,26 @@ curl -X POST "http://localhost:3009/chat" \
 
 ## Known Limitations
 
-1. **First Run**: Takes longer to create FAISS indexes
-2. **FAISS Storage**: Requires disk space for indexes (~few MB)
+1. **PostgreSQL pgvector Required**: Must have pgvector extension installed
+2. **Dual Database Users**: Recommended to set up separate read-only and update users
 3. **LangGraph Learning Curve**: Different from LangChain patterns
+4. **Embedding Generation**: Must be done via API endpoints after loading data
+
+## Security Improvements
+
+### Dual Database Connections
+
+The application now uses two separate database connections:
+
+1. **Read-Only Connection** (`USER`/`PASSWORD`):
+   - Used for: Health checks, Chat endpoints (query execution)
+   - Prevents accidental data modification
+
+2. **Update Connection** (`UPDATE_USER`/`UPDATE_PASSWORD`):
+   - Used for: Embedding generation routes (UPDATE operations)
+   - Allows controlled write access only where needed
+
+This follows the **Principle of Least Privilege** - regular endpoints only have read access, reducing the attack surface.
 
 ## Future Improvements
 
@@ -211,4 +276,5 @@ curl -X POST "http://localhost:3009/chat" \
 - Add more sophisticated example retrieval logic
 - Support for multiple vector stores (different example categories)
 - Add metrics/monitoring for token usage
+- Enhanced logging and monitoring
 

@@ -11,8 +11,8 @@ to generate embeddings after loading the data.
 
 import json
 from sqlalchemy import text
-from db import sync_engine
-from examples_data import SAMPLE_EXAMPLES, EXTRA_PROMPT_DATA
+from app.config.database import sync_engine_update
+from scripts.examples_data import SAMPLE_EXAMPLES, EXTRA_PROMPT_DATA
 
 
 def load_examples_data():
@@ -22,7 +22,8 @@ def load_examples_data():
     print(f"{'='*80}")
     
     try:
-        with sync_engine.connect() as conn:
+        # Use update engine for INSERT/UPDATE operations
+        with sync_engine_update.connect() as conn:
             inserted_count = 0
             updated_count = 0
             
@@ -104,7 +105,8 @@ def load_extra_prompts_data():
     print(f"{'='*80}")
     
     try:
-        with sync_engine.connect() as conn:
+        # Use update engine for INSERT/UPDATE operations
+        with sync_engine_update.connect() as conn:
             inserted_count = 0
             updated_count = 0
             

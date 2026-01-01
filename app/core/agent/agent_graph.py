@@ -12,9 +12,9 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_community.utilities.sql_database import SQLDatabase
-from agent_tools import create_get_few_shot_examples_tool, create_execute_db_query_tool
-from prompts import get_system_prompt
-from vector_store import VectorStoreManager
+from app.core.agent.agent_tools import create_get_few_shot_examples_tool, create_execute_db_query_tool
+from app.core.prompts import get_system_prompt
+from app.services.vector_store_service import VectorStoreService
 
 
 def log_message_sequence(messages: List, step_name: str):
@@ -67,7 +67,7 @@ class SQLAgentGraph:
         self,
         llm: BaseChatModel,
         db: SQLDatabase,
-        vector_store_manager: VectorStoreManager,
+        vector_store_manager: VectorStoreService,
         user_id: Optional[str] = None,
         top_k: int = 20
     ):
@@ -77,7 +77,7 @@ class SQLAgentGraph:
         Args:
             llm: Language model instance (OpenAI, Groq, or any BaseChatModel)
             db: SQLDatabase instance
-            vector_store_manager: VectorStoreManager instance
+            vector_store_manager: VectorStoreService instance
             user_id: User ID for access control
             top_k: Maximum number of results
         """

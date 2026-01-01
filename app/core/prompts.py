@@ -56,24 +56,6 @@ Key points to remember:
 ==========================================================================
 """
 
-# def get_system_prompt(user_id: str = None, top_k: int = 20) -> str:
-#     """
-#     Get the complete system prompt with security instructions.
-    
-#     Args:
-#         user_id: User ID for access control
-#         top_k: Maximum number of results to return
-        
-#     Returns:
-#         Complete system prompt string
-#     """
-#     prompt = CONCISE_SQL_PREFIX.format(top_k=top_k)
-    
-#     if user_id and str(user_id).lower() != "admin":
-#         prompt += "\n" + STRICT_INSTRUCTION.format(user_id=user_id)
-    
-#     return prompt
-
 
 def get_system_prompt(
     user_id: str, 
@@ -89,7 +71,7 @@ def get_system_prompt(
         user_id: User ID for access control
         top_k: Maximum number of results to return
         question: User's question (for retrieving relevant examples)
-        vector_store_manager: VectorStoreManager instance for retrieving examples
+        vector_store_manager: VectorStoreService instance for retrieving examples
         preload_examples: Whether to pre-load 1-2 examples in the prompt
         
     Returns:
