@@ -48,7 +48,7 @@ def load_examples_data():
                         UPDATE ai_vector_examples
                         SET 
                             sql_query = :sql_query,
-                            metadata = :metadata::jsonb
+                            metadata = CAST(:metadata AS jsonb)
                         WHERE id = :id
                     """)
                     conn.execute(update_query, {
@@ -63,7 +63,7 @@ def load_examples_data():
                     # Insert new record
                     insert_query = text("""
                         INSERT INTO ai_vector_examples (question, sql_query, metadata)
-                        VALUES (:question, :sql_query, :metadata::jsonb)
+                        VALUES (:question, :sql_query, CAST(:metadata AS jsonb))
                     """)
                     conn.execute(insert_query, {
                         "question": question,
@@ -130,7 +130,7 @@ def load_extra_prompts_data():
                         UPDATE ai_vector_extra_prompts
                         SET 
                             note_type = :note_type,
-                            metadata = :metadata::jsonb
+                            metadata = CAST(:metadata AS jsonb)
                         WHERE id = :id
                     """)
                     conn.execute(update_query, {
@@ -145,7 +145,7 @@ def load_extra_prompts_data():
                     # Insert new record
                     insert_query = text("""
                         INSERT INTO ai_vector_extra_prompts (content, note_type, metadata)
-                        VALUES (:content, :note_type, :metadata::jsonb)
+                        VALUES (:content, :note_type, CAST(:metadata AS jsonb))
                     """)
                     conn.execute(insert_query, {
                         "content": content,

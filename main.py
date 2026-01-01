@@ -418,7 +418,7 @@ def generate_embeddings_examples(request: Request, payload: GenerateEmbeddingsRe
                     # Update the record
                     update_query = text("""
                         UPDATE ai_vector_examples
-                        SET minilm_embedding = :embedding::vector
+                        SET minilm_embedding = CAST(:embedding AS vector)
                         WHERE id = :id
                     """)
                     conn.execute(update_query, {
@@ -545,7 +545,7 @@ def generate_embeddings_extra_prompts(request: Request, payload: GenerateEmbeddi
                     # Update the record
                     update_query = text("""
                         UPDATE ai_vector_extra_prompts
-                        SET minilm_embedding = :embedding::vector
+                        SET minilm_embedding = CAST(:embedding AS vector)
                         WHERE id = :id
                     """)
                     conn.execute(update_query, {
