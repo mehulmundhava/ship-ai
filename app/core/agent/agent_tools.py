@@ -326,12 +326,16 @@ def create_get_table_list_tool(db: SQLDatabase, table_metadata: Optional[List[Di
     @tool
     def get_table_list() -> str:
         """
+        FALLBACK TOOL ONLY - Use this ONLY if you have already tried to generate a query from the examples provided in the system prompt and failed.
+        
+        Do NOT call this tool if you can generate a query from the examples. This is a LAST RESORT tool.
+        
         Get a list of all available tables with their descriptions (uses) and important fields.
         
-        Use this tool when:
-        - You cannot generate a query from the examples provided
-        - You need to discover what tables are available in the database
-        - You need to understand the purpose of each table and which fields are important
+        Use this tool ONLY when:
+        - You have already tried to generate a query using the examples in the system prompt
+        - You have already tried using get_few_shot_examples to get more examples
+        - You STILL cannot generate a query and need to discover what tables are available
         
         This tool returns all configured tables with:
         - Table names
@@ -409,10 +413,18 @@ def create_get_table_structure_tool(db: SQLDatabase):
     @tool
     def get_table_structure(table_names: str) -> str:
         """
+        FALLBACK TOOL ONLY - Use this ONLY after you have:
+        1. Tried to generate a query from examples in the system prompt
+        2. Tried using get_few_shot_examples to get more examples
+        3. Used get_table_list to discover tables
+        4. STILL need detailed column information to construct a query
+        
+        Do NOT call this tool if you can generate a query from the examples. This is a LAST RESORT tool.
+        
         Get the full column structure for specified tables.
         
-        Use this tool when:
-        - You have identified which tables you need from get_table_list
+        Use this tool ONLY when:
+        - You have already used get_table_list and identified which tables you need
         - You need detailed column information (names and data types) to construct a query
         - The examples provided don't contain enough schema information
         

@@ -31,14 +31,17 @@ Never query for all the columns from a specific table, only ask for the relevant
 You have access to tools for interacting with the database:
 1. get_few_shot_examples - Retrieve similar example queries from the knowledge base
 2. execute_db_query - Execute SQL queries against PostgreSQL database
-3. get_table_list - Get list of all tables with descriptions and important fields (use when examples don't help)
-4. get_table_structure - Get full column structure for specific tables (use after get_table_list if needed)
+3. get_table_list - FALLBACK ONLY: Get list of tables (ONLY if you cannot generate query from examples)
+4. get_table_structure - FALLBACK ONLY: Get table column structure (ONLY after get_table_list if still needed)
 
-IMPORTANT: Tool usage strategy:
-- First, try to generate a query using the examples provided or use get_few_shot_examples to retrieve relevant examples
-- If you cannot generate a query from examples, use get_table_list to discover available tables
-- If you need detailed column information, use get_table_structure with table names from get_table_list
-- Finally, use execute_db_query to run your generated SQL
+CRITICAL Tool Usage Strategy (MUST FOLLOW THIS ORDER):
+1. FIRST: Try to generate a SQL query using the examples provided in the system prompt
+2. If you cannot generate a query from those examples, use get_few_shot_examples to get more examples
+3. If you STILL cannot generate a query after getting more examples, ONLY THEN use get_table_list
+4. If you need column details after get_table_list, use get_table_structure
+5. Finally, use execute_db_query to run your generated SQL
+
+IMPORTANT: Do NOT call get_table_list or get_table_structure unless you have already tried to generate a query from the examples and failed. These are LAST RESORT fallback tools only.
 
 You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
@@ -106,15 +109,17 @@ def get_system_prompt(
             Available tools:
             1. get_few_shot_examples — use ONLY if you need additional examples beyond what's provided below
             2. execute_db_query — execute SQL queries against the database
-            3. get_table_list — get list of all tables with descriptions and important fields (use when examples don't help)
-            4. get_table_structure — get full column structure for specific tables (use after get_table_list if needed)
+            3. get_table_list — FALLBACK ONLY: get list of tables (ONLY use if you absolutely cannot generate a query from examples)
+            4. get_table_structure — FALLBACK ONLY: get table column structure (ONLY use after get_table_list if still needed)
 
-            Tool Usage Strategy:
-            - First, try to generate a query using the examples provided below
-            - If that fails, use get_few_shot_examples to retrieve more examples
-            - If you still cannot generate a query, use get_table_list to discover available tables
-            - If you need detailed column information, use get_table_structure with the table names from get_table_list
-            - Finally, use execute_db_query to execute your generated SQL
+            CRITICAL Tool Usage Strategy (MUST FOLLOW THIS ORDER):
+            1. FIRST: Try to generate a SQL query using the examples provided below in this prompt
+            2. If you cannot generate a query from the examples below, use get_few_shot_examples to get more examples
+            3. If you STILL cannot generate a query after getting more examples, ONLY THEN use get_table_list
+            4. If you need column details after get_table_list, use get_table_structure
+            5. Finally, use execute_db_query to execute your generated SQL
+            
+            IMPORTANT: Do NOT call get_table_list or get_table_structure unless you have already tried to generate a query from the examples and failed. These are LAST RESORT tools only.
 
             - Validate SQL before execution.
             - Retry once if execution fails.

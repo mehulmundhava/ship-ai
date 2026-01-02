@@ -666,7 +666,7 @@ class SQLAgentGraph:
         print(f"   Last message type: {type(last_message).__name__ if last_message else 'None'}")
         
         # Safety check: prevent infinite loops
-        if iteration_count >= 3:
+        if iteration_count >= 5:
             print(f"⚠️  Max iterations reached ({iteration_count}), forcing end")
             return "end"
         
