@@ -507,7 +507,23 @@ class SQLAgentGraph:
                         "content_preview": msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
                     })
             
-            response = self.llm_with_tools.invoke(messages)
+            try:
+                response = self.llm_with_tools.invoke(messages)
+            except Exception as e:
+                error_str = str(e)
+                # Check if it's a Groq tool call format error
+                if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
+                    print(f"⚠️  Groq API tool call error detected. Attempting to continue without tools...")
+                    # Try invoking without tools to get a text response
+                    try:
+                        response = self.llm.invoke(messages)
+                        print(f"✅ Got text response from LLM (no tools)")
+                    except Exception as e2:
+                        print(f"❌ Error even without tools: {e2}")
+                        raise e
+                else:
+                    raise e
+            
             messages.append(response)
             
             # Track token usage

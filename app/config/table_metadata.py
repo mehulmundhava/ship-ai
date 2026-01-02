@@ -21,24 +21,23 @@ Each entry should be a dictionary with:
 # Add your table information here
 TABLE_METADATA = [
     # Example entries - replace with your actual table information:
-    # {
-    #     "name": "devices",
-    #     "description": "Stores device information including device IDs, status, and latest sensor readings",
-    #     "important_fields": [
-    #         "device_id (PRIMARY KEY)",
-    #         "latest_sensor_id (FOREIGN KEY -> sensors.id)",
-    #         "latest_incoming_message_id",
-    #         "status"
-    #     ]
-    # },
-    # {
-    #     "name": "user_device_assignment",
-    #     "description": "Maps users to their assigned devices for access control",
-    #     "important_fields": [
-    #         "user_id (PRIMARY KEY)",
-    #         "device (FOREIGN KEY -> devices.device_id)",
-    #         "assigned_at"
-    #     ]
-    # },
+    {
+        "name": "device_details_table",
+        "description": "Stores device information including device IDs, status, and latest sensor readings",
+        "important_fields": [
+            "device_id (PRIMARY KEY)",
+            "latest_sensor_id (FOREIGN KEY -> sensors.id)",
+            "latest_incoming_message_id",
+            "status"
+        ]
+    },
+    {
+        "name": "user_device_assignment",
+        "description": "Maps users to their assigned devices for access control",
+        "important_fields": [
+            "user_id (PRIMARY KEY)",
+            "device_id (FOREIGN KEY -> device_details_table.device_id)",
+        ]
+    },
 ]
 

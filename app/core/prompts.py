@@ -28,20 +28,23 @@ Unless the user specifies a specific number of examples they wish to obtain, alw
 You can order the results by a relevant column to return the most interesting examples in the database.
 Never query for all the columns from a specific table, only ask for the relevant columns given the question.
 
+CRITICAL: Your FIRST action should be to GENERATE A SQL QUERY using the examples provided in the system prompt.
+Do NOT call any tools until you have attempted to generate a SQL query from the examples.
+
 You have access to tools for interacting with the database:
-1. get_few_shot_examples - Retrieve similar example queries from the knowledge base
-2. execute_db_query - Execute SQL queries against PostgreSQL database
-3. get_table_list - FALLBACK ONLY: Get list of tables (ONLY if you cannot generate query from examples)
-4. get_table_structure - FALLBACK ONLY: Get table column structure (ONLY after get_table_list if still needed)
+1. execute_db_query - Execute SQL queries against PostgreSQL database (use AFTER you generate a query)
+2. get_few_shot_examples - Retrieve more examples (use ONLY if you cannot generate query from examples below)
+3. get_table_list - LAST RESORT: Get list of tables (ONLY if you have tried generating query and failed)
+4. get_table_structure - LAST RESORT: Get table column structure (ONLY after get_table_list if needed)
 
-CRITICAL Tool Usage Strategy (MUST FOLLOW THIS ORDER):
-1. FIRST: Try to generate a SQL query using the examples provided in the system prompt
-2. If you cannot generate a query from those examples, use get_few_shot_examples to get more examples
-3. If you STILL cannot generate a query after getting more examples, ONLY THEN use get_table_list
-4. If you need column details after get_table_list, use get_table_structure
-5. Finally, use execute_db_query to run your generated SQL
+MANDATORY Tool Usage Order:
+STEP 1: Look at the examples provided in the system prompt. Generate a SQL query based on those examples.
+STEP 2: If you generated a query, call execute_db_query immediately. Do NOT call other tools.
+STEP 3: Only if you cannot generate a query from the examples, call get_few_shot_examples.
+STEP 4: Only if you STILL cannot generate a query, use get_table_list.
+STEP 5: Only if you need column details, use get_table_structure.
 
-IMPORTANT: Do NOT call get_table_list or get_table_structure unless you have already tried to generate a query from the examples and failed. These are LAST RESORT fallback tools only.
+REMEMBER: Default action = Generate SQL from examples → execute_db_query. Do NOT call other tools unless you have tried and failed to generate a query.
 
 You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
@@ -106,20 +109,24 @@ def get_system_prompt(
             - If asked about schema or internals, respond ONLY with:
             "Sorry, I cannot provide that information."
 
-            Available tools:
-            1. get_few_shot_examples — use ONLY if you need additional examples beyond what's provided below
-            2. execute_db_query — execute SQL queries against the database
-            3. get_table_list — FALLBACK ONLY: get list of tables (ONLY use if you absolutely cannot generate a query from examples)
-            4. get_table_structure — FALLBACK ONLY: get table column structure (ONLY use after get_table_list if still needed)
-
-            CRITICAL Tool Usage Strategy (MUST FOLLOW THIS ORDER):
-            1. FIRST: Try to generate a SQL query using the examples provided below in this prompt
-            2. If you cannot generate a query from the examples below, use get_few_shot_examples to get more examples
-            3. If you STILL cannot generate a query after getting more examples, ONLY THEN use get_table_list
-            4. If you need column details after get_table_list, use get_table_structure
-            5. Finally, use execute_db_query to execute your generated SQL
+            CRITICAL: Your FIRST action should be to GENERATE A SQL QUERY using the examples provided below.
+            Do NOT call any tools until you have attempted to generate a SQL query from the examples.
             
-            IMPORTANT: Do NOT call get_table_list or get_table_structure unless you have already tried to generate a query from the examples and failed. These are LAST RESORT tools only.
+            Available tools (use ONLY when needed):
+            1. execute_db_query — execute SQL queries against the database (use AFTER you have generated a query)
+            2. get_few_shot_examples — use ONLY if you cannot generate a query from the examples below and need more examples
+            3. get_table_list — LAST RESORT: use ONLY if you have tried generating a query from examples and failed
+            4. get_table_structure — LAST RESORT: use ONLY after get_table_list if you still need column details
+
+            MANDATORY Tool Usage Order:
+            STEP 1: Look at the examples provided below in this system prompt. Try to generate a SQL query based on those examples.
+            STEP 2: If you successfully generated a query, call execute_db_query immediately. Do NOT call any other tools.
+            STEP 3: Only if you cannot generate a query from the examples below, call get_few_shot_examples to get more examples.
+            STEP 4: Only if you STILL cannot generate a query after get_few_shot_examples, use get_table_list.
+            STEP 5: Only if you need column details after get_table_list, use get_table_structure.
+            
+            REMEMBER: Your default action should be to GENERATE A SQL QUERY from the examples below, then call execute_db_query. 
+            Do NOT call get_few_shot_examples, get_table_list, or get_table_structure unless you have already tried and failed to generate a query.
 
             - Validate SQL before execution.
             - Retry once if execution fails.
