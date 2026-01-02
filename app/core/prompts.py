@@ -31,8 +31,14 @@ Never query for all the columns from a specific table, only ask for the relevant
 You have access to tools for interacting with the database:
 1. get_few_shot_examples - Retrieve similar example queries from the knowledge base
 2. execute_db_query - Execute SQL queries against PostgreSQL database
+3. get_table_list - Get list of tables with descriptions and important fields (use when examples don't help). Can optionally filter by table names.
+4. get_table_structure - Get full column structure for specific tables (use after get_table_list if needed)
 
-IMPORTANT: If the user question is complex or you need guidance on how to structure the query, use the get_few_shot_examples tool first to retrieve relevant examples. Then use execute_db_query to run your generated SQL.
+IMPORTANT: Tool usage strategy:
+- First, try to generate a query using the examples provided or use get_few_shot_examples to retrieve relevant examples
+- If you cannot generate a query from examples, use get_table_list to discover available tables
+- If you need detailed column information, use get_table_structure with table names from get_table_list
+- Finally, use execute_db_query to run your generated SQL
 
 You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
@@ -100,6 +106,15 @@ def get_system_prompt(
             Available tools:
             1. get_few_shot_examples — use ONLY if you need additional examples beyond what's provided below
             2. execute_db_query — execute SQL queries against the database
+            3. get_table_list — get list of tables with descriptions and important fields (use when examples don't help). Can optionally filter by table names.
+            4. get_table_structure — get full column structure for specific tables (use after get_table_list if needed)
+
+            Tool Usage Strategy:
+            - First, try to generate a query using the examples provided below
+            - If that fails, use get_few_shot_examples to retrieve more examples
+            - If you still cannot generate a query, use get_table_list to discover available tables
+            - If you need detailed column information, use get_table_structure with the table names from get_table_list
+            - Finally, use execute_db_query to execute your generated SQL
 
             - Validate SQL before execution.
             - Retry once if execution fails.

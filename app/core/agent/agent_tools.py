@@ -4,13 +4,17 @@ LangGraph Agent Tools
 This module defines tools that the agent can use:
 1. get_few_shot_examples - Retrieves similar examples from PostgreSQL vector store (pgvector)
 2. execute_db_query - Executes SQL queries against PostgreSQL
+3. get_table_list - Retrieves list of tables with descriptions and important fields
+4. get_table_structure - Retrieves full column structure for specified tables
 """
 
-from typing import Optional, Dict, Any, Sequence, Tuple
+from typing import Optional, Dict, Any, Sequence, Tuple, List
 import re
 from langchain_core.tools import tool
 from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy.engine import Result
+from sqlalchemy import text
+from app.config.table_metadata import TABLE_METADATA
 
 # List of sensitive tables that should not be queried directly for raw data
 RESTRICTED_TABLES = [
@@ -298,4 +302,254 @@ def create_execute_db_query_tool(db: SQLDatabase, vector_store_manager):
         return query_tool.execute(query)
     
     return execute_db_query
+
+
+def create_get_table_list_tool(db: SQLDatabase, table_metadata: Optional[List[Dict[str, Any]]] = None):
+    """
+    Create the get_table_list tool function.
+    
+    Args:
+        db: SQLDatabase instance (kept for compatibility, not used)
+        table_metadata: Optional list of table metadata dictionaries.
+                       If not provided, uses TABLE_METADATA from config.
+                       Each dict should have:
+                       - name: Table name
+                       - description: Table description/use case
+                       - important_fields: List of important field names
+    
+    Returns:
+        Tool function for retrieving table list with descriptions and important fields
+    """
+    # Use provided metadata or fall back to config
+    metadata = table_metadata if table_metadata is not None else TABLE_METADATA
+    
+    @tool
+    def get_table_list(table_names: Optional[str] = None) -> str:
+        """
+        Get a list of available tables with their descriptions (uses) and important fields.
+        
+        Use this tool when:
+        - You cannot generate a query from the examples provided
+        - You need to discover what tables are available in the database
+        - You need to understand the purpose of each table and which fields are important
+        
+        Args:
+            table_names: Optional comma-separated list of table names to filter.
+                        If not provided, returns all configured tables.
+                        Example: "users,devices" or "users"
+        
+        This tool returns:
+        - Table names
+        - Table descriptions/uses (manually configured)
+        - Important fields (manually configured)
+        
+        Returns:
+            A formatted string containing table information
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: get_table_list")
+        print(f"{'='*80}")
+        if table_names:
+            print(f"   Filter: {table_names}")
+        
+        try:
+            if not metadata:
+                error_msg = "No table metadata configured. Please configure TABLE_METADATA in app/config/table_metadata.py"
+                print(f"   ❌ {error_msg}")
+                print(f"{'='*80}\n")
+                return error_msg
+            
+            # Filter tables if table_names is provided
+            if table_names:
+                requested_tables = [t.strip().lower() for t in table_names.split(',') if t.strip()]
+                filtered_metadata = [
+                    table for table in metadata
+                    if table.get("name", "").lower() in requested_tables
+                ]
+                
+                if not filtered_metadata:
+                    error_msg = f"No matching tables found for: {table_names}"
+                    print(f"   ⚠️  {error_msg}")
+                    print(f"{'='*80}\n")
+                    return error_msg
+                
+                metadata_to_use = filtered_metadata
+            else:
+                metadata_to_use = metadata
+            
+            result_parts = []
+            result_parts.append("=== AVAILABLE TABLES ===\n")
+            
+            for table_info in metadata_to_use:
+                table_name = table_info.get("name", "")
+                description = table_info.get("description", "No description available")
+                important_fields = table_info.get("important_fields", [])
+                
+                if not table_name:
+                    continue
+                
+                result_parts.append(f"\nTable: {table_name}")
+                result_parts.append(f"Description: {description}")
+                
+                if important_fields:
+                    fields_str = ', '.join(important_fields) if isinstance(important_fields, list) else str(important_fields)
+                    result_parts.append(f"Important Fields: {fields_str}")
+                else:
+                    result_parts.append("Important Fields: (none specified)")
+            
+            result = "\n".join(result_parts)
+            result_preview = result[:500] + "..." if len(result) > 500 else result
+            print(f"   Result: {len(metadata_to_use)} table(s) found")
+            print(f"   Preview: {result_preview}")
+            print(f"{'='*80}\n")
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Error retrieving table list: {str(e)}"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            import traceback
+            traceback.print_exc()
+            return error_msg
+    
+    return get_table_list
+
+
+def create_get_table_structure_tool(db: SQLDatabase):
+    """
+    Create the get_table_structure tool function.
+    
+    Args:
+        db: SQLDatabase instance
+        
+    Returns:
+        Tool function for retrieving table structure
+    """
+    @tool
+    def get_table_structure(table_names: str) -> str:
+        """
+        Get the full column structure for specified tables.
+        
+        Use this tool when:
+        - You have identified which tables you need from get_table_list
+        - You need detailed column information (names and data types) to construct a query
+        - The examples provided don't contain enough schema information
+        
+        Args:
+            table_names: Comma-separated list of table names (e.g., "users,devices,facilities")
+                         or a single table name (e.g., "users")
+        
+        Returns:
+            A formatted string containing table name and all columns with their data types
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: get_table_structure")
+        print(f"{'='*80}")
+        print(f"   Input Table Names: {table_names}")
+        
+        try:
+            # Parse table names (handle comma-separated or single table)
+            table_list = [t.strip() for t in table_names.split(',') if t.strip()]
+            
+            if not table_list:
+                error_msg = "No table names provided. Please provide at least one table name."
+                print(f"   ❌ {error_msg}")
+                print(f"{'='*80}\n")
+                return error_msg
+            
+            # Get database connection
+            engine = db._engine
+            
+            result_parts = []
+            result_parts.append("=== TABLE STRUCTURES ===\n")
+            
+            with engine.connect() as conn:
+                for table_name in table_list:
+                    # Check if table exists
+                    check_query = text("""
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.tables
+                            WHERE table_schema = 'public'
+                            AND table_name = :table_name
+                        )
+                    """)
+                    exists_result = conn.execute(check_query, {"table_name": table_name})
+                    table_exists = exists_result.fetchone()[0]
+                    
+                    if not table_exists:
+                        result_parts.append(f"\nTable: {table_name}")
+                        result_parts.append("ERROR: Table does not exist\n")
+                        continue
+                    
+                    # Get all columns with their data types
+                    columns_query = text("""
+                        SELECT 
+                            column_name,
+                            data_type,
+                            character_maximum_length,
+                            is_nullable,
+                            column_default
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                        AND table_name = :table_name
+                        ORDER BY ordinal_position
+                    """)
+                    cols_result = conn.execute(columns_query, {"table_name": table_name})
+                    columns = cols_result.fetchall()
+                    
+                    if not columns:
+                        result_parts.append(f"\nTable: {table_name}")
+                        result_parts.append("No columns found\n")
+                        continue
+                    
+                    result_parts.append(f"\nTable: {table_name}")
+                    result_parts.append("Columns:")
+                    
+                    for col in columns:
+                        col_name = col[0]
+                        data_type = col[1]
+                        max_length = col[2]
+                        is_nullable = col[3]
+                        default_val = col[4]
+                        
+                        # Format data type with length if applicable
+                        if max_length:
+                            type_str = f"{data_type}({max_length})"
+                        else:
+                            type_str = data_type
+                        
+                        # Build column description
+                        col_desc = f"  - {col_name} ({type_str})"
+                        
+                        if is_nullable == 'NO':
+                            col_desc += " [NOT NULL]"
+                        
+                        if default_val:
+                            # Truncate long defaults
+                            default_str = str(default_val)
+                            if len(default_str) > 30:
+                                default_str = default_str[:30] + "..."
+                            col_desc += f" [DEFAULT: {default_str}]"
+                        
+                        result_parts.append(col_desc)
+            
+            result = "\n".join(result_parts)
+            result_preview = result[:500] + "..." if len(result) > 500 else result
+            print(f"   Result: Retrieved structure for {len(table_list)} table(s)")
+            print(f"   Preview: {result_preview}")
+            print(f"{'='*80}\n")
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Error retrieving table structure: {str(e)}"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            import traceback
+            traceback.print_exc()
+            return error_msg
+    
+    return get_table_structure
 

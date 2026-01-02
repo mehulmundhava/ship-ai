@@ -12,7 +12,12 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_community.utilities.sql_database import SQLDatabase
-from app.core.agent.agent_tools import create_get_few_shot_examples_tool, create_execute_db_query_tool
+from app.core.agent.agent_tools import (
+    create_get_few_shot_examples_tool, 
+    create_execute_db_query_tool,
+    create_get_table_list_tool,
+    create_get_table_structure_tool
+)
 from app.core.prompts import get_system_prompt
 from app.services.vector_store_service import VectorStoreService
 
@@ -90,9 +95,16 @@ class SQLAgentGraph:
         # Create tools
         self.get_examples_tool = create_get_few_shot_examples_tool(vector_store_manager)
         self.execute_db_query_tool = create_execute_db_query_tool(db, vector_store_manager)
+        self.get_table_list_tool = create_get_table_list_tool(db)
+        self.get_table_structure_tool = create_get_table_structure_tool(db)
         
         # Main tools for LLM (security guard is handled separately as direct LLM call)
-        self.tools = [self.get_examples_tool, self.execute_db_query_tool]
+        self.tools = [
+            self.get_examples_tool, 
+            self.execute_db_query_tool,
+            self.get_table_list_tool,
+            self.get_table_structure_tool
+        ]
         
         # Bind tools to LLM
         self.llm_with_tools = self.llm.bind_tools(self.tools)
