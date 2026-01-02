@@ -36,8 +36,14 @@ async def lifespan(app: FastAPI):
     
     # Initialize vector stores (PostgreSQL pgvector)
     app.state.vector_store = VectorStoreService()
-    app.state.vector_store.initialize_stores()
-    print("✅ Vector stores initialized")
+    try:
+        app.state.vector_store.initialize_stores()
+        print("✅ Vector stores initialized")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not initialize vector stores: {e}")
+        print("   The app will start, but vector search will fail until connection is available.")
+        import traceback
+        traceback.print_exc()
     
     # Initialize database connection (lazy - will connect on first use)
     # Note: SQLDatabase tries to connect during init, so we catch errors

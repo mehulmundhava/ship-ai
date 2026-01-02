@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     
     # Embedding Configuration
     EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
+    HUGGING_FACE_MODEL: Optional[str] = None
     
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -85,6 +86,10 @@ class Settings(BaseSettings):
         # Normalize LLM provider
         if self.LLM_PROVIDER:
             self.LLM_PROVIDER = self.LLM_PROVIDER.upper()
+        
+        # Use HUGGING_FACE_MODEL if provided, otherwise use EMBEDDING_MODEL_NAME
+        if not self.HUGGING_FACE_MODEL:
+            self.HUGGING_FACE_MODEL = self.EMBEDDING_MODEL_NAME
     
     # Properties for backward compatibility with db_* naming
     @property
@@ -125,7 +130,27 @@ class Settings(BaseSettings):
     
     @property
     def embedding_model_name(self) -> str:
-        return self.EMBEDDING_MODEL_NAME
+        """Get the embedding model name from HUGGING_FACE_MODEL or fallback to EMBEDDING_MODEL_NAME."""
+        return self.HUGGING_FACE_MODEL or self.EMBEDDING_MODEL_NAME
+    
+    def get_embedding_field_name(self) -> str:
+        """
+        Get the database field name for embeddings based on the model.
+        
+        Returns:
+            'minilm_embedding' for all-MiniLM-L6-v2 models
+            'bge_large_embedding' for BAAI/bge-large-en-v1.5 models
+            'minilm_embedding' as default fallback
+        """
+        model_name = self.embedding_model_name.lower()
+        
+        if "bge-large" in model_name or "bge_large" in model_name:
+            return "bge_large_embedding"
+        elif "minilm" in model_name:
+            return "minilm_embedding"
+        else:
+            # Default fallback
+            return "minilm_embedding"
     
     def validate_database_config(self):
         """Validate that all required database config is present."""

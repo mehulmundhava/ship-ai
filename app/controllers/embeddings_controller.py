@@ -5,9 +5,9 @@ Handles embedding generation endpoints for vector store tables.
 Uses update database connection for write operations.
 """
 
-import json
 from sqlalchemy import text
 from app.config.database import sync_engine_update
+from app.config.settings import settings
 from app.models.schemas import (
     GenerateEmbeddingsRequest,
     GenerateEmbeddingsResponse,
@@ -82,6 +82,10 @@ def generate_embeddings_examples(
         updated_ids = []
         errors = []
         
+        # Get the embedding field name based on the model
+        embedding_field = settings.get_embedding_field_name()
+        print(f"   Using embedding field: {embedding_field}")
+        
         # Use update engine for write operations
         with sync_engine_update.connect() as conn:
             if payload.id:
@@ -102,10 +106,10 @@ def generate_embeddings_examples(
                     )
             else:
                 # Process all records with NULL embeddings
-                query = text("""
+                query = text(f"""
                     SELECT id, question, sql_query, metadata
                     FROM ai_vector_examples
-                    WHERE minilm_embedding IS NULL
+                    WHERE {embedding_field} IS NULL
                 """)
                 result = conn.execute(query)
                 rows = result.fetchall()
@@ -124,38 +128,24 @@ def generate_embeddings_examples(
                 try:
                     record_id = row.id
                     
-                    # Extract keywords from metadata for embedding
-                    metadata = row.metadata if row.metadata else {}
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except (json.JSONDecodeError, TypeError):
-                            metadata = {}
-                    
-                    keywords = metadata.get('keywords', [])
-                    if not keywords or not isinstance(keywords, list) or len(keywords) == 0:
-                        # Skip records without keywords
-                        print(f"   ⚠️  Skipping ID {record_id}: No keywords found in metadata")
-                        continue
-                    
-                    # Join keywords with spaces to create embedding text
-                    embedding_text = ' '.join(str(kw) for kw in keywords if kw)
+                    # Use question field directly for embedding
+                    embedding_text = row.question if row.question else ""
                     
                     if not embedding_text.strip():
-                        # Skip if keywords are empty strings
-                        print(f"   ⚠️  Skipping ID {record_id}: Keywords are empty")
+                        # Skip if question is empty
+                        print(f"   ⚠️  Skipping ID {record_id}: Question is empty")
                         continue
                     
-                    # Generate embedding from keywords only
+                    # Generate embedding from question
                     embedding = vector_store.embed_query(embedding_text)
                     
                     # Convert to PostgreSQL array format string
                     embedding_str = '[' + ','.join(map(str, embedding)) + ']'
                     
-                    # Update the record
-                    update_query = text("""
+                    # Update the record using dynamic field name
+                    update_query = text(f"""
                         UPDATE ai_vector_examples
-                        SET minilm_embedding = CAST(:embedding AS vector)
+                        SET {embedding_field} = CAST(:embedding AS vector)
                         WHERE id = :id
                     """)
                     conn.execute(update_query, {
@@ -166,8 +156,8 @@ def generate_embeddings_examples(
                     
                     processed_count += 1
                     updated_ids.append(record_id)
-                    keywords_preview = ', '.join(str(kw) for kw in keywords[:5])
-                    print(f"   ✓ Processed ID {record_id}: Keywords: {keywords_preview}...")
+                    question_preview = embedding_text[:100] + "..." if len(embedding_text) > 100 else embedding_text
+                    print(f"   ✓ Processed ID {record_id}: Question: {question_preview}")
                     
                 except Exception as e:
                     error_msg = f"Error processing ID {row.id}: {str(e)}"
@@ -231,6 +221,10 @@ def generate_embeddings_extra_prompts(
         updated_ids = []
         errors = []
         
+        # Get the embedding field name based on the model
+        embedding_field = settings.get_embedding_field_name()
+        print(f"   Using embedding field: {embedding_field}")
+        
         # Use update engine for write operations
         with sync_engine_update.connect() as conn:
             if payload.id:
@@ -251,10 +245,10 @@ def generate_embeddings_extra_prompts(
                     )
             else:
                 # Process all records with NULL embeddings
-                query = text("""
+                query = text(f"""
                     SELECT id, content, metadata
                     FROM ai_vector_extra_prompts
-                    WHERE minilm_embedding IS NULL
+                    WHERE {embedding_field} IS NULL
                 """)
                 result = conn.execute(query)
                 rows = result.fetchall()
@@ -273,38 +267,24 @@ def generate_embeddings_extra_prompts(
                 try:
                     record_id = row.id
                     
-                    # Extract keywords from metadata for embedding
-                    metadata = row.metadata if row.metadata else {}
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except (json.JSONDecodeError, TypeError):
-                            metadata = {}
-                    
-                    keywords = metadata.get('keywords', [])
-                    if not keywords or not isinstance(keywords, list) or len(keywords) == 0:
-                        # Skip records without keywords
-                        print(f"   ⚠️  Skipping ID {record_id}: No keywords found in metadata")
-                        continue
-                    
-                    # Join keywords with spaces to create embedding text
-                    embedding_text = ' '.join(str(kw) for kw in keywords if kw)
+                    # Use content field directly for embedding
+                    embedding_text = row.content if row.content else ""
                     
                     if not embedding_text.strip():
-                        # Skip if keywords are empty strings
-                        print(f"   ⚠️  Skipping ID {record_id}: Keywords are empty")
+                        # Skip if content is empty
+                        print(f"   ⚠️  Skipping ID {record_id}: Content is empty")
                         continue
                     
-                    # Generate embedding from keywords only
+                    # Generate embedding from content
                     embedding = vector_store.embed_query(embedding_text)
                     
                     # Convert to PostgreSQL array format string
                     embedding_str = '[' + ','.join(map(str, embedding)) + ']'
                     
-                    # Update the record
-                    update_query = text("""
+                    # Update the record using dynamic field name
+                    update_query = text(f"""
                         UPDATE ai_vector_extra_prompts
-                        SET minilm_embedding = CAST(:embedding AS vector)
+                        SET {embedding_field} = CAST(:embedding AS vector)
                         WHERE id = :id
                     """)
                     conn.execute(update_query, {
@@ -315,8 +295,8 @@ def generate_embeddings_extra_prompts(
                     
                     processed_count += 1
                     updated_ids.append(record_id)
-                    keywords_preview = ', '.join(str(kw) for kw in keywords[:5])
-                    print(f"   ✓ Processed ID {record_id}: Keywords: {keywords_preview}...")
+                    content_preview = embedding_text[:100] + "..." if len(embedding_text) > 100 else embedding_text
+                    print(f"   ✓ Processed ID {record_id}: Content: {content_preview}")
                     
                 except Exception as e:
                     error_msg = f"Error processing ID {row.id}: {str(e)}"

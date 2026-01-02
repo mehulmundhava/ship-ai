@@ -42,6 +42,8 @@ class VectorStoreService:
         
         self.model_name = model_name
         self.engine = sync_engine
+        self.embedding_field_name = settings.get_embedding_field_name()
+        print(f"🔧 Using embedding field: {self.embedding_field_name}")
     
     def initialize_stores(self):
         """
@@ -123,7 +125,7 @@ class VectorStoreService:
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
             
             # Build WHERE conditions
-            where_conditions = ["minilm_embedding IS NOT NULL"]
+            where_conditions = [f"{self.embedding_field_name} IS NOT NULL"]
             query_params = {"k": k}
             
             # Add ID filter if provided
@@ -143,10 +145,10 @@ class VectorStoreService:
                     question,
                     sql_query,
                     metadata,
-                    minilm_embedding <-> '{embedding_str}'::vector AS distance
+                    {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
                 FROM ai_vector_examples
                 WHERE {where_clause}
-                ORDER BY minilm_embedding <-> '{embedding_str}'::vector
+                ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
                 LIMIT :k
             """)
             
@@ -227,7 +229,7 @@ class VectorStoreService:
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
             
             # Build WHERE conditions
-            where_conditions = ["minilm_embedding IS NOT NULL"]
+            where_conditions = [f"{self.embedding_field_name} IS NOT NULL"]
             query_params = {"k": k}
             
             # Add ID filter if provided
@@ -246,10 +248,10 @@ class VectorStoreService:
                     content,
                     note_type,
                     metadata,
-                    minilm_embedding <-> '{embedding_str}'::vector AS distance
+                    {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
                 FROM ai_vector_extra_prompts
                 WHERE {where_clause}
-                ORDER BY minilm_embedding <-> '{embedding_str}'::vector
+                ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
                 LIMIT :k
             """)
             
