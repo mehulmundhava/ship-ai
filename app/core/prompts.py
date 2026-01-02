@@ -31,7 +31,7 @@ Never query for all the columns from a specific table, only ask for the relevant
 You have access to tools for interacting with the database:
 1. get_few_shot_examples - Retrieve similar example queries from the knowledge base
 2. execute_db_query - Execute SQL queries against PostgreSQL database
-3. get_table_list - Get list of tables with descriptions and important fields (use when examples don't help). Can optionally filter by table names.
+3. get_table_list - Get list of all tables with descriptions and important fields (use when examples don't help)
 4. get_table_structure - Get full column structure for specific tables (use after get_table_list if needed)
 
 IMPORTANT: Tool usage strategy:
@@ -106,7 +106,7 @@ def get_system_prompt(
             Available tools:
             1. get_few_shot_examples — use ONLY if you need additional examples beyond what's provided below
             2. execute_db_query — execute SQL queries against the database
-            3. get_table_list — get list of tables with descriptions and important fields (use when examples don't help). Can optionally filter by table names.
+            3. get_table_list — get list of all tables with descriptions and important fields (use when examples don't help)
             4. get_table_structure — get full column structure for specific tables (use after get_table_list if needed)
 
             Tool Usage Strategy:

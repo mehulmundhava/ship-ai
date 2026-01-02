@@ -324,33 +324,29 @@ def create_get_table_list_tool(db: SQLDatabase, table_metadata: Optional[List[Di
     metadata = table_metadata if table_metadata is not None else TABLE_METADATA
     
     @tool
-    def get_table_list(table_names: Optional[str] = None) -> str:
+    def get_table_list() -> str:
         """
-        Get a list of available tables with their descriptions (uses) and important fields.
+        Get a list of all available tables with their descriptions (uses) and important fields.
         
         Use this tool when:
         - You cannot generate a query from the examples provided
         - You need to discover what tables are available in the database
         - You need to understand the purpose of each table and which fields are important
         
-        Args:
-            table_names: Optional comma-separated list of table names to filter.
-                        If not provided, returns all configured tables.
-                        Example: "users,devices" or "users"
-        
-        This tool returns:
+        This tool returns all configured tables with:
         - Table names
         - Table descriptions/uses (manually configured)
         - Important fields (manually configured)
         
+        If you need detailed column information for specific tables, use get_table_structure tool after this.
+        
         Returns:
-            A formatted string containing table information
+            A formatted string containing table information for all available tables
         """
         print(f"\n{'='*80}")
         print(f"🔧 TOOL CALLED: get_table_list")
         print(f"{'='*80}")
-        if table_names:
-            print(f"   Filter: {table_names}")
+        print(f"   Returning all configured tables")
         
         try:
             if not metadata:
@@ -359,23 +355,7 @@ def create_get_table_list_tool(db: SQLDatabase, table_metadata: Optional[List[Di
                 print(f"{'='*80}\n")
                 return error_msg
             
-            # Filter tables if table_names is provided
-            if table_names:
-                requested_tables = [t.strip().lower() for t in table_names.split(',') if t.strip()]
-                filtered_metadata = [
-                    table for table in metadata
-                    if table.get("name", "").lower() in requested_tables
-                ]
-                
-                if not filtered_metadata:
-                    error_msg = f"No matching tables found for: {table_names}"
-                    print(f"   ⚠️  {error_msg}")
-                    print(f"{'='*80}\n")
-                    return error_msg
-                
-                metadata_to_use = filtered_metadata
-            else:
-                metadata_to_use = metadata
+            metadata_to_use = metadata
             
             result_parts = []
             result_parts.append("=== AVAILABLE TABLES ===\n")
