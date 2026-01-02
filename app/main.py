@@ -6,12 +6,29 @@ for natural language to SQL queries using LangGraph and RAG.
 """
 
 from contextlib import asynccontextmanager
+from pathlib import Path
+import logging
 from fastapi import FastAPI
 from langchain_community.utilities.sql_database import SQLDatabase
 from app.config.database import sync_engine
+from app.config.settings import settings
 from app.services.llm_service import LLMService
 from app.services.vector_store_service import VectorStoreService
 from app.api import api_router
+from app.utils.logger import setup_logger
+
+# Setup logger with settings
+log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+# Configure and get the logger instance
+logger = setup_logger(
+    name="ship_rag_ai",
+    level=log_level,
+    log_dir=Path(settings.LOG_DIR),
+    log_to_console=settings.LOG_TO_CONSOLE,
+    log_to_file=settings.LOG_TO_FILE,
+    rotation_interval_hours=settings.LOG_ROTATION_INTERVAL_HOURS,
+    retention_days=settings.LOG_RETENTION_DAYS
+)
 
 
 @asynccontextmanager
@@ -28,51 +45,48 @@ async def lifespan(app: FastAPI):
     # STARTUP: Initialize all components once
     # ========================================================================
     
-    print("🚀 Starting application...")
+    logger.info("🚀 Starting application...")
     
     # Initialize the LLM model
     app.state.llm_model = LLMService()
-    print("✅ LLM model initialized")
+    logger.info("✅ LLM model initialized")
     
     # Initialize vector stores (PostgreSQL pgvector)
     app.state.vector_store = VectorStoreService()
     try:
         app.state.vector_store.initialize_stores()
-        print("✅ Vector stores initialized")
+        logger.info("✅ Vector stores initialized")
     except Exception as e:
-        print(f"⚠️  Warning: Could not initialize vector stores: {e}")
-        print("   The app will start, but vector search will fail until connection is available.")
-        import traceback
-        traceback.print_exc()
+        logger.warning(f"⚠️  Warning: Could not initialize vector stores: {e}")
+        logger.warning("   The app will start, but vector search will fail until connection is available.")
+        logger.exception("Vector store initialization error")
     
     # Initialize database connection (lazy - will connect on first use)
     # Note: SQLDatabase tries to connect during init, so we catch errors
-    print("🔍 Attempting to initialize SQLDatabase wrapper...")
+    logger.info("🔍 Attempting to initialize SQLDatabase wrapper...")
     try:
         app.state.sql_db = SQLDatabase(sync_engine)
-        print("✅ PostgreSQL database connection initialized")
+        logger.info("✅ PostgreSQL database connection initialized")
         
         # Test the connection
         try:
-            print("🔍 Testing database connection...")
+            logger.info("🔍 Testing database connection...")
             with sync_engine.connect() as conn:
                 from sqlalchemy import text
                 result = conn.execute(text("SELECT 1"))
                 result.fetchone()
-            print("✅ Database connection test successful")
+            logger.info("✅ Database connection test successful")
         except Exception as test_error:
-            print(f"⚠️  Database connection test failed: {test_error}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"⚠️  Database connection test failed: {test_error}")
+            logger.exception("Database connection test error")
             
     except Exception as e:
-        print(f"⚠️  Warning: Could not initialize database connection: {e}")
-        print("   The app will start, but database queries will fail until connection is available.")
-        import traceback
-        traceback.print_exc()
+        logger.warning(f"⚠️  Warning: Could not initialize database connection: {e}")
+        logger.warning("   The app will start, but database queries will fail until connection is available.")
+        logger.exception("Database initialization error")
         app.state.sql_db = None
     
-    print("✅ Application ready to serve requests")
+    logger.info("✅ Application ready to serve requests")
     
     # Yield control back to FastAPI
     yield
@@ -85,7 +99,7 @@ async def lifespan(app: FastAPI):
         if hasattr(app.state.sql_db, "dispose"):
             app.state.sql_db.dispose()
     
-    print("👋 Application shutting down")
+    logger.info("👋 Application shutting down")
 
 
 # ============================================================================

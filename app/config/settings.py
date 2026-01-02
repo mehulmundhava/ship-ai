@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
     HUGGING_FACE_MODEL: Optional[str] = None
     
+    # Logging Configuration
+    LOG_LEVEL: str = "INFO"  # DEBUG, INFO, WARNING, ERROR
+    LOG_DIR: str = "logs"
+    LOG_ROTATION_INTERVAL_HOURS: int = 24
+    LOG_RETENTION_DAYS: int = 30
+    LOG_TO_CONSOLE: bool = True
+    LOG_TO_FILE: bool = True
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=False,

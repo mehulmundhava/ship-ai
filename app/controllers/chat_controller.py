@@ -11,6 +11,12 @@ from app.config.database import sync_engine
 from app.models.schemas import ChatRequest, ChatResponse
 
 
+import logging
+
+# Get logger for this module
+logger = logging.getLogger("ship_rag_ai")
+
+
 def process_chat(
     payload: ChatRequest,
     llm_model,
@@ -48,6 +54,12 @@ def process_chat(
     
     # Process user question
     try:
+        logger.info("="*80)
+        logger.info("📥 API REQUEST RECEIVED")
+        logger.info(f"Question: {payload.question}")
+        logger.info(f"User ID: {payload.user_id}")
+        logger.info(f"Chat History Length: {len(payload.chat_history or [])}")
+        
         print(f"\n{'='*80}")
         print(f"📥 API REQUEST RECEIVED")
         print(f"{'='*80}")
@@ -59,7 +71,11 @@ def process_chat(
         # Get LLM instance (OpenAI or Groq based on LLM_PROVIDER env var)
         llm = llm_model.get_llm_model()
         model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', None) or 'Unknown'
-        print(f"🤖 LLM Provider: {llm_model.get_provider()}")
+        provider = llm_model.get_provider()
+        
+        logger.info(f"LLM Provider: {provider}")
+        logger.info(f"LLM Model: {model_name}")
+        print(f"🤖 LLM Provider: {provider}")
         print(f"🤖 LLM Model: {model_name}")
         
         # Create SQL agent graph
@@ -72,6 +88,7 @@ def process_chat(
         )
         
         # Process the question
+        logger.info("Starting agent invocation")
         result = agent.invoke(payload.question)
         
         answer = result.get("answer", "No answer generated")
@@ -79,8 +96,12 @@ def process_chat(
         query_result = result.get("query_result", "")
         debug_info = result.get("debug", {})
         
+        logger.info(f"Agent completed - Answer length: {len(answer)}, SQL query: {bool(sql_query)}, Query result: {bool(query_result)}")
+        
     except Exception as e:
         # Handle any errors that occur during processing
+        logger.error(f"Error processing question: {e}")
+        logger.exception("Full error traceback")
         print(f"Error processing question: {e}")
         import traceback
         traceback.print_exc()

@@ -20,6 +20,11 @@ from app.core.agent.agent_tools import (
 )
 from app.core.prompts import get_system_prompt
 from app.services.vector_store_service import VectorStoreService
+import logging
+import re
+
+# Get logger for this module
+logger = logging.getLogger("ship_rag_ai")
 
 
 def log_message_sequence(messages: List, step_name: str):
@@ -98,6 +103,10 @@ class SQLAgentGraph:
         self.get_table_list_tool = create_get_table_list_tool(db)
         self.get_table_structure_tool = create_get_table_structure_tool(db)
         
+        # Store the underlying query tool for direct execution
+        from app.core.agent.agent_tools import QuerySQLDatabaseTool
+        self.query_tool_instance = QuerySQLDatabaseTool(db)
+        
         # Main tools for LLM (security guard is handled separately as direct LLM call)
         self.tools = [
             self.get_examples_tool, 
@@ -111,6 +120,53 @@ class SQLAgentGraph:
         
         # Build graph
         self.graph = self._build_graph()
+    
+    def _extract_sql_from_text(self, text: str) -> Optional[str]:
+        """
+        Extract SQL query from markdown code blocks or plain text.
+        
+        Args:
+            text: Text content that may contain SQL query
+            
+        Returns:
+            Extracted SQL query string, or None if not found
+        """
+        if not text:
+            return None
+        
+        logger.debug(f"Attempting to extract SQL from text (length: {len(text)} chars)")
+        
+        # Try markdown code blocks first (```sql ... ```)
+        sql_pattern = r'```sql\s*(.*?)```'
+        matches = re.findall(sql_pattern, text, re.DOTALL | re.IGNORECASE)
+        if matches:
+            sql = matches[0].strip()
+            # Remove any leading/trailing whitespace and newlines
+            sql = re.sub(r'^\s+|\s+$', '', sql, flags=re.MULTILINE)
+            if sql and sql.upper().startswith('SELECT'):
+                logger.info(f"✅ Extracted SQL from markdown code block: {sql[:100]}...")
+                return sql
+        
+        # Try markdown code blocks without language specifier (``` ... ```)
+        sql_pattern = r'```\s*(SELECT.*?)```'
+        matches = re.findall(sql_pattern, text, re.DOTALL | re.IGNORECASE)
+        if matches:
+            sql = matches[0].strip()
+            if sql.upper().startswith('SELECT'):
+                logger.info(f"✅ Extracted SQL from generic code block: {sql[:100]}...")
+                return sql
+        
+        # Try plain SQL (SELECT statements)
+        sql_pattern = r'(SELECT\s+.*?(?:LIMIT\s+\d+)?(?:\s*;)?)'
+        matches = re.findall(sql_pattern, text, re.DOTALL | re.IGNORECASE)
+        if matches:
+            sql = matches[0].strip().rstrip(';')
+            if sql:
+                logger.info(f"✅ Extracted SQL from plain text: {sql[:100]}...")
+                return sql
+        
+        logger.debug("No SQL query found in text")
+        return None
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow."""
@@ -511,17 +567,39 @@ class SQLAgentGraph:
                 response = self.llm_with_tools.invoke(messages)
             except Exception as e:
                 error_str = str(e)
+                error_type = type(e).__name__
+                
+                # Log full error details
+                logger.error(f"Groq API tool call error detected")
+                logger.error(f"Error Type: {error_type}")
+                logger.error(f"Error Message: {error_str}")
+                logger.exception("Full exception details")
+                
+                print(f"\n{'='*80}")
+                print(f"❌ GROQ TOOL CALL ERROR DETAILS")
+                print(f"{'='*80}")
+                print(f"Error Type: {error_type}")
+                print(f"Error Message: {error_str}")
+                import traceback
+                print(f"Traceback:\n{traceback.format_exc()}")
+                print(f"{'='*80}\n")
+                
                 # Check if it's a Groq tool call format error
-                if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
+                if "tool_use_failed" in error_str or "Failed to call a function" in error_str or "tool" in error_str.lower():
+                    logger.warning("Groq API tool call error detected. Attempting to continue without tools...")
                     print(f"⚠️  Groq API tool call error detected. Attempting to continue without tools...")
                     # Try invoking without tools to get a text response
                     try:
                         response = self.llm.invoke(messages)
+                        logger.info("Got text response from LLM (no tools)")
                         print(f"✅ Got text response from LLM (no tools)")
                     except Exception as e2:
+                        logger.error(f"Error even without tools: {e2}")
+                        logger.exception("Error invoking LLM without tools")
                         print(f"❌ Error even without tools: {e2}")
                         raise e
                 else:
+                    logger.error("Unknown error type, re-raising")
                     raise e
             
             messages.append(response)
@@ -575,13 +653,65 @@ class SQLAgentGraph:
             # Log LLM response
             if hasattr(response, "tool_calls") and response.tool_calls:
                 print(f"🔧 LLM Response: Requesting {len(response.tool_calls)} tool call(s)")
+                logger.info(f"LLM Response: Requesting {len(response.tool_calls)} tool call(s)")
                 for tc in response.tool_calls:
                     print(f"   - Tool: {tc.get('name')}")
+                    logger.info(f"Tool call: {tc.get('name')}")
                     if tc.get('name') == 'execute_db_query':
-                        print(f"     SQL Query: {tc.get('args', {}).get('query', 'N/A')}")
+                        sql = tc.get('args', {}).get('query', 'N/A')
+                        print(f"     SQL Query: {sql}")
+                        logger.info(f"SQL Query from tool call: {sql[:200]}...")
             else:
                 content_preview = (response.content[:200] + "...") if response.content and len(response.content) > 200 else (response.content or "[No content]")
                 print(f"💬 LLM Response: {content_preview}")
+                logger.info(f"LLM Response (text only): {content_preview}")
+                
+                # Try to extract SQL from text response when tool calls fail
+                extracted_sql = None
+                if response.content:
+                    extracted_sql = self._extract_sql_from_text(response.content)
+                
+                if extracted_sql:
+                    logger.info(f"🔍 EXTRACTED SQL FROM TEXT RESPONSE")
+                    logger.info(f"SQL Query: {extracted_sql}")
+                    print(f"\n{'='*80}")
+                    print(f"🔍 EXTRACTED SQL FROM TEXT RESPONSE")
+                    print(f"{'='*80}")
+                    print(f"SQL Query: {extracted_sql}")
+                    print(f"{'='*80}\n")
+                    
+                    # Manually execute the query
+                    try:
+                        logger.info("Attempting to execute extracted SQL query")
+                        print(f"🔧 Attempting to execute extracted SQL query...")
+                        
+                        # Use the underlying query tool instance to execute the SQL
+                        query_result = self.query_tool_instance.execute(extracted_sql)
+                        
+                        # Create ToolMessage to maintain message flow
+                        tool_message = ToolMessage(
+                            content=query_result,
+                            name="execute_db_query",
+                            tool_call_id="manual_extraction_001"
+                        )
+                        messages.append(tool_message)
+                        
+                        # Update state
+                        state["sql_query"] = extracted_sql
+                        state["query_result"] = query_result
+                        
+                        logger.info(f"✅ Executed extracted SQL query successfully")
+                        logger.info(f"Result length: {len(query_result)} characters")
+                        logger.debug(f"Query result preview: {query_result[:500]}...")
+                        print(f"✅ Executed extracted SQL query successfully")
+                        print(f"   Result length: {len(query_result)} characters")
+                    except Exception as exec_error:
+                        logger.error(f"❌ Error executing extracted SQL: {exec_error}")
+                        logger.exception("SQL execution error")
+                        print(f"❌ Error executing extracted SQL: {exec_error}")
+                        import traceback
+                        traceback.print_exc()
+                        # Continue with text response even if execution fails
         except Exception as e:
             print(f"❌ Error invoking LLM: {e}")
             print(f"   Messages count: {len(messages)}")
@@ -600,13 +730,16 @@ class SQLAgentGraph:
         # Extract SQL query if execute_db_query was called
         sql_query = state.get("sql_query")
         if hasattr(response, "tool_calls") and response.tool_calls:
+            logger.debug(f"Extracting SQL from {len(response.tool_calls)} tool calls")
             for tool_call in response.tool_calls:
                 if tool_call["name"] == "execute_db_query":
                     sql_query = tool_call["args"]["query"]
+                    logger.info(f"✅ Extracted SQL from tool call: {sql_query[:100]}...")
                     break
         
         # Check if we got query results from previous tool execution
         query_result = state.get("query_result")
+        logger.debug(f"Current state - SQL query: {bool(sql_query)}, Query result: {bool(query_result)}")
         if not query_result:
             # Look for tool messages with query results
             for msg in messages:
@@ -650,6 +783,7 @@ class SQLAgentGraph:
         for msg in reversed(messages):
             if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
                 # We have query results - format answer directly without another agent call
+                logger.info("TOOL RESULT DETECTED - Routing directly to format_answer")
                 print(f"\n{'='*80}")
                 print(f"✅ TOOL RESULT DETECTED - Routing directly to format_answer")
                 print(f"   This saves tokens by skipping agent node with full history")
@@ -657,6 +791,7 @@ class SQLAgentGraph:
                 return "format"
         
         # No query results yet, continue to agent
+        logger.debug("No tool results found, continuing to agent")
         return "continue"
     
     def _should_continue(self, state: AgentState) -> str:
@@ -664,6 +799,7 @@ class SQLAgentGraph:
         # Check if final_answer is already set (e.g., from early validation rejection)
         final_answer = state.get("final_answer")
         if final_answer:
+            logger.info("Decision: END - Final answer already set")
             print(f"\n{'='*80}")
             print(f"✅ DECISION POINT - Final answer already set")
             print(f"{'='*80}")
@@ -675,6 +811,7 @@ class SQLAgentGraph:
         last_message = messages[-1] if messages else None
         iteration_count = state.get("iteration_count", 0)
         
+        logger.debug(f"Decision point - Iteration: {iteration_count}, Last message type: {type(last_message).__name__ if last_message else 'None'}")
         print(f"\n{'='*80}")
         print(f"🤔 DECISION POINT - Should Continue?")
         print(f"{'='*80}")
@@ -683,17 +820,21 @@ class SQLAgentGraph:
         
         # Safety check: prevent infinite loops
         if iteration_count >= 5:
+            logger.warning(f"Max iterations reached ({iteration_count}), forcing end")
             print(f"⚠️  Max iterations reached ({iteration_count}), forcing end")
             return "end"
         
         # If last message has tool calls, continue to tools
         if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            print(f"🔧 Decision: CONTINUE - Agent wants to call {len(last_message.tool_calls)} tool(s)")
+            tool_count = len(last_message.tool_calls)
+            logger.info(f"Decision: CONTINUE - Agent wants to call {tool_count} tool(s)")
+            print(f"🔧 Decision: CONTINUE - Agent wants to call {tool_count} tool(s)")
             return "continue"
         
         # If we have a query result, format the answer
         query_result = state.get("query_result")
         if query_result and query_result != "":
+            logger.info("Decision: END - Query result found in state")
             print(f"✅ Decision: END - Query result found")
             return "end"
         
@@ -701,6 +842,7 @@ class SQLAgentGraph:
         for msg in reversed(messages):
             if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
                 # We have query results, format answer
+                logger.info("Decision: END - Found execute_db_query ToolMessage")
                 print(f"✅ Decision: END - Found execute_db_query ToolMessage")
                 return "end"
         
@@ -710,16 +852,20 @@ class SQLAgentGraph:
             for msg in messages:
                 if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
                     # Already executed, should format answer
+                    logger.info("Decision: END - SQL query already executed")
                     print(f"✅ Decision: END - SQL query already executed")
                     return "end"
         
         # If last message is AIMessage without tool_calls, we have final answer
         if last_message and isinstance(last_message, AIMessage):
-            if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+            has_tool_calls = hasattr(last_message, "tool_calls") and last_message.tool_calls
+            if not has_tool_calls:
+                logger.info("Decision: END - Final AIMessage without tool_calls")
                 print(f"✅ Decision: END - Final AIMessage without tool_calls")
                 return "end"
         
         # Otherwise, continue (agent might want to call tools)
+        logger.debug("Decision: CONTINUE - Agent might want to call tools")
         print(f"🔄 Decision: CONTINUE - Agent might want to call tools")
         print(f"{'='*80}\n")
         return "continue"
@@ -747,21 +893,38 @@ class SQLAgentGraph:
         sql_query = state.get("sql_query", "")
         if not sql_query:
             # Try to find SQL query in tool calls
+            logger.debug("SQL query not in state, searching in messages...")
             for msg in reversed(messages):
                 if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
                     for tool_call in msg.tool_calls:
                         if tool_call["name"] == "execute_db_query":
                             sql_query = tool_call["args"].get("query", "")
+                            logger.info(f"✅ Found SQL query from tool call: {sql_query[:100]}...")
                             print(f"✅ Found SQL query from tool call: {sql_query}")
                             break
                     if sql_query:
                         break
+            
+            # If still not found, try extracting from text messages
+            if not sql_query:
+                logger.debug("SQL query not found in tool calls, trying to extract from text...")
+                for msg in reversed(messages):
+                    if isinstance(msg, AIMessage) and msg.content:
+                        extracted = self._extract_sql_from_text(msg.content)
+                        if extracted:
+                            sql_query = extracted
+                            logger.info(f"✅ Extracted SQL from final message: {sql_query[:100]}...")
+                            print(f"✅ Extracted SQL from final message: {sql_query}")
+                            break
         
+        logger.info(f"📊 Extracted SQL Query: {sql_query or 'None'}")
+        logger.info(f"📊 Query Result: {query_result[:200] if query_result else 'None'}...")
         print(f"📊 Extracted SQL Query: {sql_query or 'None'}")
         print(f"📊 Query Result: {query_result[:200] if query_result else 'None'}...")
         
         # If we have query results, format them
         if query_result and not query_result.startswith("::::::"):
+            logger.info("Formatting final answer from query results")
             # Generate final answer from results using a MINIMAL, one-shot prompt.
             # IMPORTANT: We DO NOT send the full message history, system prompt,
             # or retrieved examples again here. This keeps token usage low for
@@ -791,6 +954,8 @@ class SQLAgentGraph:
                 Now provide a short, user-friendly answer to the question based on these results.
                 """.strip()
             
+            logger.info("Generating final answer from query results")
+            logger.debug(f"Final prompt length: {len(final_prompt)} characters")
             print(f"🤖 Generating final answer from query results...")
             print(f"   Prompt length: {len(final_prompt)} characters")
             print(f"   Using MINIMAL prompt (no system prompt, no examples, no history)")
@@ -843,6 +1008,7 @@ class SQLAgentGraph:
             }
             llm_call_history.append(llm_call_info)
             
+            logger.info(f"✅ Final Answer Generated: {final_answer[:200]}...")
             print(f"✅ Final Answer Generated: {final_answer[:200]}...")
             
             return {
@@ -856,17 +1022,86 @@ class SQLAgentGraph:
             final_answer = f"Based on the query, there are no results matching your criteria for the question: {state['question']}"
         else:
             # No query executed - use last message
+            logger.warning("No query result found, attempting to use last AI message")
             if messages:
                 last_ai_message = None
                 for msg in reversed(messages):
-                    if isinstance(msg, AIMessage) and not hasattr(msg, "tool_calls"):
-                        last_ai_message = msg
-                        break
+                    # Check if it's an AIMessage without tool_calls (or with empty tool_calls)
+                    if isinstance(msg, AIMessage):
+                        has_tool_calls = hasattr(msg, "tool_calls") and msg.tool_calls
+                        if not has_tool_calls:
+                            last_ai_message = msg
+                            break
+                
                 if last_ai_message:
+                    logger.info("Using last AI message content as final answer")
+                    logger.debug(f"Last AI message content length: {len(last_ai_message.content) if last_ai_message.content else 0}")
+                    
+                    # Also try to extract SQL from the message if not already extracted
+                    if not sql_query and last_ai_message.content:
+                        extracted_sql = self._extract_sql_from_text(last_ai_message.content)
+                        if extracted_sql:
+                            sql_query = extracted_sql
+                            logger.info(f"✅ Extracted SQL from final message: {sql_query[:100]}...")
+                            print(f"✅ Extracted SQL from final message: {sql_query}")
+                            
+                            # Try to execute it
+                            try:
+                                logger.info("Attempting to execute SQL from final message")
+                                query_result = self.query_tool_instance.execute(extracted_sql)
+                                state["sql_query"] = extracted_sql
+                                state["query_result"] = query_result
+                                logger.info(f"✅ Executed SQL from final message, result length: {len(query_result)}")
+                                
+                                # If we got results, format them
+                                if query_result and not query_result.startswith("::::::"):
+                                    # Generate final answer from results
+                                    user_question = state.get("question", "")
+                                    user_id = state.get("user_id", "")
+                                    final_prompt = f"""
+                                        You are a helpful assistant. Your task is ONLY to explain database query results
+                                        to the user in clear, natural language.
+
+                                        Constraints for your answer:
+                                        - Do NOT mention or describe table names, column names, joins, or SQL syntax.
+                                        - Do NOT reveal anything about database schema or internal implementation.
+                                        - Answer ONLY for the active user_id if relevant: {user_id}.
+                                        - Be concise and focus on what the numbers mean for the question.
+
+                                        User Question:
+                                        {user_question}
+
+                                        SQL Query (for your reference only, do NOT explain it explicitly):
+                                        {sql_query}
+
+                                        SQL Query Results:
+                                        {query_result}
+
+                                        Now provide a short, user-friendly answer to the question based on these results.
+                                        """.strip()
+                                    
+                                    from langchain_core.messages import HumanMessage
+                                    final_messages = [HumanMessage(content=final_prompt)]
+                                    response = self.llm.invoke(final_messages)
+                                    final_answer = response.content if hasattr(response, 'content') else str(response)
+                                    logger.info(f"✅ Generated final answer from query results")
+                                    print(f"✅ Final Answer: {final_answer}")
+                                    return {
+                                        **state,
+                                        "final_answer": final_answer,
+                                        "sql_query": sql_query,
+                                        "query_result": query_result
+                                    }
+                            except Exception as exec_error:
+                                logger.error(f"Error executing SQL from final message: {exec_error}")
+                                logger.exception("SQL execution error in format_answer")
+                    
                     final_answer = last_ai_message.content
                 else:
+                    logger.warning("No suitable AI message found for final answer")
                     final_answer = "I couldn't generate a response to your question."
             else:
+                logger.warning("No messages available for final answer")
                 final_answer = "I couldn't generate a response to your question."
         
         print(f"✅ Final Answer: {final_answer}")
