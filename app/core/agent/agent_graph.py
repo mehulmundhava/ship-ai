@@ -16,7 +16,10 @@ from app.core.agent.agent_tools import (
     create_get_few_shot_examples_tool, 
     create_execute_db_query_tool,
     create_get_table_list_tool,
-    create_get_table_structure_tool
+    create_get_table_structure_tool,
+    create_count_query_tool,
+    create_list_query_tool,
+    create_get_extra_examples_tool
 )
 from app.core.prompts import get_system_prompt
 from app.services.vector_store_service import VectorStoreService
@@ -102,15 +105,23 @@ class SQLAgentGraph:
         self.execute_db_query_tool = create_execute_db_query_tool(db, vector_store_manager)
         self.get_table_list_tool = create_get_table_list_tool(db)
         self.get_table_structure_tool = create_get_table_structure_tool(db)
+        self.count_query_tool = create_count_query_tool(db)
+        self.list_query_tool = create_list_query_tool(db)
+        self.get_extra_examples_tool = create_get_extra_examples_tool(vector_store_manager)
         
         # Store the underlying query tool for direct execution
         from app.core.agent.agent_tools import QuerySQLDatabaseTool
         self.query_tool_instance = QuerySQLDatabaseTool(db)
         
         # Main tools for LLM (security guard is handled separately as direct LLM call)
+        # Note: execute_db_query already handles result splitting automatically
+        # The specialized tools (count_query, list_query) are available but optional
         self.tools = [
             self.get_examples_tool, 
-            self.execute_db_query_tool,
+            self.execute_db_query_tool,  # Main tool - handles both COUNT and LIST with auto-splitting
+            self.count_query_tool,  # Optional: specialized for COUNT queries
+            self.list_query_tool,  # Optional: specialized for LIST queries
+            self.get_extra_examples_tool,  # Alias for get_few_shot_examples
             self.get_table_list_tool,
             self.get_table_structure_tool
         ]
@@ -193,9 +204,9 @@ class SQLAgentGraph:
                     tool_name = tc.get("name", "unknown")
                     tool_args = tc.get("args", {})
                     print(f"📞 Calling Tool: {tool_name}")
-                    if tool_name == "execute_db_query":
+                    if tool_name in ["execute_db_query", "count_query", "list_query"]:
                         print(f"   SQL Query: {tool_args.get('query', 'N/A')}")
-                    elif tool_name == "get_few_shot_examples":
+                    elif tool_name in ["get_few_shot_examples", "get_extra_examples"]:
                         print(f"   Search Query: {tool_args.get('question', 'N/A')}")
                 print(f"{'='*80}\n")
             
@@ -641,8 +652,8 @@ class SQLAgentGraph:
                         "name": tc.get("name"),
                         "args": tc.get("args", {})
                     }
-                    # Extract SQL query if it's execute_db_query
-                    if tc.get("name") == "execute_db_query":
+                    # Extract SQL query if it's a query tool
+                    if tc.get("name") in ["execute_db_query", "count_query", "list_query"]:
                         sql_query = tc.get("args", {}).get("query", "")
                         tool_call_info["sql_query"] = sql_query
                     tool_calls_info.append(tool_call_info)
@@ -657,10 +668,10 @@ class SQLAgentGraph:
                 for tc in response.tool_calls:
                     print(f"   - Tool: {tc.get('name')}")
                     logger.info(f"Tool call: {tc.get('name')}")
-                    if tc.get('name') == 'execute_db_query':
+                    if tc.get('name') in ['execute_db_query', 'count_query', 'list_query']:
                         sql = tc.get('args', {}).get('query', 'N/A')
                         print(f"     SQL Query: {sql}")
-                        logger.info(f"SQL Query from tool call: {sql[:200]}...")
+                        logger.info(f"SQL Query from tool call ({tc.get('name')}): {sql[:200]}...")
             else:
                 content_preview = (response.content[:200] + "...") if response.content and len(response.content) > 200 else (response.content or "[No content]")
                 print(f"💬 LLM Response: {content_preview}")
@@ -732,18 +743,18 @@ class SQLAgentGraph:
         if hasattr(response, "tool_calls") and response.tool_calls:
             logger.debug(f"Extracting SQL from {len(response.tool_calls)} tool calls")
             for tool_call in response.tool_calls:
-                if tool_call["name"] == "execute_db_query":
+                if tool_call["name"] in ["execute_db_query", "count_query", "list_query"]:
                     sql_query = tool_call["args"]["query"]
-                    logger.info(f"✅ Extracted SQL from tool call: {sql_query[:100]}...")
+                    logger.info(f"✅ Extracted SQL from tool call ({tool_call['name']}): {sql_query[:100]}...")
                     break
         
         # Check if we got query results from previous tool execution
         query_result = state.get("query_result")
         logger.debug(f"Current state - SQL query: {bool(sql_query)}, Query result: {bool(query_result)}")
         if not query_result:
-            # Look for tool messages with query results
+            # Look for tool messages with query results (check all query tools)
             for msg in messages:
-                if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
+                if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
                     query_result = msg.content
                     break
         
@@ -779,13 +790,13 @@ class SQLAgentGraph:
         """
         messages = state.get("messages", [])
         
-        # Check if we have query results from execute_db_query
+        # Check if we have query results from any query tool
         for msg in reversed(messages):
-            if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
+            if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
                 # We have query results - format answer directly without another agent call
-                logger.info("TOOL RESULT DETECTED - Routing directly to format_answer")
+                logger.info(f"TOOL RESULT DETECTED ({msg.name}) - Routing directly to format_answer")
                 print(f"\n{'='*80}")
-                print(f"✅ TOOL RESULT DETECTED - Routing directly to format_answer")
+                print(f"✅ TOOL RESULT DETECTED ({msg.name}) - Routing directly to format_answer")
                 print(f"   This saves tokens by skipping agent node with full history")
                 print(f"{'='*80}\n")
                 return "format"
@@ -838,22 +849,22 @@ class SQLAgentGraph:
             print(f"✅ Decision: END - Query result found")
             return "end"
         
-        # Check if we have a tool message with results (from execute_db_query)
+        # Check if we have a tool message with results (from any query tool)
         for msg in reversed(messages):
-            if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
+            if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
                 # We have query results, format answer
-                logger.info("Decision: END - Found execute_db_query ToolMessage")
-                print(f"✅ Decision: END - Found execute_db_query ToolMessage")
+                logger.info(f"Decision: END - Found {msg.name} ToolMessage")
+                print(f"✅ Decision: END - Found {msg.name} ToolMessage")
                 return "end"
         
         # If we have SQL query but no result yet, check if we already executed
         if state.get("sql_query"):
-            # Check if we already tried to execute
+            # Check if we already tried to execute (check all query tools)
             for msg in messages:
-                if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
+                if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
                     # Already executed, should format answer
-                    logger.info("Decision: END - SQL query already executed")
-                    print(f"✅ Decision: END - SQL query already executed")
+                    logger.info(f"Decision: END - SQL query already executed via {msg.name}")
+                    print(f"✅ Decision: END - SQL query already executed via {msg.name}")
                     return "end"
         
         # If last message is AIMessage without tool_calls, we have final answer
@@ -882,25 +893,28 @@ class SQLAgentGraph:
         # Extract query result from messages if not in state
         query_result = state.get("query_result", "")
         if not query_result:
-            # Try to extract from tool messages
+            # Try to extract from tool messages (check all query tools)
             for msg in reversed(messages):
-                if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
-                    query_result = msg.content
-                    print(f"✅ Found query result from ToolMessage: {query_result[:200]}...")
-                    break
+                if isinstance(msg, ToolMessage):
+                    tool_name = getattr(msg, 'name', '')
+                    if tool_name in ["execute_db_query", "count_query", "list_query"]:
+                        query_result = msg.content
+                        print(f"✅ Found query result from ToolMessage ({tool_name}): {query_result[:200]}...")
+                        break
         
         # Extract SQL query from messages if not in state
         sql_query = state.get("sql_query", "")
         if not sql_query:
-            # Try to find SQL query in tool calls
+            # Try to find SQL query in tool calls (check all query tools)
             logger.debug("SQL query not in state, searching in messages...")
             for msg in reversed(messages):
                 if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
                     for tool_call in msg.tool_calls:
-                        if tool_call["name"] == "execute_db_query":
+                        tool_name = tool_call.get("name", "")
+                        if tool_name in ["execute_db_query", "count_query", "list_query"]:
                             sql_query = tool_call["args"].get("query", "")
-                            logger.info(f"✅ Found SQL query from tool call: {sql_query[:100]}...")
-                            print(f"✅ Found SQL query from tool call: {sql_query}")
+                            logger.info(f"✅ Found SQL query from tool call ({tool_name}): {sql_query[:100]}...")
+                            print(f"✅ Found SQL query from tool call ({tool_name}): {sql_query}")
                             break
                     if sql_query:
                         break
@@ -932,6 +946,21 @@ class SQLAgentGraph:
             user_question = state.get("question", "")
             user_id = state.get("user_id", "")
 
+            # Extract CSV download link from query_result if present
+            csv_download_url = None
+            csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
+            if csv_link_match:
+                csv_path = csv_link_match.group(1)
+                # Convert to full URL (using localhost:3009 as per user's example)
+                csv_download_url = f"http://localhost:3009{csv_path}"
+                logger.info(f"✅ Extracted CSV download link: {csv_download_url}")
+                print(f"✅ Extracted CSV download link: {csv_download_url}")
+
+            # Build the prompt with CSV link if available
+            csv_link_instruction = ""
+            if csv_download_url:
+                csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link. You MUST include this full URL in your answer: {csv_download_url}"
+
             final_prompt = f"""
                 You are a helpful assistant. Your task is ONLY to explain database query results
                 to the user in clear, natural language.
@@ -940,7 +969,7 @@ class SQLAgentGraph:
                 - Do NOT mention or describe table names, column names, joins, or SQL syntax.
                 - Do NOT reveal anything about database schema or internal implementation.
                 - Answer ONLY for the active user_id if relevant: {user_id}.
-                - Be concise and focus on what the numbers mean for the question.
+                - Be concise and focus on what the numbers mean for the question.{csv_link_instruction}
 
                 User Question:
                 {user_question}
@@ -1058,6 +1087,22 @@ class SQLAgentGraph:
                                     # Generate final answer from results
                                     user_question = state.get("question", "")
                                     user_id = state.get("user_id", "")
+                                    
+                                    # Extract CSV download link from query_result if present
+                                    csv_download_url = None
+                                    csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
+                                    if csv_link_match:
+                                        csv_path = csv_link_match.group(1)
+                                        # Convert to full URL (using localhost:3009 as per user's example)
+                                        csv_download_url = f"http://localhost:3009{csv_path}"
+                                        logger.info(f"✅ Extracted CSV download link: {csv_download_url}")
+                                        print(f"✅ Extracted CSV download link: {csv_download_url}")
+
+                                    # Build the prompt with CSV link if available
+                                    csv_link_instruction = ""
+                                    if csv_download_url:
+                                        csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link. You MUST include this full URL in your answer: {csv_download_url}"
+                                    
                                     final_prompt = f"""
                                         You are a helpful assistant. Your task is ONLY to explain database query results
                                         to the user in clear, natural language.
@@ -1066,7 +1111,7 @@ class SQLAgentGraph:
                                         - Do NOT mention or describe table names, column names, joins, or SQL syntax.
                                         - Do NOT reveal anything about database schema or internal implementation.
                                         - Answer ONLY for the active user_id if relevant: {user_id}.
-                                        - Be concise and focus on what the numbers mean for the question.
+                                        - Be concise and focus on what the numbers mean for the question.{csv_link_instruction}
 
                                         User Question:
                                         {user_question}
@@ -1150,20 +1195,20 @@ class SQLAgentGraph:
         # Extract query result from messages if not already set
         query_result = final_state.get("query_result")
         if not query_result:
-            # Try to extract from tool messages
+            # Try to extract from tool messages (check all query tools)
             for msg in reversed(final_state.get("messages", [])):
-                if isinstance(msg, ToolMessage) and msg.name == "execute_db_query":
+                if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
                     query_result = msg.content
                     break
         
         # Also extract SQL query from messages if not set
         sql_query = final_state.get("sql_query")
         if not sql_query:
-            # Try to find SQL query in tool calls
+            # Try to find SQL query in tool calls (check all query tools)
             for msg in reversed(final_state.get("messages", [])):
                 if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
                     for tool_call in msg.tool_calls:
-                        if tool_call["name"] == "execute_db_query":
+                        if tool_call["name"] in ["execute_db_query", "count_query", "list_query"]:
                             sql_query = tool_call["args"].get("query", "")
                             break
                     if sql_query:
@@ -1233,7 +1278,7 @@ class SQLAgentGraph:
                             "name": tc.get("name"),
                             "args": tc.get("args", {})
                         }
-                        if tc.get("name") == "execute_db_query":
+                        if tc.get("name") in ["execute_db_query", "count_query", "list_query"]:
                             tool_call_info["sql_query"] = tc.get("args", {}).get("query", "")
                         msg_info["tool_calls"].append(tool_call_info)
                 
@@ -1262,7 +1307,7 @@ class SQLAgentGraph:
                 if call.get("call_type") == "agent_node":
                     tool_calls = call.get("output", {}).get("tool_calls", [])
                     for tc in tool_calls:
-                        if tc.get("name") == "execute_db_query":
+                        if tc.get("name") in ["execute_db_query", "count_query", "list_query"]:
                             sql_query_from_history = tc.get("sql_query", "")
                             break
                     if sql_query_from_history:

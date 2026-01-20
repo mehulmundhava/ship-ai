@@ -15,6 +15,7 @@ from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy.engine import Result
 from sqlalchemy import text
 from app.config.table_metadata import TABLE_METADATA
+from app.utils.csv_generator import format_result_with_csv, generate_csv_from_result
 
 # List of sensitive tables that should not be queried directly for raw data
 RESTRICTED_TABLES = [
@@ -133,6 +134,191 @@ def create_get_few_shot_examples_tool(vector_store_manager):
     return get_few_shot_examples
 
 
+def create_count_query_tool(db: SQLDatabase):
+    """
+    Create the count_query tool function for COUNT/aggregation queries.
+    
+    Args:
+        db: SQLDatabase instance
+        
+    Returns:
+        Tool function for executing COUNT queries
+    """
+    query_tool = QuerySQLDatabaseTool(db)
+    
+    @tool
+    def count_query(query: str) -> str:
+        """
+        Execute COUNT or aggregation queries and return only the count/aggregation result.
+        
+        Use this tool when the user asks for:
+        - Counts (e.g., "how many devices", "count of assets")
+        - Totals (e.g., "total temperature", "sum of battery")
+        - Aggregations (e.g., "average temperature", "maximum battery")
+        
+        This tool is optimized for queries that return a single aggregated value.
+        
+        Args:
+            query: SQL query that returns a count or aggregation (should use COUNT, SUM, AVG, MAX, MIN)
+            
+        Returns:
+            Count or aggregation result as string
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: count_query")
+        print(f"{'='*80}")
+        print(f"   SQL Query: {query}")
+        
+        # Execute query
+        output = query_tool.db.run_no_throw(query, include_columns=True)
+        
+        if not output:
+            print(f"   Result: No rows returned")
+            print(f"{'='*80}\n")
+            return "0"
+        
+        result = str(output)
+        print(f"   Count Result: {result}")
+        print(f"{'='*80}\n")
+        
+        return result
+    
+    return count_query
+
+
+def create_list_query_tool(db: SQLDatabase):
+    """
+    Create the list_query tool function for LIST queries.
+    
+    Args:
+        db: SQLDatabase instance
+        
+    Returns:
+        Tool function for executing LIST queries
+    """
+    query_tool = QuerySQLDatabaseTool(db)
+    
+    @tool
+    def list_query(query: str, limit: int = 5) -> str:
+        """
+        Execute LIST queries and return first N rows only.
+        
+        Use this tool when the user asks for:
+        - Lists of items (e.g., "list devices", "show assets", "get all facilities")
+        - Multiple rows of data
+        
+        IMPORTANT: This tool automatically limits results to the first 5 rows by default.
+        If the query returns more than 5 rows, it will:
+        1. Return the count of total rows
+        2. Show the first 5 rows
+        3. Provide a CSV download link for the full results
+        
+        Args:
+            query: SQL query that returns a list of rows
+            limit: Maximum number of rows to return in preview (default: 5)
+            
+        Returns:
+            First N rows as formatted string, with count and CSV link if > limit rows
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: list_query")
+        print(f"{'='*80}")
+        print(f"   SQL Query: {query}")
+        print(f"   Limit: {limit}")
+        
+        # Ensure query has LIMIT clause (add if not present)
+        query_upper = query.upper().strip()
+        if 'LIMIT' not in query_upper:
+            # Add LIMIT to get all rows (we'll handle splitting in result processing)
+            # But first, let's execute without modifying to preserve original query
+            pass
+        
+        # Execute query
+        output = query_tool.db.run_no_throw(query, include_columns=True)
+        
+        if not output:
+            print(f"   Result: No rows returned")
+            print(f"{'='*80}\n")
+            return ":::::: Query execution has returned 0 rows. Return final answer accordingly. ::::::"
+        
+        result = str(output)
+        
+        # Format result with CSV if needed
+        formatted_result = format_result_with_csv(result, max_preview_rows=limit)
+        
+        print(f"   Formatted result with splitting logic")
+        print(f"{'='*80}\n")
+        
+        return formatted_result
+    
+    return list_query
+
+
+def create_get_extra_examples_tool(vector_store_manager):
+    """
+    Create the get_extra_examples tool function (alias for get_few_shot_examples).
+    
+    Args:
+        vector_store_manager: VectorStoreService instance
+        
+    Returns:
+        Tool function for retrieving additional examples
+    """
+    @tool
+    def get_extra_examples(question: str) -> str:
+        """
+        Retrieve additional similar example queries beyond the 2 pre-loaded examples.
+        
+        NOTE: You already have 1-2 relevant examples pre-loaded in your system prompt.
+        Use this tool ONLY when:
+        - You need MORE examples beyond what's already provided
+        - The pre-loaded examples don't match your specific use case
+        - You need additional business rules or schema information
+        
+        This is an alias for get_few_shot_examples for clarity.
+        
+        Args:
+            question: The user's question to find similar examples for
+            
+        Returns:
+            A formatted string containing similar examples and relevant context
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: get_extra_examples")
+        print(f"{'='*80}")
+        print(f"   Input Question: {question}")
+        
+        # Search for similar examples (same logic as get_few_shot_examples)
+        example_docs = vector_store_manager.search_examples(question, k=3)
+        extra_docs = vector_store_manager.search_extra_prompts(question, k=2)
+        
+        result_parts = []
+        
+        if example_docs:
+            result_parts.append("=== SIMILAR EXAMPLE QUERIES ===\n")
+            for i, doc in enumerate(example_docs, 1):
+                result_parts.append(f"Example {i}:\n{doc.page_content}\n")
+        
+        if extra_docs:
+            result_parts.append("\n=== RELEVANT BUSINESS RULES & SCHEMA INFO ===\n")
+            for i, doc in enumerate(extra_docs, 1):
+                result_parts.append(f"{i}. {doc.page_content}\n")
+        
+        if not result_parts:
+            print(f"   Result: No similar examples found")
+            print(f"{'='*80}\n")
+            return "No similar examples found. Proceed with your knowledge of the database schema."
+        
+        result = "\n".join(result_parts)
+        print(f"   Result: Found {len(example_docs)} examples and {len(extra_docs)} extra prompts")
+        print(f"   Output length: {len(result)} characters")
+        print(f"{'='*80}\n")
+        
+        return result
+    
+    return get_extra_examples
+
+
 class QuerySQLDatabaseTool:
     """
     Tool for executing SQL queries against PostgreSQL database.
@@ -141,9 +327,38 @@ class QuerySQLDatabaseTool:
     def __init__(self, db: SQLDatabase):
         self.db = db
     
+    def _detect_query_type(self, query: str) -> str:
+        """
+        Detect if query is COUNT, LIST, or other type.
+        
+        Args:
+            query: SQL query string
+            
+        Returns:
+            'count', 'list', or 'other'
+        """
+        query_upper = query.upper().strip()
+        
+        # Check for COUNT queries
+        if re.search(r'\bCOUNT\s*\(', query_upper):
+            return 'count'
+        
+        # Check for aggregation queries (SUM, AVG, MAX, MIN with GROUP BY or without)
+        if re.search(r'\b(SUM|AVG|MAX|MIN)\s*\(', query_upper):
+            # If it's just aggregation without GROUP BY, treat as count-like
+            if 'GROUP BY' not in query_upper:
+                return 'count'
+        
+        # Check for SELECT queries (list queries)
+        if query_upper.startswith('SELECT'):
+            return 'list'
+        
+        return 'other'
+    
     def execute(self, query: str) -> str:
         """
         Execute a SQL query and return results.
+        Automatically handles result splitting for large lists.
         
         Args:
             query: SQL query to execute
@@ -156,6 +371,10 @@ class QuerySQLDatabaseTool:
         print(f"{'='*80}")
         print(f"   SQL Query: {query}")
         
+        # Detect query type
+        query_type = self._detect_query_type(query)
+        print(f"   Detected Query Type: {query_type}")
+        
         # Execute query without throwing exceptions
         output = self.db.run_no_throw(query, include_columns=True)
         
@@ -166,12 +385,79 @@ class QuerySQLDatabaseTool:
             return ":::::: Query execution has returned 0 rows. Return final answer accordingly. ::::::"
         
         result = str(output)
-        result_preview = result[:300] + "..." if len(result) > 300 else result
-        print(f"   Result: {len(result)} characters")
-        print(f"   Preview: {result_preview}")
-        print(f"{'='*80}\n")
         
-        return result
+        # Handle result splitting for LIST queries
+        if query_type == 'list':
+            # Check if result is a Python list/dict format (from SQLDatabase)
+            import ast
+            
+            row_count = 0
+            is_dict_format = False
+            original_result = result
+            
+            # Try to parse as Python list/dict
+            try:
+                # Check if it looks like a Python list/dict representation
+                if result.strip().startswith('[') and ('{' in result or '[' in result):
+                    # Try to parse as JSON-like structure
+                    parsed = ast.literal_eval(result)
+                    if isinstance(parsed, list):
+                        row_count = len(parsed)
+                        is_dict_format = True
+                        # Convert to formatted string for CSV generation
+                        if parsed and isinstance(parsed[0], dict):
+                            # Convert list of dicts to pipe-separated format
+                            headers = list(parsed[0].keys())
+                            lines = [' | '.join(headers)]
+                            for row in parsed:
+                                values = [str(row.get(h, '')) for h in headers]
+                                lines.append(' | '.join(values))
+                            result = '\n'.join(lines)
+                            print(f"   Converted Python dict format to pipe-separated format")
+            except (ValueError, SyntaxError, AttributeError):
+                # Not a Python list format, parse as string
+                pass
+            
+            # If not dict format, parse as string
+            if not is_dict_format:
+                lines = result.strip().split('\n')
+                data_rows = [line for line in lines[1:] if line.strip()] if len(lines) > 1 else []
+                row_count = len(data_rows)
+            else:
+                # Count from the converted format
+                lines = result.strip().split('\n')
+                row_count = len(lines) - 1  # Exclude header
+            
+            print(f"   Result: {row_count} rows, {len(original_result)} characters")
+            
+            # If > 5 rows, format with CSV
+            if row_count > 5:
+                print(f"   Large result detected ({row_count} rows), generating CSV...")
+                formatted_result = format_result_with_csv(result, max_preview_rows=5)
+                print(f"   Formatted result with CSV link")
+                print(f"{'='*80}\n")
+                return formatted_result
+            else:
+                # <= 5 rows, return original format (or converted if dict format)
+                if is_dict_format:
+                    # Return the converted pipe-separated format for consistency
+                    result_preview = result[:300] + "..." if len(result) > 300 else result
+                    print(f"   Result preview: {result_preview}")
+                    print(f"{'='*80}\n")
+                    return result
+                else:
+                    # Return original string format
+                    result_preview = original_result[:300] + "..." if len(original_result) > 300 else original_result
+                    print(f"   Result preview: {result_preview}")
+                    print(f"{'='*80}\n")
+                    return original_result
+        else:
+            # COUNT or other queries - return as-is
+            result_preview = result[:300] + "..." if len(result) > 300 else result
+            print(f"   Result: {len(result)} characters")
+            print(f"   Preview: {result_preview}")
+            print(f"{'='*80}\n")
+            return result
 
 
 def _is_restricted_user_query(user_question: str) -> Tuple[bool, Optional[str]]:
