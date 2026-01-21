@@ -144,6 +144,7 @@ class VectorStoreService:
                     id,
                     question,
                     sql_query,
+                    description,
                     metadata,
                     {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
                 FROM ai_vector_examples
@@ -159,8 +160,15 @@ class VectorStoreService:
             # Convert results to Document objects
             documents = []
             for row in rows:
-                # Combine question and SQL for the document content
-                content = f"Question: {row.question}\n\nSQL Query:\n{row.sql_query}"
+                # Combine question, description (if available), and SQL for the document content
+                content_parts = [f"Question: {row.question}"]
+                
+                # Add description if available
+                if row.description:
+                    content_parts.append(f"Description: {row.description}")
+                
+                content_parts.append(f"\nSQL Query:\n{row.sql_query}")
+                content = "\n\n".join(content_parts)
                 
                 # Parse metadata - JSONB columns are typically returned as dicts by psycopg2
                 # But handle string case for safety

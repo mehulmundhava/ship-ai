@@ -19,7 +19,9 @@ from app.core.agent.agent_tools import (
     create_get_table_structure_tool,
     create_count_query_tool,
     create_list_query_tool,
-    create_get_extra_examples_tool
+    create_get_extra_examples_tool,
+    create_journey_list_tool,
+    create_journey_count_tool
 )
 from app.core.prompts import get_system_prompt
 from app.services.vector_store_service import VectorStoreService
@@ -108,6 +110,8 @@ class SQLAgentGraph:
         self.count_query_tool = create_count_query_tool(db)
         self.list_query_tool = create_list_query_tool(db)
         self.get_extra_examples_tool = create_get_extra_examples_tool(vector_store_manager)
+        self.journey_list_tool = create_journey_list_tool(db, user_id)
+        self.journey_count_tool = create_journey_count_tool(db, user_id)
         
         # Store the underlying query tool for direct execution
         from app.core.agent.agent_tools import QuerySQLDatabaseTool
@@ -116,6 +120,7 @@ class SQLAgentGraph:
         # Main tools for LLM (security guard is handled separately as direct LLM call)
         # Note: execute_db_query already handles result splitting automatically
         # The specialized tools (count_query, list_query) are available but optional
+        # Journey tools are for journey-related questions only
         self.tools = [
             self.get_examples_tool, 
             self.execute_db_query_tool,  # Main tool - handles both COUNT and LIST with auto-splitting
@@ -123,7 +128,9 @@ class SQLAgentGraph:
             self.list_query_tool,  # Optional: specialized for LIST queries
             self.get_extra_examples_tool,  # Alias for get_few_shot_examples
             self.get_table_list_tool,
-            self.get_table_structure_tool
+            self.get_table_structure_tool,
+            self.journey_list_tool,  # For journey lists and facility breakdowns
+            self.journey_count_tool  # For journey counts
         ]
         
         # Bind tools to LLM
@@ -191,10 +198,29 @@ class SQLAgentGraph:
             """Wrapper for tool node with logging and message preservation."""
             messages = state.get("messages", [])
             last_message = messages[-1] if messages else None
+            user_question = state.get("question", "")
             
             # CRITICAL: Preserve the full message history before tool execution
             # The ToolNode will only return ToolMessages, so we need to keep everything
             preserved_messages = messages.copy()
+            
+            # Extract from_facility from question if present (for journey tools)
+            from_facility = None
+            if user_question:
+                # Pattern: "starting from facility X" or "from facility X"
+                import re
+                patterns = [
+                    r'starting\s+from\s+facility\s+([A-Z0-9]+)',
+                    r'from\s+facility\s+([A-Z0-9]+)',
+                    r'journeys?\s+from\s+facility\s+([A-Z0-9]+)'
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, user_question, re.IGNORECASE)
+                    if match:
+                        from_facility = match.group(1).strip()
+                        logger.info(f"✅ Extracted from_facility from question: {from_facility}")
+                        print(f"✅ Extracted from_facility from question: {from_facility}")
+                        break
             
             if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
                 print(f"\n{'='*80}")
@@ -203,11 +229,27 @@ class SQLAgentGraph:
                 for tc in last_message.tool_calls:
                     tool_name = tc.get("name", "unknown")
                     tool_args = tc.get("args", {})
+                    
+                    # Inject from_facility into journey tool params if extracted from question
+                    if from_facility and tool_name in ["journey_list_tool", "journey_count_tool"]:
+                        if not tool_args.get("params"):
+                            tool_args["params"] = {}
+                        if "from_facility" not in tool_args["params"]:
+                            tool_args["params"]["from_facility"] = from_facility
+                            # Update the tool_call args directly (dicts are mutable)
+                            tc["args"] = tool_args
+                            logger.info(f"✅ Injected from_facility={from_facility} into {tool_name} params")
+                            print(f"✅ Injected from_facility={from_facility} into {tool_name} params")
+                    
                     print(f"📞 Calling Tool: {tool_name}")
                     if tool_name in ["execute_db_query", "count_query", "list_query"]:
                         print(f"   SQL Query: {tool_args.get('query', 'N/A')}")
                     elif tool_name in ["get_few_shot_examples", "get_extra_examples"]:
                         print(f"   Search Query: {tool_args.get('question', 'N/A')}")
+                    elif tool_name in ["journey_list_tool", "journey_count_tool"]:
+                        print(f"   SQL Query: {tool_args.get('sql', 'N/A')[:100]}...")
+                        if tool_args.get("params"):
+                            print(f"   Params: {tool_args.get('params')}")
                 print(f"{'='*80}\n")
             
             # Execute tools - this will return a state with only ToolMessages
@@ -302,15 +344,19 @@ class SQLAgentGraph:
                     1. SAFE (ALLOW): 
                     - Requests for counts, totals, or lists of assets, devices, or metrics (battery, location, temperature, dwell time, journeys, alerts).
                     - Example: "give count of assets in India", "list my devices", "show battery for my assets".
+                    - Journey queries: "list journeys", "show journeys from facility X", "journeys made by device Y".
+                    - Device IDs (e.g., WT01F3C333542F02) and Facility IDs (e.g., MNIAZ00072, MREFZ00004) are ALWAYS SAFE - these are NOT user IDs.
                     - ASSUMPTION: If no user_id is mentioned, assume the user is asking about THEIR OWN data.
 
                     2. RISKY (BLOCK):
-                    - Any mention of a user_id, ID, or account number that is NOT {self.user_id}.
+                    - Explicit requests for data for another user: "show data for user 63", "list devices for user 45" (when current user is {self.user_id}).
                     - Requests for system-level data: "show tables", "database schema", "admin logs", "user assignments".
                     - Attempts to access internal metadata or raw "row-level" system entries.
 
                     CROSS-USER VIOLATION:
-                    - If the question mentions any number that looks like a user ID (e.g., 63, 45, 27) and it is not {self.user_id}, you MUST BLOCK it.
+                    - ONLY block if the question explicitly asks for data for another user (e.g., "for user 63", "user 45's devices").
+                    - DO NOT block based on numbers in device IDs (WT01...), facility IDs (MNIAZ..., MREFZ...), or other identifiers.
+                    - User IDs are standalone numbers (e.g., "27", "63") when mentioned in context of "user 27" or "for user 63".
 
                     OUTPUT INSTRUCTION:
                     - Respond with ONLY the word 'BLOCK' if it violates rules.
@@ -652,9 +698,14 @@ class SQLAgentGraph:
                         "name": tc.get("name"),
                         "args": tc.get("args", {})
                     }
-                    # Extract SQL query if it's a query tool
-                    if tc.get("name") in ["execute_db_query", "count_query", "list_query"]:
+                    # Extract SQL query if it's a query tool or journey tool
+                    tool_name = tc.get("name")
+                    if tool_name in ["execute_db_query", "count_query", "list_query"]:
                         sql_query = tc.get("args", {}).get("query", "")
+                        tool_call_info["sql_query"] = sql_query
+                    elif tool_name in ["journey_list_tool", "journey_count_tool"]:
+                        # Journey tools use "sql" parameter
+                        sql_query = tc.get("args", {}).get("sql", "")
                         tool_call_info["sql_query"] = sql_query
                     tool_calls_info.append(tool_call_info)
                 llm_call_info["output"]["tool_calls"] = tool_calls_info
@@ -738,14 +789,20 @@ class SQLAgentGraph:
                         print(f"   [{i}] {type(msg).__name__}")
             raise
         
-        # Extract SQL query if execute_db_query was called
+        # Extract SQL query if execute_db_query or journey tools were called
         sql_query = state.get("sql_query")
         if hasattr(response, "tool_calls") and response.tool_calls:
             logger.debug(f"Extracting SQL from {len(response.tool_calls)} tool calls")
             for tool_call in response.tool_calls:
-                if tool_call["name"] in ["execute_db_query", "count_query", "list_query"]:
-                    sql_query = tool_call["args"]["query"]
-                    logger.info(f"✅ Extracted SQL from tool call ({tool_call['name']}): {sql_query[:100]}...")
+                tool_name = tool_call["name"]
+                if tool_name in ["execute_db_query", "count_query", "list_query"]:
+                    sql_query = tool_call["args"].get("query", "")
+                    logger.info(f"✅ Extracted SQL from tool call ({tool_name}): {sql_query[:100]}...")
+                    break
+                elif tool_name in ["journey_list_tool", "journey_count_tool"]:
+                    # Journey tools use "sql" parameter instead of "query"
+                    sql_query = tool_call["args"].get("sql", "")
+                    logger.info(f"✅ Extracted SQL from journey tool call ({tool_name}): {sql_query[:100]}...")
                     break
         
         # Check if we got query results from previous tool execution
@@ -790,9 +847,9 @@ class SQLAgentGraph:
         """
         messages = state.get("messages", [])
         
-        # Check if we have query results from any query tool
+        # Check if we have query results from any query tool (including journey tools)
         for msg in reversed(messages):
-            if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
+            if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
                 # We have query results - format answer directly without another agent call
                 logger.info(f"TOOL RESULT DETECTED ({msg.name}) - Routing directly to format_answer")
                 print(f"\n{'='*80}")
@@ -849,9 +906,9 @@ class SQLAgentGraph:
             print(f"✅ Decision: END - Query result found")
             return "end"
         
-        # Check if we have a tool message with results (from any query tool)
+        # Check if we have a tool message with results (from any query tool, including journey tools)
         for msg in reversed(messages):
-            if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
+            if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
                 # We have query results, format answer
                 logger.info(f"Decision: END - Found {msg.name} ToolMessage")
                 print(f"✅ Decision: END - Found {msg.name} ToolMessage")
@@ -859,9 +916,9 @@ class SQLAgentGraph:
         
         # If we have SQL query but no result yet, check if we already executed
         if state.get("sql_query"):
-            # Check if we already tried to execute (check all query tools)
+            # Check if we already tried to execute (check all query tools, including journey tools)
             for msg in messages:
-                if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
+                if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
                     # Already executed, should format answer
                     logger.info(f"Decision: END - SQL query already executed via {msg.name}")
                     print(f"✅ Decision: END - SQL query already executed via {msg.name}")
@@ -892,20 +949,23 @@ class SQLAgentGraph:
         
         # Extract query result from messages if not in state
         query_result = state.get("query_result", "")
+        journey_tool_used = False
         if not query_result:
-            # Try to extract from tool messages (check all query tools)
+            # Try to extract from tool messages (check all query tools, including journey tools)
             for msg in reversed(messages):
                 if isinstance(msg, ToolMessage):
                     tool_name = getattr(msg, 'name', '')
-                    if tool_name in ["execute_db_query", "count_query", "list_query"]:
+                    if tool_name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
                         query_result = msg.content
+                        if tool_name in ["journey_list_tool", "journey_count_tool"]:
+                            journey_tool_used = True
                         print(f"✅ Found query result from ToolMessage ({tool_name}): {query_result[:200]}...")
                         break
         
         # Extract SQL query from messages if not in state
         sql_query = state.get("sql_query", "")
         if not sql_query:
-            # Try to find SQL query in tool calls (check all query tools)
+            # Try to find SQL query in tool calls (check all query tools, including journey tools)
             logger.debug("SQL query not in state, searching in messages...")
             for msg in reversed(messages):
                 if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
@@ -915,6 +975,12 @@ class SQLAgentGraph:
                             sql_query = tool_call["args"].get("query", "")
                             logger.info(f"✅ Found SQL query from tool call ({tool_name}): {sql_query[:100]}...")
                             print(f"✅ Found SQL query from tool call ({tool_name}): {sql_query}")
+                            break
+                        elif tool_name in ["journey_list_tool", "journey_count_tool"]:
+                            # Journey tools use "sql" parameter
+                            sql_query = tool_call["args"].get("sql", "")
+                            logger.info(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query[:100]}...")
+                            print(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query}")
                             break
                     if sql_query:
                         break
@@ -945,16 +1011,72 @@ class SQLAgentGraph:
             # the final "explain the result" step.
             user_question = state.get("question", "")
             user_id = state.get("user_id", "")
+            
+            # For journey tools, add special instruction
+            journey_instruction = ""
+            if journey_tool_used:
+                journey_instruction = """
+                
+                IMPORTANT: The results are from journey calculation.
+                
+                For journey LISTS (journies array):
+                - If _showing_preview is true, only a sample is shown. Mention the total count and CSV link.
+                - If user asked for journeys "starting from facility X", the results are already filtered.
+                
+                For journey COUNTS (journey_details object):
+                - If user asks about facility type transitions (e.g., "M to R"):
+                  * Manufacturer types: "D" and "M"
+                  * Retailer type: "R"
+                  * Filter journey_details where from_type is "D" or "M" AND to_type is "R"
+                  * Sum the "count" values from matching entries
+                
+                Be concise. Focus on answering the specific question asked.
+                """
 
             # Extract CSV download link from query_result if present
             csv_download_url = None
-            csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
-            if csv_link_match:
-                csv_path = csv_link_match.group(1)
-                # Convert to full URL (using localhost:3009 as per user's example)
-                csv_download_url = f"http://localhost:3009{csv_path}"
-                logger.info(f"✅ Extracted CSV download link: {csv_download_url}")
-                print(f"✅ Extracted CSV download link: {csv_download_url}")
+            csv_id = None
+            
+            # Try to parse as JSON first (for journey tools)
+            result_dict = None
+            try:
+                if query_result.strip().startswith('{'):
+                    result_dict = json.loads(query_result)
+                    # Check for CSV link in journey results
+                    if 'csv_download_link' in result_dict:
+                        csv_path = result_dict['csv_download_link']
+                        csv_id = result_dict.get('csv_id')
+                        csv_download_url = f"http://localhost:3009{csv_path}"
+                        logger.info(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
+                        print(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
+            except (json.JSONDecodeError, KeyError, TypeError):
+                # Not JSON or no CSV link, try text format
+                pass
+            
+            # For journey tools, reduce token usage by filtering/truncating results before format_answer
+            if journey_tool_used and result_dict:
+                # If there are many journeys, only include a summary in the prompt
+                journies = result_dict.get('journies', [])
+                total_journeys = len(journies)
+                
+                if total_journeys > 10:
+                    # For large result sets, only include first 5 journeys in prompt
+                    # The CSV link will have all the data
+                    result_dict['journies'] = journies[:5]
+                    result_dict['_total_journeys'] = total_journeys
+                    result_dict['_showing_preview'] = True
+                    query_result = json.dumps(result_dict, indent=2, default=str)
+                    logger.info(f"📊 Reduced journey list from {total_journeys} to 5 for format_answer (token optimization)")
+                    print(f"📊 Token optimization: Showing only 5 of {total_journeys} journeys in prompt")
+            
+            # If not found in JSON, try text format (for regular SQL queries)
+            if not csv_download_url:
+                csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
+                if csv_link_match:
+                    csv_path = csv_link_match.group(1)
+                    csv_download_url = f"http://localhost:3009{csv_path}"
+                    logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
+                    print(f"✅ Extracted CSV download link from text: {csv_download_url}")
 
             # Build the prompt with CSV link if available
             csv_link_instruction = ""
@@ -969,7 +1091,7 @@ class SQLAgentGraph:
                 - Do NOT mention or describe table names, column names, joins, or SQL syntax.
                 - Do NOT reveal anything about database schema or internal implementation.
                 - Answer ONLY for the active user_id if relevant: {user_id}.
-                - Be concise and focus on what the numbers mean for the question.{csv_link_instruction}
+                - Be concise and focus on what the numbers mean for the question.{csv_link_instruction}{journey_instruction}
 
                 User Question:
                 {user_question}
@@ -977,7 +1099,7 @@ class SQLAgentGraph:
                 SQL Query (for your reference only, do NOT explain it explicitly):
                 {sql_query}
 
-                SQL Query Results:
+                Query Results:
                 {query_result}
 
                 Now provide a short, user-friendly answer to the question based on these results.
@@ -1090,13 +1212,29 @@ class SQLAgentGraph:
                                     
                                     # Extract CSV download link from query_result if present
                                     csv_download_url = None
-                                    csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
-                                    if csv_link_match:
-                                        csv_path = csv_link_match.group(1)
-                                        # Convert to full URL (using localhost:3009 as per user's example)
-                                        csv_download_url = f"http://localhost:3009{csv_path}"
-                                        logger.info(f"✅ Extracted CSV download link: {csv_download_url}")
-                                        print(f"✅ Extracted CSV download link: {csv_download_url}")
+                                    csv_id = None
+                                    
+                                    # Try to parse as JSON first (for journey tools)
+                                    try:
+                                        if query_result.strip().startswith('{'):
+                                            result_dict = json.loads(query_result)
+                                            if 'csv_download_link' in result_dict:
+                                                csv_path = result_dict['csv_download_link']
+                                                csv_id = result_dict.get('csv_id')
+                                                csv_download_url = f"http://localhost:3009{csv_path}"
+                                                logger.info(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
+                                                print(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
+                                    except (json.JSONDecodeError, KeyError, TypeError):
+                                        pass
+                                    
+                                    # If not found in JSON, try text format
+                                    if not csv_download_url:
+                                        csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
+                                        if csv_link_match:
+                                            csv_path = csv_link_match.group(1)
+                                            csv_download_url = f"http://localhost:3009{csv_path}"
+                                            logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
+                                            print(f"✅ Extracted CSV download link from text: {csv_download_url}")
 
                                     # Build the prompt with CSV link if available
                                     csv_link_instruction = ""
@@ -1195,21 +1333,26 @@ class SQLAgentGraph:
         # Extract query result from messages if not already set
         query_result = final_state.get("query_result")
         if not query_result:
-            # Try to extract from tool messages (check all query tools)
+            # Try to extract from tool messages (check all query tools, including journey tools)
             for msg in reversed(final_state.get("messages", [])):
-                if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
+                if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
                     query_result = msg.content
                     break
         
         # Also extract SQL query from messages if not set
         sql_query = final_state.get("sql_query")
         if not sql_query:
-            # Try to find SQL query in tool calls (check all query tools)
+            # Try to find SQL query in tool calls (check all query tools, including journey tools)
             for msg in reversed(final_state.get("messages", [])):
                 if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
                     for tool_call in msg.tool_calls:
-                        if tool_call["name"] in ["execute_db_query", "count_query", "list_query"]:
+                        tool_name = tool_call["name"]
+                        if tool_name in ["execute_db_query", "count_query", "list_query"]:
                             sql_query = tool_call["args"].get("query", "")
+                            break
+                        elif tool_name in ["journey_list_tool", "journey_count_tool"]:
+                            # Journey tools use "sql" parameter
+                            sql_query = tool_call["args"].get("sql", "")
                             break
                     if sql_query:
                         break
@@ -1242,6 +1385,22 @@ class SQLAgentGraph:
         messages = state.get("messages", [])
         token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
         llm_call_history = state.get("llm_call_history", [])
+        
+        # Extract tools used from message history
+        tools_used = []
+        tool_names_seen = set()
+        for msg in messages:
+            if isinstance(msg, ToolMessage):
+                tool_name = getattr(msg, 'name', 'unknown')
+                if tool_name not in tool_names_seen:
+                    tools_used.append(tool_name)
+                    tool_names_seen.add(tool_name)
+            elif isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_name = tc.get("name", "unknown")
+                    if tool_name not in tool_names_seen:
+                        tools_used.append(tool_name)
+                        tool_names_seen.add(tool_name)
         
         # Calculate token usage from llm_call_history as source of truth
         calculated_token_usage = {"input": 0, "output": 0, "total": 0}
@@ -1278,7 +1437,7 @@ class SQLAgentGraph:
                             "name": tc.get("name"),
                             "args": tc.get("args", {})
                         }
-                        if tc.get("name") in ["execute_db_query", "count_query", "list_query"]:
+                        if tc.get("name") in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
                             tool_call_info["sql_query"] = tc.get("args", {}).get("query", "")
                         msg_info["tool_calls"].append(tool_call_info)
                 
@@ -1307,8 +1466,12 @@ class SQLAgentGraph:
                 if call.get("call_type") == "agent_node":
                     tool_calls = call.get("output", {}).get("tool_calls", [])
                     for tc in tool_calls:
-                        if tc.get("name") in ["execute_db_query", "count_query", "list_query"]:
-                            sql_query_from_history = tc.get("sql_query", "")
+                        tool_name = tc.get("name")
+                        if tool_name in ["execute_db_query", "count_query", "list_query"]:
+                            sql_query_from_history = tc.get("sql_query", "") or tc.get("args", {}).get("query", "")
+                            break
+                        elif tool_name in ["journey_list_tool", "journey_count_tool"]:
+                            sql_query_from_history = tc.get("sql_query", "") or tc.get("args", {}).get("sql", "")
                             break
                     if sql_query_from_history:
                         break
@@ -1322,6 +1485,7 @@ class SQLAgentGraph:
             # - security_guard: Query validation (if query is blocked/allowed)
             # - agent_node: SQL query generation (includes tool_calls with SQL queries)
             # - format_answer: Human-readable answer generation
+            "tools_used": tools_used,  # Ordered list of tools actually called
             "token_usage": {
                 "input_tokens": final_token_usage.get("input", 0),
                 "output_tokens": final_token_usage.get("output", 0),

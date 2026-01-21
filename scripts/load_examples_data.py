@@ -30,6 +30,7 @@ def load_examples_data():
             for example in SAMPLE_EXAMPLES:
                 question = example.get('question', '')
                 sql_query = example.get('sql', '')
+                description = example.get('description', None)  # Optional description field
                 metadata = example.get('metadata', {})
                 
                 # Convert metadata dict to JSON string
@@ -49,12 +50,14 @@ def load_examples_data():
                         UPDATE ai_vector_examples
                         SET 
                             sql_query = :sql_query,
+                            description = :description,
                             metadata = CAST(:metadata AS jsonb)
                         WHERE id = :id
                     """)
                     conn.execute(update_query, {
                         "id": existing[0],
                         "sql_query": sql_query,
+                        "description": description,
                         "metadata": metadata_json
                     })
                     conn.commit()
@@ -63,12 +66,13 @@ def load_examples_data():
                 else:
                     # Insert new record
                     insert_query = text("""
-                        INSERT INTO ai_vector_examples (question, sql_query, metadata)
-                        VALUES (:question, :sql_query, CAST(:metadata AS jsonb))
+                        INSERT INTO ai_vector_examples (question, sql_query, description, metadata)
+                        VALUES (:question, :sql_query, :description, CAST(:metadata AS jsonb))
                     """)
                     conn.execute(insert_query, {
                         "question": question,
                         "sql_query": sql_query,
+                        "description": description,
                         "metadata": metadata_json
                     })
                     conn.commit()

@@ -10,12 +10,14 @@ This module defines tools that the agent can use:
 
 from typing import Optional, Dict, Any, Sequence, Tuple, List
 import re
+import json
 from langchain_core.tools import tool
 from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy.engine import Result
 from sqlalchemy import text
 from app.config.table_metadata import TABLE_METADATA
-from app.utils.csv_generator import format_result_with_csv, generate_csv_from_result
+from app.utils.csv_generator import format_result_with_csv, generate_csv_from_result, format_journey_list_with_csv
+from app.core.journey_calculator import calculate_journey_counts, calculate_journey_list
 
 # List of sensitive tables that should not be queried directly for raw data
 RESTRICTED_TABLES = [
@@ -830,4 +832,430 @@ def create_get_table_structure_tool(db: SQLDatabase):
             return error_msg
     
     return get_table_structure
+
+
+def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
+    """
+    Create the journey_list_tool function for journey lists and facility breakdowns.
+    
+    This tool:
+    1. Executes SQL to fetch raw geofencing rows
+    2. Runs Python journey calculation algorithm
+    3. Returns structured journey list (NOT raw SQL rows)
+    
+    Args:
+        db: SQLDatabase instance
+        user_id: User ID for access control
+        
+    Returns:
+        Tool function for calculating journey lists
+    """
+    query_tool = QuerySQLDatabaseTool(db)
+    
+    @tool
+    def journey_list_tool(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Calculate and return journey list from geofencing data.
+        
+        IMPORTANT: This tool is for JOURNEY-RELATED questions only.
+        Use this tool when the user asks about:
+        - Journey lists
+        - Facility to facility breakdowns
+        - Device-level journeys
+        - Movement between facilities
+        
+        This tool:
+        1. Executes the provided SQL query to fetch raw geofencing rows
+        2. Runs Python journey calculation algorithm (NOT SQL)
+        3. Returns structured journey data with facility details
+        
+        The SQL query should fetch geofencing rows with:
+        - device_id
+        - facility_id
+        - facility_type (optional)
+        - facility_name (optional)
+        - entry_event_time (Unix timestamp)
+        - exit_event_time (Unix timestamp)
+        
+        Results should be ordered by entry_event_time ASC.
+        
+        Args:
+            sql: SQL query to fetch geofencing rows (SELECT only)
+            params: Optional parameters dict with:
+                - start_date: Start date filter (optional)
+                - end_date: End date filter (optional)
+                - device_id: Specific device ID (optional)
+                - extraJourneyTimeLimit: Extra hours for same-facility journeys (optional)
+                - offset: Pagination offset (optional)
+                - from_facility: Filter journeys that START from this facility ID (optional)
+        
+        Returns:
+            JSON string with:
+            - facilities_details: Dict mapping facility_id to facility info
+            - journies: List of journey objects with from_facility, to_facility, device_id, times
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: journey_list_tool")
+        print(f"{'='*80}")
+        print(f"   SQL Query: {sql}")
+        print(f"   Params: {params}")
+        
+        # Validate SQL is SELECT only
+        sql_upper = sql.strip().upper()
+        if not sql_upper.startswith('SELECT'):
+            error_msg = "Only SELECT queries are allowed for journey calculations"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return error_msg
+        
+        # Execute query
+        try:
+            output = query_tool.db.run_no_throw(sql, include_columns=True)
+            
+            if not output:
+                print(f"   Result: No geofencing rows returned")
+                print(f"{'='*80}\n")
+                return json.dumps({
+                    "facilities_details": {},
+                    "journies": []
+                })
+            
+            # Debug: Log the raw SQL output format
+            print(f"   Raw SQL output type: {type(output)}")
+            print(f"   Raw SQL output length: {len(str(output)) if output else 0}")
+            print(f"   Raw SQL output preview (first 500 chars): {str(output)[:500] if output else 'None'}")
+            
+            # Parse query results into list of dicts
+            geofencing_rows = _parse_sql_result_to_dicts(output)
+            
+            print(f"   Parsed {len(geofencing_rows)} geofencing rows from SQL result")
+            
+            if not geofencing_rows:
+                print(f"   ⚠️ WARNING: SQL returned data but parsing failed!")
+                print(f"   Raw output was: {str(output)[:1000] if output else 'None'}")
+                print(f"{'='*80}\n")
+                # Return error with raw data info
+                return json.dumps({
+                    "error": "Failed to parse SQL results",
+                    "raw_output_preview": str(output)[:500] if output else None,
+                    "facilities_details": {},
+                    "journies": []
+                })
+            
+            # Extract parameters
+            extra_journey_time_limit = None
+            from_facility = None
+            if params:
+                extra_journey_time_limit = params.get("extraJourneyTimeLimit")
+                from_facility = params.get("from_facility")
+            
+            # Run Python journey calculation
+            filter_note = f" (filtering from_facility={from_facility})" if from_facility else ""
+            print(f"   Processing {len(geofencing_rows)} geofencing rows with Python journey algorithm{filter_note}...")
+            journey_result = calculate_journey_list(geofencing_rows, extra_journey_time_limit, from_facility)
+            
+            journey_count = len(journey_result.get('journies', []))
+            facilities_count = len(journey_result.get('facilities_details', {}))
+            
+            # Format result with CSV if > 5 journeys
+            if journey_count > 5:
+                print(f"   📊 Large result detected ({journey_count} journeys), generating CSV...")
+                result_json = format_journey_list_with_csv(journey_result, max_preview=5)
+                print(f"   ✅ Showing first 5 journeys, CSV available for all {journey_count} journeys")
+            else:
+                # Format result normally (no CSV needed)
+                result_json = json.dumps(journey_result, indent=2, default=str)
+                print(f"   ✅ Showing all {journey_count} journeys (no CSV needed)")
+            
+            print(f"   Found {facilities_count} unique facilities")
+            print(f"{'='*80}\n")
+            
+            return result_json
+            
+        except Exception as e:
+            error_msg = f"Error calculating journeys: {str(e)}"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            import traceback
+            traceback.print_exc()
+            return error_msg
+    
+    return journey_list_tool
+
+
+def create_journey_count_tool(db: SQLDatabase, user_id: Optional[str] = None):
+    """
+    Create the journey_count_tool function for journey counts.
+    
+    This tool:
+    1. Executes SQL to fetch raw geofencing rows
+    2. Runs Python journey count algorithm
+    3. Returns journey counts by facility pair
+    
+    Args:
+        db: SQLDatabase instance
+        user_id: User ID for access control
+        
+    Returns:
+        Tool function for calculating journey counts
+    """
+    query_tool = QuerySQLDatabaseTool(db)
+    
+    @tool
+    def journey_count_tool(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Calculate and return journey counts from geofencing data.
+        
+        IMPORTANT: This tool is for JOURNEY COUNT questions only.
+        Use this tool when the user asks:
+        - "How many journeys..."
+        - "Total journeys..."
+        - "Count between facilities"
+        - "Number of journeys from X to Y"
+        
+        This tool:
+        1. Executes the provided SQL query to fetch raw geofencing rows
+        2. Runs Python journey count algorithm (NOT SQL)
+        3. Returns journey counts by facility pair
+        
+        The SQL query should fetch geofencing rows with:
+        - device_id
+        - facility_id
+        - entry_event_time (Unix timestamp)
+        - exit_event_time (Unix timestamp)
+        
+        Results should be ordered by entry_event_time ASC.
+        
+        Args:
+            sql: SQL query to fetch geofencing rows (SELECT only)
+            params: Optional parameters dict with:
+                - start_date: Start date filter (optional)
+                - end_date: End date filter (optional)
+                - device_id: Specific device ID (optional)
+                - extraJourneyTimeLimit: Extra hours for same-facility journeys (optional)
+        
+        Returns:
+            JSON string with:
+            - counts: Dict mapping "facilityA||facilityB" to count
+            - total: Total number of journeys
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: journey_count_tool")
+        print(f"{'='*80}")
+        print(f"   SQL Query: {sql}")
+        print(f"   Params: {params}")
+        
+        # Validate SQL is SELECT only
+        sql_upper = sql.strip().upper()
+        if not sql_upper.startswith('SELECT'):
+            error_msg = "Only SELECT queries are allowed for journey calculations"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return error_msg
+        
+        # Execute query
+        try:
+            output = query_tool.db.run_no_throw(sql, include_columns=True)
+            
+            if not output:
+                print(f"   Result: No geofencing rows returned")
+                print(f"{'='*80}\n")
+                return json.dumps({
+                    "counts": {},
+                    "total": 0
+                })
+            
+            # Debug: Log the raw SQL output format
+            print(f"   Raw SQL output type: {type(output)}")
+            print(f"   Raw SQL output length: {len(str(output)) if output else 0}")
+            print(f"   Raw SQL output preview (first 500 chars): {str(output)[:500] if output else 'None'}")
+            
+            # Parse query results into list of dicts
+            geofencing_rows = _parse_sql_result_to_dicts(output)
+            
+            print(f"   Parsed {len(geofencing_rows)} geofencing rows from SQL result")
+            
+            if not geofencing_rows:
+                print(f"   ⚠️ WARNING: SQL returned data but parsing failed!")
+                print(f"   Raw output was: {str(output)[:1000] if output else 'None'}")
+                print(f"{'='*80}\n")
+                # Return error with raw data info
+                return json.dumps({
+                    "error": "Failed to parse SQL results",
+                    "raw_output_preview": str(output)[:500] if output else None,
+                    "counts": {},
+                    "total": 0
+                })
+            
+            # Extract extraJourneyTimeLimit from params
+            extra_journey_time_limit = None
+            if params:
+                extra_journey_time_limit = params.get("extraJourneyTimeLimit")
+            
+            # Run Python journey calculation
+            print(f"   Processing {len(geofencing_rows)} geofencing rows with Python journey algorithm...")
+            journey_result = calculate_journey_counts(geofencing_rows, extra_journey_time_limit)
+            
+            # Log metadata for debugging
+            metadata = journey_result.get('metadata', {})
+            if metadata:
+                print(f"   📊 Metadata: {metadata.get('total_rows_processed', 0)} rows, "
+                      f"{metadata.get('devices_processed', 0)} devices, "
+                      f"facility types: {metadata.get('facility_types_found', [])}")
+            
+            # Format result
+            result_json = json.dumps(journey_result, indent=2, default=str)
+            
+            total_journeys = journey_result.get('total', 0)
+            print(f"   ✅ Calculated {total_journeys} total journeys")
+            print(f"   Found {len(journey_result.get('counts', {}))} unique facility pairs")
+            
+            if total_journeys == 0 and len(geofencing_rows) > 0:
+                print(f"   ⚠️ NOTE: Found {len(geofencing_rows)} geofencing records but 0 journeys")
+                print(f"   This could mean: same facility only, or journey time < 4 hours")
+            
+            print(f"{'='*80}\n")
+            
+            return result_json
+            
+        except Exception as e:
+            error_msg = f"Error calculating journey counts: {str(e)}"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            import traceback
+            traceback.print_exc()
+            return error_msg
+    
+    return journey_count_tool
+
+
+def _parse_sql_result_to_dicts(sql_result: str) -> List[Dict[str, Any]]:
+    """
+    Parse SQL result string into list of dictionaries.
+    
+    Handles different SQL result formats from SQLDatabase.run_no_throw().
+    
+    Args:
+        sql_result: SQL result string (can be pipe-separated, JSON, or Python list format)
+        
+    Returns:
+        List of dictionaries with row data
+    """
+    rows = []
+    
+    if not sql_result or not sql_result.strip():
+        return rows
+    
+    # Try to parse as Python list/dict format first
+    import ast
+    import datetime as dt_module
+    from datetime import datetime
+    try:
+        if sql_result.strip().startswith('['):
+            # First try ast.literal_eval (safe, but doesn't handle datetime objects)
+            try:
+                parsed = ast.literal_eval(sql_result)
+                if isinstance(parsed, list):
+                    return parsed
+            except (ValueError, SyntaxError):
+                # If that fails, it might contain datetime objects
+                # Use eval() with a safe namespace (only datetime module and class allowed)
+                # This handles cases like: [{'entry_event_time': datetime.datetime(2024, 12, 6, 15, 14, 59), ...}]
+                # The string uses datetime.datetime(...) so we need both the module and the class
+                safe_dict = {
+                    '__builtins__': {},
+                    'datetime': dt_module,  # Provide the datetime module so datetime.datetime works
+                    'dict': dict,
+                    'list': list,
+                    'tuple': tuple,
+                    'None': None,
+                    'True': True,
+                    'False': False
+                }
+                parsed = eval(sql_result, safe_dict)
+                if isinstance(parsed, list):
+                    # datetime objects are preserved - perfect!
+                    return parsed
+    except (ValueError, SyntaxError, NameError, TypeError) as e:
+        logger.debug(f"Failed to parse as Python list: {e}")
+        pass
+    
+    # Try to parse as JSON
+    try:
+        parsed = json.loads(sql_result)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    
+    # Parse as pipe-separated format (default SQLDatabase format)
+    lines = sql_result.strip().split('\n')
+    if len(lines) < 2:
+        return rows
+    
+    # First line is headers
+    headers = [h.strip() for h in lines[0].split('|')]
+    headers = [h for h in headers if h]  # Remove empty headers
+    
+    # Remaining lines are data
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        
+        values = [v.strip() for v in line.split('|')]
+        values = [v for v in values if v]  # Remove empty values
+        
+        if len(values) != len(headers):
+            continue
+        
+        row_dict = {}
+        for i, header in enumerate(headers):
+            value = values[i] if i < len(values) else None
+            
+            # Try to convert numeric values or parse timestamps
+            if value:
+                # Check if it looks like a timestamp string (for entry_event_time, exit_event_time columns)
+                if isinstance(value, str) and ('event_time' in header.lower() or 'time' in header.lower()):
+                    # Try to parse as timestamp (common PostgreSQL formats)
+                    from datetime import datetime
+                    timestamp_formats = [
+                        '%Y-%m-%d %H:%M:%S.%f',
+                        '%Y-%m-%d %H:%M:%S',
+                        '%Y-%m-%dT%H:%M:%S.%f',
+                        '%Y-%m-%dT%H:%M:%S',
+                        '%Y-%m-%d %H:%M:%S+00:00',
+                        '%Y-%m-%d %H:%M:%S.%f+00:00'
+                    ]
+                    timestamp_parsed = False
+                    for fmt in timestamp_formats:
+                        try:
+                            value = datetime.strptime(value, fmt)
+                            timestamp_parsed = True
+                            break
+                        except ValueError:
+                            continue
+                    
+                    # If timestamp parsing failed, keep as string (will be handled by _convert_to_unix_timestamp)
+                    if not timestamp_parsed:
+                        # Keep as string - _convert_to_unix_timestamp will handle it
+                        pass
+                elif isinstance(value, str):
+                    # For non-timestamp strings, try numeric conversion
+                    try:
+                        # Try float first (handles decimals)
+                        if '.' in value and not any(c.isalpha() for c in value):
+                            value = float(value)
+                        elif not any(c.isalpha() for c in value):
+                            # Try int
+                            value = int(value)
+                    except ValueError:
+                        # Keep as string
+                        pass
+                # If it's already a datetime, int, or float, keep as is
+            
+            row_dict[header] = value
+        
+        rows.append(row_dict)
+    
+    return rows
 

@@ -9,6 +9,7 @@ import csv
 import io
 import base64
 import uuid
+import json
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import logging
@@ -117,6 +118,154 @@ def get_csv_by_id(csv_id: str) -> Optional[str]:
         Base64 encoded CSV string, or None if not found
     """
     return _csv_storage.get(csv_id)
+
+
+def generate_csv_from_journey_list(journey_result: Dict[str, Any], max_preview: int = 5) -> Optional[Dict[str, Any]]:
+    """
+    Generate CSV from journey list result.
+    
+    Args:
+        journey_result: Journey result dict with 'journies' and 'facilities_details'
+        max_preview: Maximum number of journeys to show in preview (default: 5)
+        
+    Returns:
+        Dictionary with CSV metadata and formatted result string, or None if no journeys
+    """
+    try:
+        journies = journey_result.get('journies', [])
+        facilities_details = journey_result.get('facilities_details', {})
+        
+        if not journies:
+            return None
+        
+        total_journeys = len(journies)
+        
+        # If <= max_preview, return full result without CSV
+        if total_journeys <= max_preview:
+            return None
+        
+        # Prepare CSV headers
+        headers = [
+            'from_facility',
+            'to_facility',
+            'device_id',
+            'journey_time_seconds',
+            'entry_time',
+            'exit_time',
+            'from_facility_type',
+            'to_facility_type',
+            'from_facility_name',
+            'to_facility_name'
+        ]
+        
+        # Convert journeys to CSV rows
+        csv_rows = []
+        for journey in journies:
+            from_fac = journey.get('from_facility', '')
+            to_fac = journey.get('to_facility', '')
+            
+            # Get facility details
+            from_fac_details = facilities_details.get(from_fac, {})
+            to_fac_details = facilities_details.get(to_fac, {})
+            
+            row = {
+                'from_facility': from_fac,
+                'to_facility': to_fac,
+                'device_id': journey.get('device_id', ''),
+                'journey_time_seconds': journey.get('journey_time', ''),
+                'entry_time': journey.get('entry_time', ''),
+                'exit_time': journey.get('exit_time', ''),
+                'from_facility_type': from_fac_details.get('facility_type', ''),
+                'to_facility_type': to_fac_details.get('facility_type', ''),
+                'from_facility_name': from_fac_details.get('facility_name', ''),
+                'to_facility_name': to_fac_details.get('facility_name', '')
+            }
+            csv_rows.append(row)
+        
+        # Generate CSV in memory
+        csv_buffer = io.StringIO()
+        writer = csv.DictWriter(csv_buffer, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+        csv_content = csv_buffer.getvalue()
+        
+        # Encode to base64
+        csv_bytes = csv_content.encode('utf-8')
+        csv_base64 = base64.b64encode(csv_bytes).decode('utf-8')
+        
+        # Generate unique ID
+        csv_id = str(uuid.uuid4())
+        
+        # Store CSV
+        _csv_storage[csv_id] = csv_base64
+        
+        # Get preview journeys (first max_preview)
+        preview_journies = journies[:max_preview]
+        
+        # Generate download link
+        csv_link = f"/download-csv/{csv_id}"
+        
+        logger.info(f"Generated journey CSV: {total_journeys} journeys, ID: {csv_id}")
+        
+        return {
+            "csv_data": csv_base64,
+            "csv_id": csv_id,
+            "row_count": total_journeys,
+            "preview_journies": preview_journies,
+            "csv_link": csv_link,
+            "headers": headers
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating journey CSV: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def format_journey_list_with_csv(journey_result: Dict[str, Any], max_preview: int = 5) -> str:
+    """
+    Format journey list result with CSV generation for large results.
+    
+    Args:
+        journey_result: Journey result dict with 'journies' and 'facilities_details'
+        max_preview: Maximum journeys to show in preview (default: 5)
+        
+    Returns:
+        JSON string with preview and CSV link if > max_preview journeys
+    """
+    try:
+        journies = journey_result.get('journies', [])
+        total_journeys = len(journies)
+        
+        # If <= max_preview, return full result
+        if total_journeys <= max_preview:
+            return json.dumps(journey_result, indent=2, default=str)
+        
+        # Generate CSV for large results
+        csv_info = generate_csv_from_journey_list(journey_result, max_preview)
+        
+        if not csv_info:
+            # Fallback: return full result
+            return json.dumps(journey_result, indent=2, default=str)
+        
+        # Create result with preview and CSV link
+        preview_result = {
+            "facilities_details": journey_result.get('facilities_details', {}),
+            "journies": csv_info['preview_journies'],
+            "total_journeys": total_journeys,
+            "preview_count": max_preview,
+            "csv_download_link": csv_info['csv_link'],
+            "csv_id": csv_info['csv_id'],
+            "note": f"Showing first {max_preview} of {total_journeys} journeys. Download full results via CSV link."
+        }
+        
+        return json.dumps(preview_result, indent=2, default=str)
+        
+    except Exception as e:
+        logger.error(f"Error formatting journey list with CSV: {e}")
+        # Fallback: return original result
+        return json.dumps(journey_result, indent=2, default=str)
 
 
 def format_result_with_csv(result_text: str, max_preview_rows: int = 5) -> str:

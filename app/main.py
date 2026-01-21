@@ -88,6 +88,11 @@ async def lifespan(app: FastAPI):
     
     logger.info("✅ Application ready to serve requests")
     
+    # Print red cross marks to indicate startup completion
+    print("\n" + "❌" * 50)
+    print("INFO:     Application startup complete.")
+    print("❌" * 50 + "\n")
+    
     # Yield control back to FastAPI
     yield
     

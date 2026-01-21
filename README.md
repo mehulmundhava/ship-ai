@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS ai_vector_examples (
     id BIGSERIAL PRIMARY KEY,
     question TEXT NOT NULL,
     sql_query TEXT NOT NULL,
+    description TEXT,  -- Optional description for the example
     metadata JSONB DEFAULT '{}',
     minilm_embedding VECTOR(384),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
