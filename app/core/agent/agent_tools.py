@@ -851,54 +851,23 @@ def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
         Tool function for calculating journey lists
     """
     query_tool = QuerySQLDatabaseTool(db)
+    # Store user_id in closure to use when SQL doesn't contain it
+    stored_user_id = user_id
     
     @tool
     def journey_list_tool(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
         """
-        Calculate and return journey list from geofencing data.
+        Calculate journey list from geofencing data. For journey/movement questions only.
         
-        IMPORTANT: This tool is for JOURNEY-RELATED questions only.
-        Use this tool when the user asks about:
-        - Journey lists
-        - Facility to facility breakdowns
-        - Device-level journeys
-        - Movement between facilities
-        
-        This tool:
-        1. Executes the provided SQL query to fetch raw geofencing rows
-        2. Runs Python journey calculation algorithm (NOT SQL)
-        3. Returns structured journey data with facility details
-        
-        The SQL query MUST:
-        - Use table: device_geofencings (alias: dg) - NOT "geofencing"
-        - Join: user_device_assignment (alias: uda) ON uda.device = dg.device_id
-        - Filter: WHERE uda.user_id = [user_id]
-        - Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
-        - Optional: LEFT JOIN facilities f ON dg.facility_id = f.facility_id (for facility_name)
-        - Order: ORDER BY dg.entry_event_time ASC
-        
-        Example SQL structure:
-        SELECT dg.device_id, dg.facility_id, dg.facility_type, f.facility_name, dg.entry_event_time, dg.exit_event_time
-        FROM device_geofencings dg
-        JOIN user_device_assignment uda ON uda.device = dg.device_id
-        LEFT JOIN facilities f ON dg.facility_id = f.facility_id
-        WHERE uda.user_id = [user_id] AND dg.device_id = '[device_id]'
-        ORDER BY dg.entry_event_time ASC
+        SQL MUST use: device_geofencings dg, JOIN user_device_assignment uda ON uda.device = dg.device_id
+        Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
+        Order: ORDER BY dg.entry_event_time ASC
         
         Args:
-            sql: SQL query to fetch geofencing rows (SELECT only)
-            params: Optional parameters dict with:
-                - start_date: Start date filter (optional)
-                - end_date: End date filter (optional)
-                - device_id: Specific device ID (optional)
-                - extraJourneyTimeLimit: Extra hours for same-facility journeys (optional)
-                - offset: Pagination offset (optional)
-                - from_facility: Filter journeys that START from this facility ID (optional)
+            sql: SELECT query to fetch geofencing rows
+            params: Optional dict with from_facility, extraJourneyTimeLimit, etc.
         
-        Returns:
-            JSON string with:
-            - facilities_details: Dict mapping facility_id to facility info
-            - journies: List of journey objects with from_facility, to_facility, device_id, times
+        Returns: JSON with facilities_details and journies array
         """
         print(f"\n{'='*80}")
         print(f"🔧 TOOL CALLED: journey_list_tool")
@@ -916,10 +885,104 @@ def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
         
         # Execute query
         try:
+            # Extract parameters first to check if we need to expand the query
+            extra_journey_time_limit = None
+            from_facility = None
+            if params:
+                extra_journey_time_limit = params.get("extraJourneyTimeLimit")
+                from_facility = params.get("from_facility")
+            
+            # Check if SQL filters by a specific facility_id (for "devices that entered facility X" queries)
+            # If so, we need to expand the query to get ALL records for those devices, not just entries to X
+            sql_upper_clean = ' '.join(sql_upper.split())
+            facility_filter_pattern = r"DG\.FACILITY_ID\s*=\s*'([^']+)'"
+            import re
+            facility_match = re.search(facility_filter_pattern, sql_upper_clean)
+            
+            # Expand query if:
+            # 1. SQL filters by facility_id AND
+            # 2. from_facility param is set (indicating "devices that entered facility X" query)
+            # 3. The facility in SQL matches from_facility param (they should match)
+            if facility_match and from_facility:
+                sql_facility = facility_match.group(1)
+                # Check if they match (case-insensitive)
+                if sql_facility.upper() == str(from_facility).upper():
+                    target_facility = sql_facility
+                    print(f"   🔍 Detected facility filter: {target_facility}")
+                    print(f"   🔍 from_facility param: {from_facility}")
+                    print(f"   📝 Expanding query to get ALL records for devices that entered {target_facility}")
+                    
+                    # Extract user_id from original query, or use stored user_id from closure
+                    user_id_match = re.search(r"UDA\.USER_ID\s*=\s*(\d+)", sql_upper_clean)
+                    if user_id_match:
+                        user_id = user_id_match.group(1)
+                    elif stored_user_id:
+                        user_id = str(stored_user_id)
+                        print(f"   ⚠️  user_id not found in SQL, using stored user_id: {user_id}")
+                    else:
+                        error_msg = "ERROR: user_id not found in SQL query and no user_id provided. Cannot proceed without user_id."
+                        print(f"   ❌ {error_msg}")
+                        return error_msg
+                    
+                    # Extract time interval from original query if present
+                    # If not found, we should not use a default - let the SQL query handle it
+                    time_interval_match = re.search(r"INTERVAL\s+'(\d+)\s+days'", sql_upper_clean)
+                    if time_interval_match:
+                        days = time_interval_match.group(1)
+                    else:
+                        # If no time interval in SQL, don't add one - use the original query's time filter
+                        error_msg = "ERROR: Time interval not found in SQL query. Cannot expand query without time interval."
+                        print(f"   ❌ {error_msg}")
+                        return error_msg
+                    
+                    # Build expanded query: Get all records for devices that entered the target facility
+                    # Step 1: Find device_ids that entered the facility in the time period
+                    # Step 2: Get all geofencing records for those devices
+                    expanded_sql = f"""
+                    WITH devices_entered_facility AS (
+                        SELECT DISTINCT dg.device_id
+                        FROM device_geofencings dg
+                        JOIN user_device_assignment uda ON uda.device = dg.device_id
+                        WHERE uda.user_id = {user_id}
+                          AND dg.facility_id = '{target_facility}'
+                          AND dg.entry_event_time >= NOW() - INTERVAL '{days} days'
+                    )
+                    SELECT 
+                        dg.device_id,
+                        dg.facility_id,
+                        dg.facility_type,
+                        dg.entry_event_time,
+                        dg.exit_event_time
+                    FROM device_geofencings dg
+                    JOIN user_device_assignment uda ON uda.device = dg.device_id
+                    JOIN devices_entered_facility def ON def.device_id = dg.device_id
+                    WHERE uda.user_id = {user_id}
+                    ORDER BY dg.device_id, dg.entry_event_time ASC
+                    """
+                    
+                    print(f"   ✅ Using user_id: {user_id}, time interval: {days} days")
+                    
+                    sql = expanded_sql.strip()
+                    print(f"   📋 Expanded SQL: {sql[:200]}...")
+                else:
+                    print(f"   ⚠️  Facility mismatch: SQL has {sql_facility}, param has {from_facility} - not expanding")
+            
             output = query_tool.db.run_no_throw(sql, include_columns=True)
             
-            if not output:
+            # Check if output is empty (handle different empty formats)
+            output_str = str(output).strip() if output else ""
+            is_empty = (
+                not output or 
+                output_str == "" or 
+                output_str == "[]" or
+                (isinstance(output, str) and output.strip() == "") or
+                (isinstance(output, list) and len(output) == 0)
+            )
+            
+            if is_empty:
                 print(f"   Result: No geofencing rows returned")
+                print(f"   Output type: {type(output)}")
+                print(f"   Output value: {repr(output)}")
                 print(f"{'='*80}\n")
                 return json.dumps({
                     "facilities_details": {},
@@ -947,13 +1010,6 @@ def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
                     "facilities_details": {},
                     "journies": []
                 })
-            
-            # Extract parameters
-            extra_journey_time_limit = None
-            from_facility = None
-            if params:
-                extra_journey_time_limit = params.get("extraJourneyTimeLimit")
-                from_facility = params.get("from_facility")
             
             # Run Python journey calculation
             filter_note = f" (filtering from_facility={from_facility})" if from_facility else ""
@@ -1010,46 +1066,17 @@ def create_journey_count_tool(db: SQLDatabase, user_id: Optional[str] = None):
     @tool
     def journey_count_tool(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
         """
-        Calculate and return journey counts from geofencing data.
+        Calculate journey counts. For "how many journeys" questions only.
         
-        IMPORTANT: This tool is for JOURNEY COUNT questions only.
-        Use this tool when the user asks:
-        - "How many journeys..."
-        - "Total journeys..."
-        - "Count between facilities"
-        - "Number of journeys from X to Y"
-        
-        This tool:
-        1. Executes the provided SQL query to fetch raw geofencing rows
-        2. Runs Python journey count algorithm (NOT SQL)
-        3. Returns journey counts by facility pair
-        
-        The SQL query MUST:
-        - Use table: device_geofencings (alias: dg) - NOT "geofencing"
-        - Join: user_device_assignment (alias: uda) ON uda.device = dg.device_id
-        - Filter: WHERE uda.user_id = [user_id]
-        - Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
-        - Order: ORDER BY dg.entry_event_time ASC
-        
-        Example SQL structure:
-        SELECT dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
-        FROM device_geofencings dg
-        JOIN user_device_assignment uda ON uda.device = dg.device_id
-        WHERE uda.user_id = [user_id] [AND filters...]
-        ORDER BY dg.entry_event_time ASC
+        SQL MUST use: device_geofencings dg, JOIN user_device_assignment uda ON uda.device = dg.device_id
+        Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
+        Order: ORDER BY dg.entry_event_time ASC
         
         Args:
-            sql: SQL query to fetch geofencing rows (SELECT only)
-            params: Optional parameters dict with:
-                - start_date: Start date filter (optional)
-                - end_date: End date filter (optional)
-                - device_id: Specific device ID (optional)
-                - extraJourneyTimeLimit: Extra hours for same-facility journeys (optional)
+            sql: SELECT query to fetch geofencing rows
+            params: Optional dict with extraJourneyTimeLimit, etc.
         
-        Returns:
-            JSON string with:
-            - counts: Dict mapping "facilityA||facilityB" to count
-            - total: Total number of journeys
+        Returns: JSON with counts dict and total
         """
         print(f"\n{'='*80}")
         print(f"🔧 TOOL CALLED: journey_count_tool")

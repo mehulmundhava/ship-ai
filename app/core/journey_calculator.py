@@ -144,8 +144,8 @@ def calculate_journey_counts(
     """
     Calculate journey counts from geofencing rows.
     
-    Ported from Laravel facility_journey_counts algorithm (Algorithm 2 - RECOMMENDED).
-    Matches JavaScript/Laravel logic exactly.
+    Uses Algorithm 2 (RECOMMENDED) from JOURNEY_LOGIC_DOCUMENTATION.md.
+    Generates journeys FROM all previously visited unique facilities TO current facility.
     
     Algorithm:
     1. Group rows by device_id
@@ -155,6 +155,12 @@ def calculate_journey_counts(
     5. For same-facility revisits, only use the immediately previous instance (via facility_last_index)
     6. Validate journey time (minimum 4 hours)
     7. Count journeys by facility pair (facilityA||facilityB)
+    
+    Example: With visits A, B, C, D, A:
+    - Visit 1 (B): Creates A→B (1 journey)
+    - Visit 2 (C): Creates A→C, B→C (2 journeys, total: 3)
+    - Visit 3 (D): Creates A→D, B→D, C→D (3 journeys, total: 6)
+    - Visit 4 (A): Creates D→A, A→A (from previous A), B→A, C→A (4 journeys, total: 10)
     
     Args:
         geofencing_rows: List of dicts with keys:
@@ -203,7 +209,7 @@ def calculate_journey_counts(
     
     for device_id, movements in device_movements.items():
         visits: List[Dict[str, Any]] = []
-        facility_last_index: Dict[str, int] = {}
+        facility_last_index: Dict[str, int] = {}  # Map of facility_id → most recent visit index
         
         for movement in movements:
             facility_id = str(movement.get("facility_id", ""))
@@ -233,7 +239,8 @@ def calculate_journey_counts(
             })
             
             # Generate journeys from all previously visited unique facilities
-            # This matches the JavaScript/Laravel algorithm exactly
+            # This matches Algorithm 2 (RECOMMENDED) from JOURNEY_LOGIC_DOCUMENTATION.md
+            # For each new visit, generate journeys FROM all previously visited unique facilities TO current facility
             if current_index > 0:
                 # Iterate through all previously visited unique facilities
                 for prev_facility_id, last_idx in facility_last_index.items():
@@ -254,6 +261,7 @@ def calculate_journey_counts(
                             journey_counts[journey_key] += 1
             
             # Update facility last index to point to current visit
+            # For same-facility revisits, this ensures we only use the immediately previous instance
             facility_last_index[facility_id] = current_index
     
     total = sum(journey_counts.values())
@@ -308,8 +316,8 @@ def calculate_journey_list(
     """
     Calculate journey list with facility details.
     
-    Uses the same algorithm as calculate_journey_counts (Algorithm 2 - RECOMMENDED).
-    Matches JavaScript/Laravel logic exactly.
+    Uses Algorithm 2 (RECOMMENDED) from JOURNEY_LOGIC_DOCUMENTATION.md.
+    Generates journeys FROM all previously visited unique facilities TO current facility.
     
     Returns detailed journey information including device, time pairs, and facility details.
     
@@ -374,7 +382,7 @@ def calculate_journey_list(
     
     for device_id, movements in device_movements.items():
         visits: List[Dict[str, Any]] = []
-        facility_last_index: Dict[str, int] = {}
+        facility_last_index: Dict[str, int] = {}  # Map of facility_id → most recent visit index
         
         for movement in movements:
             facility_id = str(movement.get("facility_id", ""))
@@ -397,7 +405,8 @@ def calculate_journey_list(
             })
             
             # Generate journeys from all previously visited unique facilities
-            # This matches the JavaScript/Laravel algorithm exactly
+            # This matches Algorithm 2 (RECOMMENDED) from JOURNEY_LOGIC_DOCUMENTATION.md
+            # For each new visit, generate journeys FROM all previously visited unique facilities TO current facility
             if current_index > 0:
                 # Iterate through all previously visited unique facilities
                 for prev_facility_id, last_idx in facility_last_index.items():
@@ -430,6 +439,7 @@ def calculate_journey_list(
                             journies.append(journey)
             
             # Update facility last index to point to current visit
+            # For same-facility revisits, this ensures we only use the immediately previous instance
             facility_last_index[facility_id] = current_index
     
     # Filter journeys by from_facility if specified (additional safety check)

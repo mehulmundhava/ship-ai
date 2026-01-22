@@ -1085,19 +1085,57 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             
             # For journey tools, reduce token usage by filtering/truncating results before format_answer
             if journey_tool_used and result_dict:
-                # If there are many journeys, only include a summary in the prompt
                 journies = result_dict.get('journies', [])
-                total_journeys = len(journies)
+                # IMPORTANT: Use total_journeys from result_dict if available (when CSV is generated),
+                # otherwise use len(journies). This ensures we show the correct total count (58) not preview count (5)
+                total_journeys = result_dict.get('total_journeys', len(journies))
                 
-                if total_journeys > 10:
-                    # For large result sets, only include first 5 journeys in prompt
-                    # The CSV link will have all the data
-                    result_dict['journies'] = journies[:5]
-                    result_dict['_total_journeys'] = total_journeys
-                    result_dict['_showing_preview'] = True
+                # Check if CSV is available (either from extracted csv_download_url or in result_dict)
+                has_csv = csv_download_url or result_dict.get('csv_download_link') or result_dict.get('csv_id')
+                
+                # If CSV is available OR >5 journeys, use minimal summary only
+                if has_csv or total_journeys > 5:
+                    # Get CSV link from result_dict if not already extracted
+                    if not csv_download_url:
+                        csv_path = result_dict.get('csv_download_link')
+                        if csv_path:
+                            csv_download_url = f"http://localhost:3009{csv_path}"
+                            csv_id = result_dict.get('csv_id')
+                    
+                    # Create minimal summary - NO full data, just counts and CSV link
+                    # This dramatically reduces token usage (from 44K chars to ~200 chars)
+                    minimal_summary = {
+                        "total_journeys": total_journeys,  # This is the ACTUAL total (58), not preview count (5)
+                        "csv_download_link": result_dict.get('csv_download_link') or (csv_download_url.replace("http://localhost:3009", "") if csv_download_url else None),
+                        "csv_id": result_dict.get('csv_id') or csv_id,
+                        "note": f"Full data available in CSV. Showing summary only to reduce token usage."
+                    }
+                    
+                    # Never include journey data when CSV is available (saves massive tokens)
+                    # Only include example if no CSV and small result
+                    if not has_csv and total_journeys <= 10 and len(journies) > 0:
+                        minimal_summary["example_journey"] = journies[0]
+                    
+                    query_result = json.dumps(minimal_summary, indent=2, default=str)
+                    logger.info(f"📊 Token optimization: Using minimal summary (total: {total_journeys} journeys, CSV: {has_csv})")
+                    print(f"📊 Token optimization: Using minimal summary only - {total_journeys} journeys (actual total, not preview), CSV available: {has_csv}")
+                elif total_journeys > 0:
+                    # Small result set (<=5 journeys), but still reduce facilities_details
+                    # Keep only facilities that appear in the journeys
+                    facilities_in_journeys = set()
+                    for journey in journies:
+                        facilities_in_journeys.add(journey.get('from_facility'))
+                        facilities_in_journeys.add(journey.get('to_facility'))
+                    
+                    # Filter facilities_details to only those in journeys
+                    filtered_facilities = {
+                        fid: details 
+                        for fid, details in result_dict.get('facilities_details', {}).items()
+                        if fid in facilities_in_journeys
+                    }
+                    result_dict['facilities_details'] = filtered_facilities
                     query_result = json.dumps(result_dict, indent=2, default=str)
-                    logger.info(f"📊 Reduced journey list from {total_journeys} to 5 for format_answer (token optimization)")
-                    print(f"📊 Token optimization: Showing only 5 of {total_journeys} journeys in prompt")
+                    logger.info(f"📊 Filtered facilities_details to {len(filtered_facilities)} facilities (from journeys only)")
             
             # If not found in JSON, try text format (for regular SQL queries)
             if not csv_download_url:
@@ -1107,18 +1145,67 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     csv_download_url = f"http://localhost:3009{csv_path}"
                     logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
                     print(f"✅ Extracted CSV download link from text: {csv_download_url}")
+                    
+                    # For regular SQL queries with CSV, also create minimal summary
+                    # Extract row count from query_result if available
+                    row_count_match = re.search(r'Total rows:\s*(\d+)', query_result)
+                    if row_count_match:
+                        row_count = int(row_count_match.group(1))
+                        # Create minimal summary for regular SQL queries too
+                        minimal_summary = f"""Total rows: {row_count}
+CSV Download Link: {csv_path}
+Note: Full data available in CSV. Showing summary only."""
+                        query_result = minimal_summary
+                        logger.info(f"📊 Token optimization: Using minimal summary for SQL query ({row_count} rows, CSV available)")
+                        print(f"📊 Token optimization: Using minimal summary for SQL query - {row_count} rows, CSV available")
 
             # Build the prompt with CSV link if available
             csv_link_instruction = ""
             if csv_download_url:
-                csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link. You MUST include this full URL in your answer: {csv_download_url}"
+                csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link with ALL the data. You MUST include this full URL in your answer: {csv_download_url}"
 
-            # OPTIMIZATION 5: Optimized final answer prompt - shorter and more focused
-            final_prompt = f"""User asked: {user_question}
+            # OPTIMIZATION: Ultra-minimal prompt when CSV is available
+            # Safety check: If CSV is available but query_result is still large, force minimal summary
+            if csv_download_url and len(query_result) > 1000:
+                # Force minimal summary if somehow we still have large data
+                if journey_tool_used:
+                    # For journey tools, extract just the count
+                    try:
+                        if isinstance(query_result, str) and query_result.strip().startswith('{'):
+                            temp_dict = json.loads(query_result)
+                            total = temp_dict.get('total_journeys', 'unknown')
+                            csv_link = temp_dict.get('csv_download_link') or (csv_download_url.replace("http://localhost:3009", "") if csv_download_url else "")
+                            query_result = f'{{"total_journeys": {total}, "csv_download_link": "{csv_link}", "note": "Full data in CSV"}}'
+                        else:
+                            query_result = f'Total journeys available in CSV. Download link: {csv_download_url}'
+                    except Exception as e:
+                        logger.warning(f"Error parsing query_result in safety check: {e}")
+                        query_result = f'Total journeys available in CSV. Download link: {csv_download_url}'
+                else:
+                    # For regular SQL, extract row count
+                    row_match = re.search(r'Total rows:\s*(\d+)', query_result)
+                    if row_match:
+                        query_result = f'Total rows: {row_match.group(1)}. Full data in CSV: {csv_download_url}'
+                    else:
+                        query_result = f'Results available in CSV. Download link: {csv_download_url}'
+                
+                logger.warning(f"⚠️  Forced minimal summary due to large query_result ({len(query_result)} chars) with CSV")
+                print(f"⚠️  Forced minimal summary - query_result was too large even with CSV")
+            
+            if csv_download_url:
+                # When CSV is available, use even more minimal prompt
+                final_prompt = f"""User asked: {user_question}
+
+Query results summary: {query_result}
+
+IMPORTANT: Use the EXACT "total_journeys" count from the results (not the preview count). Mention this exact total number in your answer, then provide the CSV download link.{csv_link_instruction}""".strip()
+            else:
+                # Regular prompt for small results
+                final_prompt = f"""User asked: {user_question}
 
 Query results: {query_result}
 
-Provide a concise, natural language answer. Do not mention table names, SQL syntax, or schema details.{csv_link_instruction}{journey_instruction}""".strip()
+Provide a concise, natural language answer. Do not mention table names, SQL syntax, or schema details.{journey_instruction}""".strip()
             
             logger.info("Generating final answer from query results")
             logger.debug(f"Final prompt length: {len(final_prompt)} characters")
