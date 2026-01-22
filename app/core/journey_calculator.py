@@ -144,13 +144,17 @@ def calculate_journey_counts(
     """
     Calculate journey counts from geofencing rows.
     
-    Ported from Laravel facility_journey_counts algorithm (1:1).
+    Ported from Laravel facility_journey_counts algorithm (Algorithm 2 - RECOMMENDED).
+    Matches JavaScript/Laravel logic exactly.
     
     Algorithm:
     1. Group rows by device_id
     2. For each device, process movements chronologically
-    3. Track facility visits and calculate journeys between facilities
-    4. Count journeys by facility pair (facilityA||facilityB)
+    3. Maintain visits array and facility_last_index map
+    4. For each new visit, generate journeys FROM all previously visited unique facilities TO current facility
+    5. For same-facility revisits, only use the immediately previous instance (via facility_last_index)
+    6. Validate journey time (minimum 4 hours)
+    7. Count journeys by facility pair (facilityA||facilityB)
     
     Args:
         geofencing_rows: List of dicts with keys:
@@ -228,28 +232,28 @@ def calculate_journey_counts(
                 "exit_time": exit_time
             })
             
-            # Check for journeys from previous facilities
+            # Generate journeys from all previously visited unique facilities
+            # This matches the JavaScript/Laravel algorithm exactly
             if current_index > 0:
+                # Iterate through all previously visited unique facilities
                 for prev_facility_id, last_idx in facility_last_index.items():
-                    prev_visit = visits[last_idx]
-                    from_time = prev_visit.get("exit_time")
-                    to_time = entry_time
-                    prev_facility_type = prev_visit.get("facility_type", "")
-                    
-                    # Check if it's same facility
-                    is_same = (prev_facility_id == facility_id)
-                    
-                    # Validate journey time
-                    if valid_journey_time(from_time, to_time, is_same, extra_journey_time_limit):
-                        # Create journey key: "facilityA||facilityB"
-                        journey_key = f"{prev_facility_id}||{facility_id}"
+                    if last_idx < len(visits) and last_idx >= 0:
+                        target_visit = visits[last_idx]
+                        from_time = target_visit.get("exit_time")
+                        to_time = entry_time
+                        is_same_facility = (facility_id == prev_facility_id)
                         
-                        # Increment count
-                        if journey_key not in journey_counts:
-                            journey_counts[journey_key] = 0
-                        journey_counts[journey_key] += 1
+                        # Validate journey time
+                        if from_time and to_time and valid_journey_time(from_time, to_time, is_same_facility, extra_journey_time_limit):
+                            # Create journey key: "facilityA||facilityB"
+                            journey_key = f"{prev_facility_id}||{facility_id}"
+                            
+                            # Increment count
+                            if journey_key not in journey_counts:
+                                journey_counts[journey_key] = 0
+                            journey_counts[journey_key] += 1
             
-            # Update facility last index
+            # Update facility last index to point to current visit
             facility_last_index[facility_id] = current_index
     
     total = sum(journey_counts.values())
@@ -304,8 +308,10 @@ def calculate_journey_list(
     """
     Calculate journey list with facility details.
     
-    Similar to calculate_journey_counts but returns detailed journey information
-    including device, time pairs, and facility details.
+    Uses the same algorithm as calculate_journey_counts (Algorithm 2 - RECOMMENDED).
+    Matches JavaScript/Laravel logic exactly.
+    
+    Returns detailed journey information including device, time pairs, and facility details.
     
     Args:
         geofencing_rows: List of dicts with keys:
@@ -390,49 +396,25 @@ def calculate_journey_list(
                 "exit_time": exit_time
             })
             
-            # Check for journeys from previous facilities
+            # Generate journeys from all previously visited unique facilities
+            # This matches the JavaScript/Laravel algorithm exactly
             if current_index > 0:
-                # If filtering by from_facility, only check journeys from that facility
-                if from_facility_str:
-                    # When filtering by from_facility, only create journeys from the immediately preceding visit
-                    # if it was from the target facility. This ensures we only get direct journeys from that facility.
-                    prev_visit = visits[current_index - 1]
-                    prev_facility_id = prev_visit.get("facility_id")
-                    
-                    if prev_facility_id == from_facility_str:
-                        from_time = prev_visit.get("exit_time")
-                        to_time = entry_time
+                # Iterate through all previously visited unique facilities
+                for prev_facility_id, last_idx in facility_last_index.items():
+                    if last_idx < len(visits) and last_idx >= 0:
+                        target_visit = visits[last_idx]
                         
-                        # Check if it's same facility
-                        is_same = (prev_facility_id == facility_id)
+                        # If filtering by from_facility, only create journey if previous facility matches
+                        if from_facility_str and prev_facility_id != from_facility_str:
+                            # Skip this journey if filtering by from_facility and it doesn't match
+                            continue
+                        
+                        from_time = target_visit.get("exit_time")
+                        to_time = entry_time
+                        is_same_facility = (facility_id == prev_facility_id)
                         
                         # Validate journey time
-                        if valid_journey_time(from_time, to_time, is_same, extra_journey_time_limit):
-                            # Calculate journey time
-                            journey_time = to_time - from_time if from_time else None
-                            
-                            # Create journey record
-                            journey = {
-                                "from_facility": prev_facility_id,
-                                "to_facility": facility_id,
-                                "device_id": device_id,
-                                "journey_time": journey_time,
-                                "entry_time": entry_time,
-                                "exit_time": from_time
-                            }
-                            journies.append(journey)
-                else:
-                    # Original algorithm: check journeys from all previous facilities
-                    for prev_facility_id, last_idx in facility_last_index.items():
-                        prev_visit = visits[last_idx]
-                        from_time = prev_visit.get("exit_time")
-                        to_time = entry_time
-                        
-                        # Check if it's same facility
-                        is_same = (prev_facility_id == facility_id)
-                        
-                        # Validate journey time
-                        if valid_journey_time(from_time, to_time, is_same, extra_journey_time_limit):
+                        if from_time and to_time and valid_journey_time(from_time, to_time, is_same_facility, extra_journey_time_limit):
                             # Calculate journey time
                             journey_time = to_time - from_time if from_time else None
                             
@@ -447,7 +429,7 @@ def calculate_journey_list(
                             }
                             journies.append(journey)
             
-            # Update facility last index
+            # Update facility last index to point to current visit
             facility_last_index[facility_id] = current_index
     
     # Filter journeys by from_facility if specified (additional safety check)

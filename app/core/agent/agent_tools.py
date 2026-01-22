@@ -869,15 +869,21 @@ def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
         2. Runs Python journey calculation algorithm (NOT SQL)
         3. Returns structured journey data with facility details
         
-        The SQL query should fetch geofencing rows with:
-        - device_id
-        - facility_id
-        - facility_type (optional)
-        - facility_name (optional)
-        - entry_event_time (Unix timestamp)
-        - exit_event_time (Unix timestamp)
+        The SQL query MUST:
+        - Use table: device_geofencings (alias: dg) - NOT "geofencing"
+        - Join: user_device_assignment (alias: uda) ON uda.device = dg.device_id
+        - Filter: WHERE uda.user_id = [user_id]
+        - Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
+        - Optional: LEFT JOIN facilities f ON dg.facility_id = f.facility_id (for facility_name)
+        - Order: ORDER BY dg.entry_event_time ASC
         
-        Results should be ordered by entry_event_time ASC.
+        Example SQL structure:
+        SELECT dg.device_id, dg.facility_id, dg.facility_type, f.facility_name, dg.entry_event_time, dg.exit_event_time
+        FROM device_geofencings dg
+        JOIN user_device_assignment uda ON uda.device = dg.device_id
+        LEFT JOIN facilities f ON dg.facility_id = f.facility_id
+        WHERE uda.user_id = [user_id] AND dg.device_id = '[device_id]'
+        ORDER BY dg.entry_event_time ASC
         
         Args:
             sql: SQL query to fetch geofencing rows (SELECT only)
@@ -1018,13 +1024,19 @@ def create_journey_count_tool(db: SQLDatabase, user_id: Optional[str] = None):
         2. Runs Python journey count algorithm (NOT SQL)
         3. Returns journey counts by facility pair
         
-        The SQL query should fetch geofencing rows with:
-        - device_id
-        - facility_id
-        - entry_event_time (Unix timestamp)
-        - exit_event_time (Unix timestamp)
+        The SQL query MUST:
+        - Use table: device_geofencings (alias: dg) - NOT "geofencing"
+        - Join: user_device_assignment (alias: uda) ON uda.device = dg.device_id
+        - Filter: WHERE uda.user_id = [user_id]
+        - Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
+        - Order: ORDER BY dg.entry_event_time ASC
         
-        Results should be ordered by entry_event_time ASC.
+        Example SQL structure:
+        SELECT dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
+        FROM device_geofencings dg
+        JOIN user_device_assignment uda ON uda.device = dg.device_id
+        WHERE uda.user_id = [user_id] [AND filters...]
+        ORDER BY dg.entry_event_time ASC
         
         Args:
             sql: SQL query to fetch geofencing rows (SELECT only)

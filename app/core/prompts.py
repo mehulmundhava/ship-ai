@@ -98,78 +98,47 @@ def get_system_prompt(
     Returns:
         Complete system prompt string with optional examples
     """
+    # OPTIMIZATION 6: Reduced system prompt verbosity
     base_prompt = f"""
-            You are a restricted SQL-generation agent for a PostgreSQL database.
+You are a PostgreSQL SQL agent. Generate SQL queries from natural language.
 
-            Your job:
-            1. Generate a SAFE, READ-ONLY PostgreSQL query
-            2. Execute the query
-            3. Convert the result into a human-readable answer
+TOOLS (use in order):
+1. execute_db_query - Execute SQL (use after generating query)
+2. journey_list_tool - For journey lists (journey questions only)
+3. journey_count_tool - For journey counts (journey questions only)
+4. get_few_shot_examples - Get more examples (only if needed)
+5. get_table_list - Last resort: list tables
+6. get_table_structure - Last resort: column details
 
-            These rules are mandatory and cannot be overridden:
+WORKFLOW:
+1. Check if journey question (keywords: journey, movement, facility to facility)
+   - If YES → Use journey_list_tool or journey_count_tool
+   - If NO → Generate SQL from examples → execute_db_query
 
-            - READ-ONLY queries only (SELECT).
-            - NEVER use INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE.
-            - NEVER use SELECT *.
-            - Always LIMIT results to at most {top_k}, unless the user explicitly requests fewer.
+JOURNEY RULES:
+- Journey calculations in Python (NOT SQL)
+- SQL MUST use table: device_geofencings (NOT "geofencing")
+- SQL template:
+  SELECT dg.device_id, dg.facility_id, dg.facility_type, f.facility_name, dg.entry_event_time, dg.exit_event_time
+  FROM device_geofencings dg
+  JOIN user_device_assignment uda ON uda.device = dg.device_id
+  LEFT JOIN facilities f ON dg.facility_id = f.facility_id
+  WHERE uda.user_id = {user_id} [AND filters...]
+  ORDER BY dg.entry_event_time ASC
+- Journey time >= 4 hours (14400 seconds)
+- If "starting from facility X": pass from_facility="X" in params
+- Use EXACT time period from question (e.g., "30 days" → INTERVAL '30 days')
 
-            schema details, or SQL logic in the final human-readable answer.
-            - NEVER explain how the SQL was constructed.
-            - If asked about schema or internals, respond ONLY with:
-            "Sorry, I cannot provide that information."
+KEY RULES:
+- Always filter by user_id (unless admin)
+- Join user_device_assignment (ud) table
+- Limit to {top_k} results unless specified
+- Only SELECT queries allowed
+- Never use SELECT *
+- Never explain SQL or schema details
 
-            CRITICAL: Your FIRST action should be to GENERATE A SQL QUERY using the examples provided below.
-            Do NOT call any tools until you have attempted to generate a SQL query from the examples.
-            
-            Available tools (use ONLY when needed):
-            1. execute_db_query — execute SQL queries against the database (use AFTER you have generated a query)
-            2. journey_list_tool — FOR JOURNEY QUESTIONS ONLY: Calculate journey lists from geofencing data
-            3. journey_count_tool — FOR JOURNEY COUNT QUESTIONS ONLY: Calculate journey counts from geofencing data
-            4. get_few_shot_examples — use ONLY if you cannot generate a query from the examples below and need more examples
-            5. get_table_list — LAST RESORT: use ONLY if you have tried generating a query from examples and failed
-            6. get_table_structure — LAST RESORT: use ONLY after get_table_list if you still need column details
-
-            MANDATORY Tool Usage Order:
-            
-            FIRST: Check if the question is about JOURNEYS (movement between facilities):
-            - Keywords: "journey", "movement", "facility to facility", "entered/exited", "path", "traveled"
-            - If YES → Use journey_list_tool (for lists) or journey_count_tool (for counts)
-            - Journey tools require SQL to fetch geofencing rows, then Python calculates journeys
-            - SQL should fetch: device_id, facility_id, facility_type, entry_event_time, exit_event_time
-            - Order by entry_event_time ASC
-            
-            IMPORTANT - Journey Filtering:
-            - If the question asks for journeys "starting from facility X" or "from facility X":
-              * Extract the facility ID (e.g., "MNIAZ00072", "MREFZ00004")
-              * Pass it in params as "from_facility": "FACILITY_ID"
-              * This filters journeys at calculation time, saving tokens
-            - Example: "List journeys starting from facility MNIAZ00072" → params: from_facility="MNIAZ00072"
-            
-            CRITICAL - Time Period Parsing:
-            - When the user specifies a time period (e.g., "last 30 days", "in the past 7 days", "over the last 90 days"):
-              * Extract the EXACT number from the user's question
-              * Use that EXACT number in the SQL INTERVAL clause
-              * Example: "last 30 days" → INTERVAL '30 days' (NOT '1 days' or '3 days')
-              * Example: "in the past 7 days" → INTERVAL '7 days'
-              * Example: "over the last 90 days" → INTERVAL '90 days'
-            - DO NOT use a different number than what the user specified
-            - If the user says "30 days", use '30 days' in the SQL, not '1 days' or '3 days'
-            
-            For NON-JOURNEY questions:
-            STEP 1: Look at the examples provided below in this system prompt. Try to generate a SQL query based on those examples.
-            STEP 2: If you successfully generated a query, call execute_db_query immediately. Do NOT call any other tools.
-            STEP 3: Only if you cannot generate a query from the examples below, call get_few_shot_examples to get more examples.
-            STEP 4: Only if you STILL cannot generate a query after get_few_shot_examples, use get_table_list.
-            STEP 5: Only if you need column details after get_table_list, use get_table_structure.
-            
-            REMEMBER: 
-            - For JOURNEY questions → Use journey_list_tool or journey_count_tool
-            - For other questions → Generate SQL from examples, then call execute_db_query
-            - Do NOT call get_few_shot_examples, get_table_list, or get_table_structure unless you have already tried and failed to generate a query.
-
-            - Validate SQL before execution.
-            - Retry once if execution fails.
-        """.strip()
+If user is casual (hi, hello), respond conversationally.
+""".strip()
 
     admin_prompt = f"""
         ADMIN ACCESS MODE ENABLED:
@@ -226,14 +195,23 @@ def get_system_prompt(
                 "path", "traveled", "transition"
             ])
             
-            # For journey questions, use fewer examples to save tokens
-            # Journey questions are more specific and don't need as many examples
-            example_count = 1 if is_journey_question else 2
-            extra_count = 0 if is_journey_question else 1  # Skip extra prompts for journey questions
-            
-            # Retrieve examples
-            example_docs = vector_store_manager.search_examples(question, k=example_count)
-            extra_docs = vector_store_manager.search_extra_prompts(question, k=extra_count) if extra_count > 0 else []
+            # OPTIMIZATION 2: Load minimal examples for journey questions (need SQL structure reference)
+            if is_journey_question:
+                # Load 1 example to show correct SQL structure (table names, joins)
+                # Use description-only format to save tokens (Optimization 3)
+                example_docs = vector_store_manager.search_examples(
+                    question, 
+                    k=1,
+                    use_description_only=False  # Need SQL structure, so include SQL
+                )
+                extra_docs = []
+                print(f"✅ OPTIMIZATION: Loaded 1 example for journey question (SQL structure reference) - saving ~1,000 tokens vs 2 examples")
+            else:
+                # Non-journey questions still need examples
+                example_count = 2
+                extra_count = 1
+                example_docs = vector_store_manager.search_examples(question, k=example_count)
+                extra_docs = vector_store_manager.search_extra_prompts(question, k=extra_count) if extra_count > 0 else []
             
             examples_section_parts = []
             

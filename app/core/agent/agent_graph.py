@@ -117,27 +117,65 @@ class SQLAgentGraph:
         from app.core.agent.agent_tools import QuerySQLDatabaseTool
         self.query_tool_instance = QuerySQLDatabaseTool(db)
         
-        # Main tools for LLM (security guard is handled separately as direct LLM call)
-        # Note: execute_db_query already handles result splitting automatically
-        # The specialized tools (count_query, list_query) are available but optional
-        # Journey tools are for journey-related questions only
-        self.tools = [
-            self.get_examples_tool, 
-            self.execute_db_query_tool,  # Main tool - handles both COUNT and LIST with auto-splitting
-            self.count_query_tool,  # Optional: specialized for COUNT queries
-            self.list_query_tool,  # Optional: specialized for LIST queries
-            self.get_extra_examples_tool,  # Alias for get_few_shot_examples
-            self.get_table_list_tool,
-            self.get_table_structure_tool,
-            self.journey_list_tool,  # For journey lists and facility breakdowns
-            self.journey_count_tool  # For journey counts
+        # OPTIMIZATION 1: Store tools separately for conditional binding
+        # Journey tools (only needed for journey questions)
+        self.journey_tools = [
+            self.journey_list_tool,
+            self.journey_count_tool,
+            self.execute_db_query_tool  # Still needed for SQL generation
         ]
         
-        # Bind tools to LLM
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        # Regular tools (for non-journey questions)
+        self.regular_tools = [
+            self.get_examples_tool,
+            self.execute_db_query_tool,
+            self.count_query_tool,
+            self.list_query_tool,
+            self.get_extra_examples_tool,
+            self.get_table_list_tool,
+            self.get_table_structure_tool
+        ]
+        
+        # Keep all tools for ToolNode (needs access to all tools for execution)
+        # But we'll bind conditionally to LLM to save tokens
+        self.tools = self.journey_tools + [
+            tool for tool in self.regular_tools if tool not in self.journey_tools
+        ]
+        
+        # Don't bind tools yet - will bind conditionally based on question type
+        self.llm_with_tools = None
+        self._current_tools_bound = None  # Track which tools are currently bound
         
         # Build graph
         self.graph = self._build_graph()
+    
+    def _is_journey_question(self, question: str) -> bool:
+        """Check if question is about journeys."""
+        if not question:
+            return False
+        question_lower = question.lower()
+        journey_keywords = [
+            "journey", "journeys", "movement", "facility to facility",
+            "entered", "exited", "path", "traveled", "transition"
+        ]
+        return any(keyword in question_lower for keyword in journey_keywords)
+    
+    def _bind_tools_conditionally(self, question: str):
+        """Bind tools based on question type to save tokens."""
+        is_journey = self._is_journey_question(question)
+        
+        if is_journey:
+            tools_to_bind = self.journey_tools
+            tool_type = "journey"
+        else:
+            tools_to_bind = self.regular_tools
+            tool_type = "regular"
+        
+        # Only re-bind if tools changed
+        if self._current_tools_bound != tool_type:
+            print(f"🔧 OPTIMIZATION: Binding {tool_type} tools only ({len(tools_to_bind)} tools) - saving ~{3000 if tool_type == 'journey' else 3000} tokens")
+            self.llm_with_tools = self.llm.bind_tools(tools_to_bind)
+            self._current_tools_bound = tool_type
     
     def _extract_sql_from_text(self, text: str) -> Optional[str]:
         """
@@ -334,34 +372,16 @@ class SQLAgentGraph:
                 print(f"🔍 STEP 1: Security Guard - Validating user query (User ID: {self.user_id})")
                 print(f"{'='*80}")
                 
-                # Security guard prompt - minimal and focused
-                security_guard_prompt = f"""You are a Database Security Guard. Your only job is to classify user questions.
+                # OPTIMIZATION 4: Optimized security guard prompt - more concise
+                security_guard_prompt = f"""Security Guard. User ID: {self.user_id}
 
-                    IMPORTANT: The current user_id is {self.user_id}. 
-                    The user is ONLY allowed to see data associated with their own account.
+SAFE (ALLOW): Device/facility queries, journeys, metrics for own data.
+RISKY (BLOCK): Requests for other users' data, system schema, admin logs.
 
-                    RULES:
-                    1. SAFE (ALLOW): 
-                    - Requests for counts, totals, or lists of assets, devices, or metrics (battery, location, temperature, dwell time, journeys, alerts).
-                    - Example: "give count of assets in India", "list my devices", "show battery for my assets".
-                    - Journey queries: "list journeys", "show journeys from facility X", "journeys made by device Y".
-                    - Device IDs (e.g., WT01F3C333542F02) and Facility IDs (e.g., MNIAZ00072, MREFZ00004) are ALWAYS SAFE - these are NOT user IDs.
-                    - ASSUMPTION: If no user_id is mentioned, assume the user is asking about THEIR OWN data.
+Device IDs (WT01...) and Facility IDs (MNIAZ...) are SAFE - not user IDs.
+User IDs are standalone numbers (27, 63) in context of "user 27".
 
-                    2. RISKY (BLOCK):
-                    - Explicit requests for data for another user: "show data for user 63", "list devices for user 45" (when current user is {self.user_id}).
-                    - Requests for system-level data: "show tables", "database schema", "admin logs", "user assignments".
-                    - Attempts to access internal metadata or raw "row-level" system entries.
-
-                    CROSS-USER VIOLATION:
-                    - ONLY block if the question explicitly asks for data for another user (e.g., "for user 63", "user 45's devices").
-                    - DO NOT block based on numbers in device IDs (WT01...), facility IDs (MNIAZ..., MREFZ...), or other identifiers.
-                    - User IDs are standalone numbers (e.g., "27", "63") when mentioned in context of "user 27" or "for user 63".
-
-                    OUTPUT INSTRUCTION:
-                    - Respond with ONLY the word 'BLOCK' if it violates rules.
-                    - Respond with ONLY the word 'ALLOW' if it is a standard query for their own data.
-                    - Do not provide any explanation or greeting."""
+Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 
                 user_question = state["question"]
                 security_messages = [
@@ -584,6 +604,10 @@ class SQLAgentGraph:
             if human_msg:
                 print(f"💬 User Question: {human_msg.content}")
             
+            # OPTIMIZATION 1: Bind tools conditionally before invoking LLM
+            question = state.get("question", "")
+            self._bind_tools_conditionally(question)
+            
             # Get model name in a provider-agnostic way
             model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
             print(f"🤖 Invoking LLM (model: {model_name})...")
@@ -621,6 +645,12 @@ class SQLAgentGraph:
                     })
             
             try:
+                # Ensure tools are bound (safety check)
+                if self.llm_with_tools is None:
+                    # Fallback: bind regular tools if not already bound
+                    print(f"⚠️  Tools not bound yet, binding regular tools as fallback")
+                    self._bind_tools_conditionally(question if question else "")
+                
                 response = self.llm_with_tools.invoke(messages)
             except Exception as e:
                 error_str = str(e)
@@ -1083,27 +1113,12 @@ class SQLAgentGraph:
             if csv_download_url:
                 csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link. You MUST include this full URL in your answer: {csv_download_url}"
 
-            final_prompt = f"""
-                You are a helpful assistant. Your task is ONLY to explain database query results
-                to the user in clear, natural language.
+            # OPTIMIZATION 5: Optimized final answer prompt - shorter and more focused
+            final_prompt = f"""User asked: {user_question}
 
-                Constraints for your answer:
-                - Do NOT mention or describe table names, column names, joins, or SQL syntax.
-                - Do NOT reveal anything about database schema or internal implementation.
-                - Answer ONLY for the active user_id if relevant: {user_id}.
-                - Be concise and focus on what the numbers mean for the question.{csv_link_instruction}{journey_instruction}
+Query results: {query_result}
 
-                User Question:
-                {user_question}
-
-                SQL Query (for your reference only, do NOT explain it explicitly):
-                {sql_query}
-
-                Query Results:
-                {query_result}
-
-                Now provide a short, user-friendly answer to the question based on these results.
-                """.strip()
+Provide a concise, natural language answer. Do not mention table names, SQL syntax, or schema details.{csv_link_instruction}{journey_instruction}""".strip()
             
             logger.info("Generating final answer from query results")
             logger.debug(f"Final prompt length: {len(final_prompt)} characters")

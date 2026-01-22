@@ -96,7 +96,8 @@ class VectorStoreService:
         """
         return self.embed_query(query)
     
-    def search_examples(self, query: str, k: int = 3, example_id: Optional[int] = None) -> List[Document]:
+    def search_examples(self, query: str, k: int = 3, example_id: Optional[int] = None, 
+                        use_description_only: bool = False) -> List[Document]:
         """
         Search for similar examples in the PostgreSQL vector store.
         
@@ -104,6 +105,7 @@ class VectorStoreService:
             query: Search query
             k: Number of results to return
             example_id: Optional specific example ID to filter by (to check distance)
+            use_description_only: If True, use description instead of full SQL (for journey questions)
             
         Returns:
             List of similar example documents
@@ -160,14 +162,19 @@ class VectorStoreService:
             # Convert results to Document objects
             documents = []
             for row in rows:
-                # Combine question, description (if available), and SQL for the document content
+                # OPTIMIZATION 3: For journey questions, use description instead of SQL
                 content_parts = [f"Question: {row.question}"]
                 
-                # Add description if available
-                if row.description:
+                if use_description_only and row.description:
+                    # Use description only - skip SQL to save tokens
                     content_parts.append(f"Description: {row.description}")
+                    print(f"   ✅ Using description-only format (saving ~{len(row.sql_query)} characters)")
+                else:
+                    # Normal format: include description if available, then SQL
+                    if row.description:
+                        content_parts.append(f"Description: {row.description}")
+                    content_parts.append(f"\nSQL Query:\n{row.sql_query}")
                 
-                content_parts.append(f"\nSQL Query:\n{row.sql_query}")
                 content = "\n\n".join(content_parts)
                 
                 # Parse metadata - JSONB columns are typically returned as dicts by psycopg2
