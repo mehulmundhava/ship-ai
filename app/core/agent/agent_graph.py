@@ -102,6 +102,11 @@ class SQLAgentGraph:
         self.user_id = user_id
         self.top_k = top_k
         
+        # Store provider info for fallback logic
+        from app.services.llm_service import LLMService
+        llm_service = LLMService()
+        self.provider = llm_service.get_provider()
+        
         # Create tools
         self.get_examples_tool = create_get_few_shot_examples_tool(vector_store_manager)
         self.execute_db_query_tool = create_execute_db_query_tool(db, vector_store_manager)
@@ -176,6 +181,97 @@ class SQLAgentGraph:
             print(f"🔧 OPTIMIZATION: Binding {tool_type} tools only ({len(tools_to_bind)} tools) - saving ~{3000 if tool_type == 'journey' else 3000} tokens")
             self.llm_with_tools = self.llm.bind_tools(tools_to_bind)
             self._current_tools_bound = tool_type
+    
+    def _get_fallback_llm(self, use_tools=False, question=""):
+        """
+        Get or create fallback LLM instance (ChatGPT).
+        
+        Args:
+            use_tools: Whether to bind tools to fallback LLM
+            question: Question text to determine which tools to bind
+        
+        Returns:
+            BaseChatModel: Configured OpenAI LLM instance
+        """
+        if not hasattr(self, '_fallback_llm') or self._fallback_llm is None:
+            # Import here to avoid circular dependency
+            from app.services.llm_service import LLMService
+            llm_service = LLMService()
+            self._fallback_llm = llm_service.get_fallback_llm_model()
+            
+            logger.info("✅ Created ChatGPT fallback LLM instance")
+            print(f"✅ Created ChatGPT fallback LLM instance")
+        
+        # If tools are needed, bind them
+        if use_tools:
+            # Determine which tools to bind (same as regular LLM)
+            is_journey = self._is_journey_question(question) if question else False
+            tools_to_bind = self.journey_tools if is_journey else self.regular_tools
+            
+            # Create a unique key for this tool binding
+            tool_key = f"journey" if is_journey else "regular"
+            cache_key = f'_fallback_llm_with_tools_{tool_key}'
+            
+            if not hasattr(self, cache_key) or getattr(self, cache_key) is None:
+                setattr(self, cache_key, self._fallback_llm.bind_tools(tools_to_bind))
+            return getattr(self, cache_key)
+        else:
+            return self._fallback_llm
+    
+    def _invoke_llm_with_fallback(self, messages, use_tools=False, question=""):
+        """
+        Invoke LLM with automatic fallback to ChatGPT if Groq fails.
+        
+        Args:
+            messages: List of messages to send to LLM
+            use_tools: Whether to use tool binding (llm_with_tools)
+            question: Question text for tool binding (if use_tools=True)
+        
+        Returns:
+            LLM response
+        """
+        try:
+            if use_tools and self.llm_with_tools:
+                return self.llm_with_tools.invoke(messages)
+            else:
+                return self.llm.invoke(messages)
+        except Exception as e:
+            # Check if it's a Groq-specific error
+            error_str = str(e)
+            error_type = type(e).__name__
+            
+            # Groq-specific error patterns
+            is_groq_error = (
+                "groq" in error_str.lower() or
+                "BadRequestError" in error_type or
+                "tool_use_failed" in error_str or
+                "Failed to call a function" in error_str or
+                "groq.BadRequestError" in error_type
+            )
+            
+            if is_groq_error and self.provider == "GROQ":
+                logger.warning(f"Groq API error detected: {error_type}. Falling back to ChatGPT...")
+                print(f"⚠️  Groq API error detected: {error_type}")
+                print(f"🔄 Falling back to ChatGPT...")
+                
+                # Get fallback LLM (ChatGPT)
+                fallback_llm = self._get_fallback_llm(use_tools, question)
+                
+                # Retry with ChatGPT
+                try:
+                    response = fallback_llm.invoke(messages)
+                    
+                    logger.info("✅ Successfully got response from ChatGPT fallback")
+                    print(f"✅ Successfully got response from ChatGPT fallback")
+                    return response
+                except Exception as e2:
+                    logger.error(f"ChatGPT fallback also failed: {e2}")
+                    logger.exception("ChatGPT fallback error")
+                    print(f"❌ ChatGPT fallback also failed: {e2}")
+                    raise e  # Re-raise original Groq error
+            else:
+                # Not a Groq error, re-raise
+                raise e
     
     def _extract_sql_from_text(self, text: str) -> Optional[str]:
         """
@@ -390,7 +486,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 ]
                 
                 print(f"🤖 Calling Security Guard LLM...")
-                security_response = self.llm.invoke(security_messages)
+                security_response = self._invoke_llm_with_fallback(security_messages, use_tools=False, question=user_question)
                 security_decision = security_response.content.strip().upper() if hasattr(security_response, 'content') else ""
                 
                 # Track token usage for security guard call
@@ -651,43 +747,27 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     print(f"⚠️  Tools not bound yet, binding regular tools as fallback")
                     self._bind_tools_conditionally(question if question else "")
                 
-                response = self.llm_with_tools.invoke(messages)
+                # Use fallback helper - it will automatically fallback to ChatGPT if Groq fails
+                response = self._invoke_llm_with_fallback(messages, use_tools=True, question=question)
             except Exception as e:
+                # This will only catch errors if both Groq AND ChatGPT fail
                 error_str = str(e)
                 error_type = type(e).__name__
                 
-                # Log full error details
-                logger.error(f"Groq API tool call error detected")
+                logger.error(f"Both Groq and ChatGPT failed")
                 logger.error(f"Error Type: {error_type}")
                 logger.error(f"Error Message: {error_str}")
                 logger.exception("Full exception details")
                 
                 print(f"\n{'='*80}")
-                print(f"❌ GROQ TOOL CALL ERROR DETAILS")
+                print(f"❌ BOTH GROQ AND CHATGPT FAILED")
                 print(f"{'='*80}")
                 print(f"Error Type: {error_type}")
                 print(f"Error Message: {error_str}")
                 import traceback
                 print(f"Traceback:\n{traceback.format_exc()}")
                 print(f"{'='*80}\n")
-                
-                # Check if it's a Groq tool call format error
-                if "tool_use_failed" in error_str or "Failed to call a function" in error_str or "tool" in error_str.lower():
-                    logger.warning("Groq API tool call error detected. Attempting to continue without tools...")
-                    print(f"⚠️  Groq API tool call error detected. Attempting to continue without tools...")
-                    # Try invoking without tools to get a text response
-                    try:
-                        response = self.llm.invoke(messages)
-                        logger.info("Got text response from LLM (no tools)")
-                        print(f"✅ Got text response from LLM (no tools)")
-                    except Exception as e2:
-                        logger.error(f"Error even without tools: {e2}")
-                        logger.exception("Error invoking LLM without tools")
-                        print(f"❌ Error even without tools: {e2}")
-                        raise e
-                else:
-                    logger.error("Unknown error type, re-raising")
-                    raise e
+                raise e
             
             messages.append(response)
             
@@ -1219,7 +1299,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             # Use HumanMessage format for proper LLM invocation
             from langchain_core.messages import HumanMessage
             final_messages = [HumanMessage(content=final_prompt)]
-            response = self.llm.invoke(final_messages)
+            response = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
             final_answer = response.content if hasattr(response, 'content') else str(response)
             
             # Track token usage for this final call
@@ -1367,7 +1447,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                     
                                     from langchain_core.messages import HumanMessage
                                     final_messages = [HumanMessage(content=final_prompt)]
-                                    response = self.llm.invoke(final_messages)
+                                    response = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
                                     final_answer = response.content if hasattr(response, 'content') else str(response)
                                     logger.info(f"✅ Generated final answer from query results")
                                     print(f"✅ Final Answer: {final_answer}")

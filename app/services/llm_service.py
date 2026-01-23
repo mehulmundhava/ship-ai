@@ -130,4 +130,25 @@ class LLMService:
             temperature=temperature
         )
         return groq_llm
+    
+    def get_fallback_llm_model(
+        self, 
+        temperature: float = 0, 
+        model: str = None
+    ) -> BaseChatModel:
+        """
+        Get fallback LLM instance (always OpenAI/ChatGPT).
+        Used when primary provider (Groq) fails.
+        
+        Args:
+            temperature (float): Controls randomness in responses. Default: 0
+            model (str): Model name. If None, uses OpenAI default.
+        
+        Returns:
+            BaseChatModel: Configured OpenAI LLM instance
+        """
+        return self.openai_llm_model(
+            temperature=temperature,
+            model=model or "gpt-4o"
+        )
 
