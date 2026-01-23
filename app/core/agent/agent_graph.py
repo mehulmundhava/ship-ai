@@ -221,6 +221,7 @@ class SQLAgentGraph:
     def _invoke_llm_with_fallback(self, messages, use_tools=False, question=""):
         """
         Invoke LLM with automatic fallback to ChatGPT if Groq fails.
+        If both fail but we can extract SQL from error, create synthetic response.
         
         Args:
             messages: List of messages to send to LLM
@@ -228,7 +229,7 @@ class SQLAgentGraph:
             question: Question text for tool binding (if use_tools=True)
         
         Returns:
-            LLM response
+            LLM response or synthetic AIMessage with tool calls
         """
         try:
             if use_tools and self.llm_with_tools:
@@ -268,10 +269,198 @@ class SQLAgentGraph:
                     logger.error(f"ChatGPT fallback also failed: {e2}")
                     logger.exception("ChatGPT fallback error")
                     print(f"❌ ChatGPT fallback also failed: {e2}")
-                    raise e  # Re-raise original Groq error
+                    
+                    # Try to recover by extracting SQL from Groq error
+                    if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
+                        logger.info("Attempting to extract SQL query from Groq error for recovery...")
+                        print(f"🔧 Attempting to extract SQL from Groq error for recovery...")
+                        print(f"   Error string preview: {error_str[:500]}...")
+                        
+                        extracted = self._extract_sql_from_groq_error(error_str)
+                        
+                        if extracted:
+                            logger.info(f"✅ Successfully extracted: tool_name={extracted.get('tool_name')}, has_args={bool(extracted.get('args'))}")
+                            print(f"✅ Successfully extracted: {extracted.get('tool_name')}")
+                            
+                            if use_tools:
+                                # Create synthetic response with extracted tool call
+                                try:
+                                    synthetic_response = self._create_synthetic_tool_response(
+                                        extracted["tool_name"],
+                                        extracted["args"],
+                                        messages
+                                    )
+                                    logger.info("✅ Created synthetic response from Groq error - workflow can continue")
+                                    print(f"✅ Recovered from Groq error - extracted and will execute: {extracted['tool_name']}")
+                                    return synthetic_response
+                                except Exception as synth_error:
+                                    logger.error(f"Failed to create synthetic response: {synth_error}")
+                                    print(f"❌ Failed to create synthetic response: {synth_error}")
+                            else:
+                                logger.warning("Extraction succeeded but use_tools is False - cannot create synthetic response")
+                                print(f"⚠️  Extraction succeeded but use_tools is False")
+                        else:
+                            logger.warning("Failed to extract SQL from Groq error")
+                            print(f"❌ Failed to extract SQL from Groq error")
+                    
+                    # If we can't recover, re-raise original error
+                    raise e
             else:
                 # Not a Groq error, re-raise
                 raise e
+    
+    def _extract_sql_from_groq_error(self, error_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract SQL query and tool name from Groq's tool_use_failed error.
+        
+        Groq sometimes generates function calls in wrong format:
+        '<function=execute_db_query {"query": "SELECT ..."}></function>'
+        
+        Args:
+            error_str: Error message string containing failed_generation
+            
+        Returns:
+            Dict with 'tool_name' and 'args', or None if extraction fails
+        """
+        try:
+            logger.debug(f"Attempting to extract from error string (length: {len(error_str)})")
+            
+            # The error format is: 'failed_generation': '<function=execute_db_query {"query": "..."}></function>'
+            # We need to extract the content between the single quotes after 'failed_generation'
+            
+            # Method 1: Extract the entire failed_generation value (handles nested quotes)
+            # Look for: 'failed_generation': '<function=...></function>'
+            # We'll extract everything between the single quotes after the colon
+            failed_gen_pattern = r"'failed_generation':\s*'((?:[^'\\]|\\.)*)'"
+            match = re.search(failed_gen_pattern, error_str, re.DOTALL)
+            
+            if not match:
+                # Method 2: Try with escaped quotes or different quote styles
+                failed_gen_pattern = r'failed_generation[^:]*:\s*["\']((?:[^"\'\\]|\\.)*)["\']'
+                match = re.search(failed_gen_pattern, error_str, re.DOTALL)
+            
+            # Method 3: Direct search - find function tag and query separately (most reliable)
+            # First find the function name
+            func_tag_match = re.search(r'<function=(\w+)', error_str)
+            if func_tag_match:
+                tool_name = func_tag_match.group(1)
+                logger.debug(f"Found function tag: {tool_name}, now searching for query...")
+                
+                # Find the query value - it's in the format "query": "SELECT..."
+                # We need to find the query value that comes after "query": "
+                query_pattern = r'"query":\s*"((?:[^"\\]|\\.)*)"'
+                query_match = re.search(query_pattern, error_str, re.DOTALL)
+                if query_match:
+                    query = query_match.group(1)
+                    # Unescape
+                    query = query.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
+                    query = query.rstrip(';').strip()
+                    if query and query.upper().startswith('SELECT'):
+                        logger.info(f"✅ Extracted SQL query from Groq error (method 3): {query[:100]}...")
+                        print(f"🔧 Extracted SQL query from Groq error: {tool_name}")
+                        return {"tool_name": tool_name, "args": {"query": query}}
+            
+            # Method 4: Even more permissive - find function tag and extract query separately
+            # This handles cases where the JSON structure might be malformed
+            func_tag_match = re.search(r'<function=(\w+)', error_str)
+            if func_tag_match:
+                tool_name = func_tag_match.group(1)
+                logger.debug(f"Found function tag: {tool_name}, now searching for query...")
+                
+                # Now find the query anywhere in the error string
+                # Look for "query": "SELECT..." pattern
+                query_match = re.search(r'"query":\s*"((?:[^"\\]|\\.)*)"', error_str, re.DOTALL)
+                if query_match:
+                    query = query_match.group(1)
+                    query = query.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
+                    query = query.rstrip(';').strip()
+                    if query and query.upper().startswith('SELECT'):
+                        logger.info(f"✅ Extracted SQL query from Groq error (permissive method): {query[:100]}...")
+                        print(f"🔧 Extracted SQL query from Groq error: {tool_name}")
+                        return {"tool_name": tool_name, "args": {"query": query}}
+            
+            if match:
+                failed_gen_content = match.group(1)
+                logger.debug(f"Extracted failed_generation content: {failed_gen_content[:200]}...")
+                
+                # Extract tool name and args from: <function=TOOL_NAME{...}></function>
+                func_pattern = r'<function=(\w+)\s*({.*?})></function>'
+                func_match = re.search(func_pattern, failed_gen_content, re.DOTALL)
+                
+                if func_match:
+                    tool_name = func_match.group(1)
+                    args_str = func_match.group(2)
+                    logger.debug(f"Extracted tool_name: {tool_name}, args_str: {args_str[:200]}...")
+                    
+                    # Parse the JSON-like args string
+                    try:
+                        # The args might have escaped quotes, so we need to handle that carefully
+                        # First, try direct JSON parsing
+                        args = json.loads(args_str)
+                        
+                        logger.info(f"✅ Extracted tool call from Groq error: {tool_name} with args")
+                        print(f"🔧 Extracted tool call from Groq error: {tool_name}")
+                        return {"tool_name": tool_name, "args": args}
+                    except json.JSONDecodeError as je:
+                        logger.debug(f"JSON decode failed: {je}, trying regex extraction")
+                        # If JSON parsing fails, try to extract query directly using regex
+                        # The query is inside double quotes, so we need to handle escaped quotes
+                        query_pattern = r'"query":\s*"((?:[^"\\]|\\.)*)"'
+                        query_match = re.search(query_pattern, args_str, re.DOTALL)
+                        
+                        if query_match:
+                            query = query_match.group(1)
+                            # Unescape common escape sequences
+                            query = query.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n').replace('\\t', '\t')
+                            # Remove trailing semicolon if present
+                            query = query.rstrip(';').strip()
+                            if query and query.upper().startswith('SELECT'):
+                                logger.info(f"✅ Extracted SQL query from Groq error (regex): {query[:100]}...")
+                                print(f"🔧 Extracted SQL query from Groq error: {tool_name}")
+                                return {"tool_name": tool_name, "args": {"query": query}}
+                        else:
+                            logger.warning(f"Could not extract query from args_str: {args_str[:200]}")
+        except Exception as e:
+            logger.warning(f"Failed to extract SQL from Groq error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        
+        logger.warning("Failed to extract SQL from Groq error - no match found")
+        return None
+    
+    def _create_synthetic_tool_response(self, tool_name: str, tool_args: Dict[str, Any], messages: List) -> AIMessage:
+        """
+        Create a synthetic AIMessage with tool_calls from extracted Groq error.
+        
+        Args:
+            tool_name: Name of the tool to call
+            tool_args: Arguments for the tool
+            messages: Current message history
+            
+        Returns:
+            AIMessage with tool_calls
+        """
+        # Generate a unique tool call ID
+        import uuid
+        tool_call_id = str(uuid.uuid4())
+        
+        # Create tool call structure
+        tool_call = {
+            "id": tool_call_id,
+            "name": tool_name,
+            "args": tool_args
+        }
+        
+        # Create AIMessage with tool calls
+        synthetic_response = AIMessage(
+            content="",
+            tool_calls=[tool_call]
+        )
+        
+        logger.info(f"✅ Created synthetic AIMessage with tool call: {tool_name}")
+        print(f"🔧 Created synthetic response with tool call: {tool_name}")
+        
+        return synthetic_response
     
     def _extract_sql_from_text(self, text: str) -> Optional[str]:
         """
