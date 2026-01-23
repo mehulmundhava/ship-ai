@@ -25,6 +25,11 @@ class ChatResponse(BaseModel):
     token_id: str
     answer: str
     sql_query: Optional[str] = None
+    results: Optional[Dict[str, Any]] = None  # Result data from query execution
+    cached: Optional[bool] = False  # True if answer came from cache
+    similarity: Optional[float] = None  # Similarity score (only when cached)
+    llm_used: Optional[bool] = True  # False if answer came from cache
+    tokens_saved: Optional[str] = None  # Estimated tokens saved (only when cached)
     debug: Optional[Dict[str, Any]] = None
 
 

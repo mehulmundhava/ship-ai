@@ -8,8 +8,13 @@ It creates two separate SQLAlchemy engines:
 """
 
 import urllib.parse
+import logging
 from sqlalchemy import create_engine
 from app.config.settings import settings
+
+# Suppress verbose SQLAlchemy SQL logging (only show errors, not full SQL)
+logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
+logging.getLogger('sqlalchemy.pool').setLevel(logging.WARNING)
 
 
 # ============================================================================

@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     LOG_TO_CONSOLE: bool = True
     LOG_TO_FILE: bool = True
     
+    # Vector Cache Configuration
+    VECTOR_CACHE_ENABLED: bool = True
+    VECTOR_CACHE_SIMILARITY_THRESHOLD: float = 0.80
+    VECTOR_CACHE_AUTO_SAVE: bool = True
+    VECTOR_CACHE_DETERMINISTIC_ONLY: bool = True
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=False,

@@ -892,17 +892,15 @@ def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
                 extra_journey_time_limit = params.get("extraJourneyTimeLimit")
                 from_facility = params.get("from_facility")
             
-            # Check if SQL filters by a specific facility_id (for "devices that entered facility X" queries)
-            # If so, we need to expand the query to get ALL records for those devices, not just entries to X
+            # Check if SQL filters by a specific facility_id
+            # When from_facility param is provided, we need to handle this correctly:
+            # - For "journeys starting from facility X": Remove facility_id filter (journey calculator handles filtering)
+            # - For "devices that entered facility X" (with time interval): Expand query to get all records
             sql_upper_clean = ' '.join(sql_upper.split())
             facility_filter_pattern = r"DG\.FACILITY_ID\s*=\s*'([^']+)'"
             import re
             facility_match = re.search(facility_filter_pattern, sql_upper_clean)
             
-            # Expand query if:
-            # 1. SQL filters by facility_id AND
-            # 2. from_facility param is set (indicating "devices that entered facility X" query)
-            # 3. The facility in SQL matches from_facility param (they should match)
             if facility_match and from_facility:
                 sql_facility = facility_match.group(1)
                 # Check if they match (case-insensitive)
@@ -910,62 +908,65 @@ def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
                     target_facility = sql_facility
                     print(f"   🔍 Detected facility filter: {target_facility}")
                     print(f"   🔍 from_facility param: {from_facility}")
-                    print(f"   📝 Expanding query to get ALL records for devices that entered {target_facility}")
-                    
-                    # Extract user_id from original query, or use stored user_id from closure
-                    user_id_match = re.search(r"UDA\.USER_ID\s*=\s*(\d+)", sql_upper_clean)
-                    if user_id_match:
-                        user_id = user_id_match.group(1)
-                    elif stored_user_id:
-                        user_id = str(stored_user_id)
-                        print(f"   ⚠️  user_id not found in SQL, using stored user_id: {user_id}")
-                    else:
-                        error_msg = "ERROR: user_id not found in SQL query and no user_id provided. Cannot proceed without user_id."
-                        print(f"   ❌ {error_msg}")
-                        return error_msg
                     
                     # Extract time interval from original query if present
-                    # If not found, we should not use a default - let the SQL query handle it
                     time_interval_match = re.search(r"INTERVAL\s+'(\d+)\s+days'", sql_upper_clean)
-                    if time_interval_match:
-                        days = time_interval_match.group(1)
-                    else:
-                        # If no time interval in SQL, don't add one - use the original query's time filter
-                        error_msg = "ERROR: Time interval not found in SQL query. Cannot expand query without time interval."
-                        print(f"   ❌ {error_msg}")
-                        return error_msg
                     
-                    # Build expanded query: Get all records for devices that entered the target facility
-                    # Step 1: Find device_ids that entered the facility in the time period
-                    # Step 2: Get all geofencing records for those devices
-                    expanded_sql = f"""
-                    WITH devices_entered_facility AS (
-                        SELECT DISTINCT dg.device_id
+                    if time_interval_match:
+                        # Has time interval: This is a "devices that entered facility X" query - expand it
+                        days = time_interval_match.group(1)
+                        print(f"   📝 Expanding query to get ALL records for devices that entered {target_facility}")
+                        
+                        # Extract user_id from original query, or use stored user_id from closure
+                        user_id_match = re.search(r"UDA\.USER_ID\s*=\s*(\d+)", sql_upper_clean)
+                        if user_id_match:
+                            user_id = user_id_match.group(1)
+                        elif stored_user_id:
+                            user_id = str(stored_user_id)
+                            print(f"   ⚠️  user_id not found in SQL, using stored user_id: {user_id}")
+                        else:
+                            error_msg = "ERROR: user_id not found in SQL query and no user_id provided. Cannot proceed without user_id."
+                            print(f"   ❌ {error_msg}")
+                            return error_msg
+                        
+                        # Build expanded query: Get all records for devices that entered the target facility
+                        expanded_sql = f"""
+                        WITH devices_entered_facility AS (
+                            SELECT DISTINCT dg.device_id
+                            FROM device_geofencings dg
+                            JOIN user_device_assignment uda ON uda.device = dg.device_id
+                            WHERE uda.user_id = {user_id}
+                              AND dg.facility_id = '{target_facility}'
+                              AND dg.entry_event_time >= NOW() - INTERVAL '{days} days'
+                        )
+                        SELECT 
+                            dg.device_id,
+                            dg.facility_id,
+                            dg.facility_type,
+                            dg.entry_event_time,
+                            dg.exit_event_time
                         FROM device_geofencings dg
                         JOIN user_device_assignment uda ON uda.device = dg.device_id
+                        JOIN devices_entered_facility def ON def.device_id = dg.device_id
                         WHERE uda.user_id = {user_id}
-                          AND dg.facility_id = '{target_facility}'
-                          AND dg.entry_event_time >= NOW() - INTERVAL '{days} days'
-                    )
-                    SELECT 
-                        dg.device_id,
-                        dg.facility_id,
-                        dg.facility_type,
-                        dg.entry_event_time,
-                        dg.exit_event_time
-                    FROM device_geofencings dg
-                    JOIN user_device_assignment uda ON uda.device = dg.device_id
-                    JOIN devices_entered_facility def ON def.device_id = dg.device_id
-                    WHERE uda.user_id = {user_id}
-                    ORDER BY dg.device_id, dg.entry_event_time ASC
-                    """
-                    
-                    print(f"   ✅ Using user_id: {user_id}, time interval: {days} days")
-                    
-                    sql = expanded_sql.strip()
-                    print(f"   📋 Expanded SQL: {sql[:200]}...")
+                        ORDER BY dg.device_id, dg.entry_event_time ASC
+                        """
+                        
+                        print(f"   ✅ Using user_id: {user_id}, time interval: {days} days")
+                        sql = expanded_sql.strip()
+                        print(f"   📋 Expanded SQL: {sql[:200]}...")
+                    else:
+                        # No time interval: This is a "journeys starting from facility X" query
+                        # Remove the facility_id filter - journey calculator will handle from_facility filtering
+                        print(f"   📝 Removing facility_id filter - journey calculator will filter by from_facility={from_facility}")
+                        # Remove the facility_id filter from SQL
+                        # Pattern: AND dg.facility_id = 'RCOSX00018' (with optional whitespace)
+                        facility_filter_remove_pattern = rf"\s+AND\s+DG\.FACILITY_ID\s*=\s*'{re.escape(sql_facility)}'"
+                        sql = re.sub(facility_filter_remove_pattern, '', sql, flags=re.IGNORECASE)
+                        print(f"   ✅ Removed facility_id filter from SQL")
+                        print(f"   📋 Modified SQL: {sql[:200]}...")
                 else:
-                    print(f"   ⚠️  Facility mismatch: SQL has {sql_facility}, param has {from_facility} - not expanding")
+                    print(f"   ⚠️  Facility mismatch: SQL has {sql_facility}, param has {from_facility} - not modifying")
             
             output = query_tool.db.run_no_throw(sql, include_columns=True)
             

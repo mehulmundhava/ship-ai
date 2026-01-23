@@ -8,13 +8,39 @@ from fastapi import HTTPException, status
 from langchain_community.utilities.sql_database import SQLDatabase
 from app.core.agent.agent_graph import SQLAgentGraph
 from app.config.database import sync_engine
+from app.config.settings import settings
 from app.models.schemas import ChatRequest, ChatResponse
-
+from app.services.cache_answer_service import CacheAnswerService
 
 import logging
 
 # Get logger for this module
 logger = logging.getLogger("ship_rag_ai")
+
+
+def detect_question_type(question: str) -> str:
+    """
+    Detect if question is about journeys or not.
+    Returns 'journey' or 'non_journey'.
+    
+    Args:
+        question: User's question
+        
+    Returns:
+        'journey' if question is about journeys, 'non_journey' otherwise
+    """
+    journey_keywords = [
+        "journey", "journeys", "movement", 
+        "facility to facility", "entered", "exited",
+        "path", "traveled", "transition", "route"
+    ]
+    
+    question_lower = question.lower()
+    for keyword in journey_keywords:
+        if keyword in question_lower:
+            return "journey"
+    
+    return "non_journey"
 
 
 def process_chat(
@@ -51,6 +77,59 @@ def process_chat(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Session ID is not proper"
         )
+    
+    # Detect question type and user type for cache context matching
+    question_type = detect_question_type(payload.question)
+    user_type = "admin" if payload.user_id == "admin" else "user"
+    
+    # Initialize cache service with sql_db and user_id for SQL adaptation
+    cache_service = CacheAnswerService(vector_store, sql_db=sql_db, user_id=payload.user_id)
+    
+    # Check cache BEFORE LLM execution
+    cached_result = None
+    if settings.VECTOR_CACHE_ENABLED:
+        try:
+            cached_result = cache_service.check_cached_answer(
+                question=payload.question,
+                user_type=user_type,
+                question_type=question_type
+            )
+            
+            if cached_result:
+                # Cache hit - return immediately (skip LLM)
+                logger.info(f"✅ Cache HIT - Returning cached answer (similarity: {cached_result['similarity']:.4f})")
+                print(f"\n{'='*80}")
+                print(f"✅ CACHE HIT - Skipping LLM")
+                print(f"   Similarity: {cached_result['similarity']:.4f}")
+                print(f"   Question Type: {question_type}")
+                print(f"   User Type: {user_type}")
+                print(f"{'='*80}\n")
+                
+                return ChatResponse(
+                    token_id=payload.token_id,
+                    answer=cached_result["answer"],
+                    sql_query=cached_result.get("sql_query"),
+                    results=cached_result.get("result_data"),
+                    cached=True,
+                    similarity=cached_result["similarity"],
+                    llm_used=False,
+                    tokens_saved="~8000-11000",
+                    debug={
+                        "cache_hit": True,
+                        "original_question": cached_result["original_question"],
+                        "question_type": question_type,
+                        "user_type": user_type
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Error checking cache (continuing with LLM): {e}")
+            # Continue with LLM flow if cache check fails
+    
+    # Cache miss - proceed with existing LLM flow
+    logger.info("Cache MISS - Proceeding with LLM execution")
+    print(f"\n{'='*80}")
+    print(f"❌ CACHE MISS - Proceeding with LLM")
+    print(f"{'='*80}\n")
     
     # Process user question
     try:
@@ -96,7 +175,59 @@ def process_chat(
         query_result = result.get("query_result", "")
         debug_info = result.get("debug", {})
         
+        # Extract result data for caching (if available)
+        result_data = None
+        if query_result:
+            try:
+                import json
+                # Try to parse query_result as JSON if it's a string
+                if isinstance(query_result, str):
+                    # First try JSON parsing
+                    try:
+                        result_data = json.loads(query_result)
+                    except (json.JSONDecodeError, ValueError):
+                        # If not JSON, try to parse as Python literal (for journey results)
+                        try:
+                            import ast
+                            parsed = ast.literal_eval(query_result)
+                            if isinstance(parsed, (dict, list)):
+                                result_data = parsed
+                            else:
+                                result_data = {"raw_result": str(query_result)}
+                        except (ValueError, SyntaxError):
+                            # If all parsing fails, store as string
+                            result_data = {"raw_result": str(query_result)}
+                elif isinstance(query_result, (dict, list)):
+                    result_data = query_result
+                else:
+                    result_data = {"raw_result": str(query_result)}
+            except Exception as e:
+                logger.debug(f"Error parsing query_result for cache: {e}")
+                result_data = {"raw_result": str(query_result)}
+        
         logger.info(f"Agent completed - Answer length: {len(answer)}, SQL query: {bool(sql_query)}, Query result: {bool(query_result)}")
+        
+        # Save to cache AFTER successful LLM response (if deterministic)
+        if settings.VECTOR_CACHE_ENABLED and settings.VECTOR_CACHE_AUTO_SAVE:
+            if answer and not result.get("error"):
+                try:
+                    cache_id = cache_service.save_answer_to_cache(
+                        question=payload.question,
+                        answer=answer,
+                        sql_query=sql_query,
+                        result_data=result_data,
+                        question_type=question_type,
+                        user_type=user_type
+                    )
+                    
+                    if cache_id:
+                        logger.info(f"✅ Answer saved to cache (ID: {cache_id})")
+                        print(f"✅ Answer saved to cache (ID: {cache_id})")
+                    else:
+                        logger.debug("Answer not saved to cache (not deterministic or validation failed)")
+                except Exception as e:
+                    logger.warning(f"Error saving to cache (non-critical): {e}")
+                    # Don't fail the request if cache save fails
         
     except Exception as e:
         # Handle any errors that occur during processing
@@ -121,6 +252,9 @@ def process_chat(
         token_id=payload.token_id,
         answer=answer,
         sql_query=sql_query_str,
+        results=result_data if 'result_data' in locals() else None,
+        cached=False,
+        llm_used=True,
         debug=debug_info
     )
 
