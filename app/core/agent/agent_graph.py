@@ -1304,6 +1304,74 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
         # If we have query results, format them
         if query_result and not query_result.startswith("::::::"):
             logger.info("Formatting final answer from query results")
+            
+            # SAFETY CHECK: Truncate extremely large results before processing
+            # LLM APIs have request size limits (typically 1-2M tokens, ~4-8M characters)
+            # We'll limit to 50,000 characters to be safe
+            MAX_RESULT_SIZE = 50000
+            original_result_size = len(query_result) if query_result else 0
+            
+            if original_result_size > MAX_RESULT_SIZE:
+                logger.warning(f"⚠️  Query result is too large ({original_result_size:,} chars). Truncating to {MAX_RESULT_SIZE:,} chars for LLM formatting.")
+                print(f"⚠️  Query result too large ({original_result_size:,} chars) - truncating for LLM")
+                
+                # For extremely large results, create a summary instead of trying to parse everything
+                # This prevents memory issues and API request size errors
+                try:
+                    # Check if it's a list/dict format by looking at first character
+                    if isinstance(query_result, str) and query_result.strip():
+                        first_char = query_result.strip()[0]
+                        
+                        if first_char == '[':
+                            # It's a list - count approximate rows by counting '},' or '],' patterns
+                            # This is much faster than parsing 92M characters
+                            row_indicators = query_result.count('},') + query_result.count('],')
+                            estimated_count = row_indicators + 1  # +1 for last item
+                            
+                            # Try to get first few items (parse only first 10KB)
+                            try:
+                                import ast
+                                sample_str = query_result[:10000]  # First 10KB should have a few items
+                                # Find the end of first complete item
+                                bracket_count = 0
+                                sample_end = 0
+                                for i, char in enumerate(sample_str):
+                                    if char == '[':
+                                        bracket_count += 1
+                                    elif char == ']':
+                                        bracket_count -= 1
+                                        if bracket_count == 0:
+                                            sample_end = i + 1
+                                            break
+                                
+                                if sample_end > 0:
+                                    parsed_sample = ast.literal_eval(sample_str[:sample_end] + ']')
+                                    if isinstance(parsed_sample, list) and len(parsed_sample) > 0:
+                                        sample = parsed_sample[:3]  # First 3 items
+                                        query_result = f"Total results: ~{estimated_count:,} rows (estimated)\n\nFirst 3 rows (sample):\n{json.dumps(sample, indent=2, default=str)}\n\n[Result too large to display fully ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+                                    else:
+                                        query_result = f"Total results: ~{estimated_count:,} rows (estimated)\n\n[Result too large to display ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+                                else:
+                                    query_result = f"Total results: ~{estimated_count:,} rows (estimated)\n\n[Result too large to display ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+                            except Exception:
+                                # If parsing fails, just show count estimate
+                                query_result = f"Total results: ~{estimated_count:,} rows (estimated)\n\n[Result too large to display ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+                        
+                        elif first_char == '{':
+                            # It's a dict - just truncate with summary
+                            query_result = query_result[:MAX_RESULT_SIZE] + f"\n\n[Result truncated - too large to display ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+                        else:
+                            # String format - just truncate
+                            query_result = query_result[:MAX_RESULT_SIZE] + f"\n\n[Result truncated - too large to display ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+                    else:
+                        # Not a string or empty - convert and truncate
+                        query_result = str(query_result)[:MAX_RESULT_SIZE] + f"\n\n[Result truncated - too large to display ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+                        
+                except Exception as e:
+                    logger.warning(f"Error creating summary for large result: {e}. Using simple truncation.")
+                    # Final fallback: simple truncation
+                    query_result = str(query_result)[:MAX_RESULT_SIZE] + f"\n\n[Result truncated - too large to display ({original_result_size:,} chars). Please refine your query with more specific filters or time ranges.]"
+            
             # Generate final answer from results using a MINIMAL, one-shot prompt.
             # IMPORTANT: We DO NOT send the full message history, system prompt,
             # or retrieved examples again here. This keeps token usage low for

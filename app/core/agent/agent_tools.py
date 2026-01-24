@@ -11,13 +11,18 @@ This module defines tools that the agent can use:
 from typing import Optional, Dict, Any, Sequence, Tuple, List
 import re
 import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from langchain_core.tools import tool
 from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy.engine import Result
 from sqlalchemy import text
 from app.config.table_metadata import TABLE_METADATA
+from app.config.database import QUERY_TIMEOUT_SECONDS, sync_engine
 from app.utils.csv_generator import format_result_with_csv, generate_csv_from_result, format_journey_list_with_csv
 from app.core.journey_calculator import calculate_journey_counts, calculate_journey_list
+
+logger = logging.getLogger("ship_rag_ai")
 
 # List of sensitive tables that should not be queried directly for raw data
 RESTRICTED_TABLES = [
@@ -362,6 +367,8 @@ class QuerySQLDatabaseTool:
         Execute a SQL query and return results.
         Automatically handles result splitting for large lists.
         
+        Queries that exceed 60 seconds will be automatically killed.
+        
         Args:
             query: SQL query to execute
             
@@ -372,13 +379,87 @@ class QuerySQLDatabaseTool:
         print(f"🔧 TOOL CALLED: execute_db_query")
         print(f"{'='*80}")
         print(f"   SQL Query: {query}")
+        print(f"   ⏱️  Timeout: {QUERY_TIMEOUT_SECONDS} seconds (query will be killed if exceeded)")
         
         # Detect query type
         query_type = self._detect_query_type(query)
         print(f"   Detected Query Type: {query_type}")
         
-        # Execute query without throwing exceptions
-        output = self.db.run_no_throw(query, include_columns=True)
+        # Execute query with timeout protection
+        # We use both connection-level statement_timeout (set at connection time) and
+        # per-query SET LOCAL as a backup to ensure queries are killed
+        def _execute_query():
+            # Get the underlying engine to execute with explicit timeout
+            engine = getattr(self.db, '_engine', None) or sync_engine
+            
+            try:
+                # Execute in a transaction with explicit statement_timeout
+                with engine.begin() as conn:
+                    # Set statement_timeout for this transaction (LOCAL means it only affects this transaction)
+                    conn.execute(text(f"SET LOCAL statement_timeout = {QUERY_TIMEOUT_SECONDS * 1000}"))
+                    
+                    # Execute the actual query
+                    result = conn.execute(text(query))
+                    
+                    # Fetch all results
+                    rows = result.fetchall()
+                    
+                    if not rows:
+                        return None
+                    
+                    # Convert to SQLDatabase format (list of dicts)
+                    columns = list(result.keys())
+                    formatted_rows = [dict(zip(columns, row)) for row in rows]
+                    
+                    # Convert to string format (pipe-separated like SQLDatabase)
+                    if not formatted_rows:
+                        return None
+                    
+                    lines = [' | '.join(columns)]
+                    for row in formatted_rows:
+                        values = [str(row.get(col, '')) for col in columns]
+                        lines.append(' | '.join(values))
+                    
+                    return '\n'.join(lines)
+            except Exception as e:
+                # Check if it's a timeout error
+                error_str = str(e).lower()
+                if 'timeout' in error_str or 'statement_timeout' in error_str or 'canceling statement' in error_str:
+                    # Re-raise timeout errors so they're handled by the outer try/except
+                    raise TimeoutError(f"Query timeout: {str(e)}")
+                # For other errors, return error message (similar to run_no_throw behavior)
+                return f"Error executing query: {str(e)}"
+        
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_execute_query)
+                output = future.result(timeout=QUERY_TIMEOUT_SECONDS + 10)  # Add 10s buffer
+        except FutureTimeoutError:
+            # Python-level timeout occurred - query should be killed by PostgreSQL
+            error_msg = f"Query execution exceeded {QUERY_TIMEOUT_SECONDS} seconds and was killed."
+            logger.error(f"⏱️  Query timeout: {error_msg}")
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return f":::::: Query execution timeout: The query took longer than {QUERY_TIMEOUT_SECONDS} seconds and was automatically killed. Please optimize your query or use more specific filters. ::::::"
+        except Exception as e:
+            # If it's a timeout-related error from PostgreSQL, handle it
+            error_str = str(e).lower()
+            if 'timeout' in error_str or 'statement_timeout' in error_str or 'canceling statement' in error_str or 'cancelled' in error_str:
+                error_msg = f"Query execution exceeded {QUERY_TIMEOUT_SECONDS} seconds and was killed by database."
+                logger.error(f"⏱️  Database timeout: {error_msg}")
+                print(f"   ❌ {error_msg}")
+                print(f"{'='*80}\n")
+                return f":::::: Query execution timeout: The query took longer than {QUERY_TIMEOUT_SECONDS} seconds and was automatically killed. Please optimize your query or use more specific filters. ::::::"
+            # Re-raise other exceptions to be handled by run_no_throw
+            raise
+        
+        # Check if query returned no rows
+        if not output:
+            print(f"   Result: No rows returned")
+            print(f"{'='*80}\n")
+            return ":::::: Query execution has returned 0 rows. Return final answer accordingly. ::::::"
+        
+        result = str(output)
         
         # Check if query returned no rows
         if not output:
