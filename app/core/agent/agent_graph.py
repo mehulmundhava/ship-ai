@@ -232,6 +232,12 @@ class SQLAgentGraph:
             LLM response or synthetic AIMessage with tool calls
         """
         try:
+            # Log which LLM we're using (primary)
+            model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
+            provider_name = type(self.llm).__name__
+            logger.info(f"🔵 Using PRIMARY LLM: {provider_name} ({model_name})")
+            print(f"🔵 Using PRIMARY LLM: {provider_name} ({model_name})")
+            
             if use_tools and self.llm_with_tools:
                 return self.llm_with_tools.invoke(messages)
             else:
@@ -241,13 +247,29 @@ class SQLAgentGraph:
             error_str = str(e)
             error_type = type(e).__name__
             
-            # Groq-specific error patterns
+            # Log the error for debugging
+            logger.warning(f"❌ LLM Error: {error_type} - {error_str[:200]}")
+            print(f"❌ LLM Error: {error_type}")
+            print(f"   Error preview: {error_str[:200]}...")
+            
+            # Groq-specific error patterns (expanded to catch authentication errors)
+            error_lower = error_str.lower()
             is_groq_error = (
-                "groq" in error_str.lower() or
+                "groq" in error_lower or
                 "BadRequestError" in error_type or
                 "tool_use_failed" in error_str or
                 "Failed to call a function" in error_str or
-                "groq.BadRequestError" in error_type
+                "groq.BadRequestError" in error_type or
+                "authentication" in error_lower or
+                "unauthorized" in error_lower or
+                "invalid" in error_lower and "api" in error_lower and "key" in error_lower or
+                "api" in error_lower and "key" in error_lower and "invalid" in error_lower or
+                "401" in error_str or
+                "403" in error_str or
+                "AuthenticationError" in error_type or
+                "UnauthorizedError" in error_type or
+                "ForbiddenError" in error_type or
+                "InvalidApiKeyError" in error_type
             )
             
             if is_groq_error and self.provider == "GROQ":
@@ -257,6 +279,12 @@ class SQLAgentGraph:
                 
                 # Get fallback LLM (ChatGPT)
                 fallback_llm = self._get_fallback_llm(use_tools, question)
+                
+                # Log which LLM we're using (fallback)
+                fallback_model_name = getattr(fallback_llm, 'model_name', None) or getattr(fallback_llm, 'model', None) or 'Unknown'
+                fallback_provider_name = type(fallback_llm).__name__
+                logger.info(f"🟢 Using FALLBACK LLM: {fallback_provider_name} ({fallback_model_name})")
+                print(f"🟢 Using FALLBACK LLM: {fallback_provider_name} ({fallback_model_name})")
                 
                 # Retry with ChatGPT
                 try:
