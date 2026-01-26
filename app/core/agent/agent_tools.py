@@ -535,12 +535,27 @@ class QuerySQLDatabaseTool:
                     print(f"{'='*80}\n")
                     return original_result
         else:
-            # COUNT or other queries - return as-is
-            result_preview = result[:300] + "..." if len(result) > 300 else result
-            print(f"   Result: {len(result)} characters")
-            print(f"   Preview: {result_preview}")
-            print(f"{'='*80}\n")
-            return result
+            # COUNT or other queries - check if we need CSV generation
+            # Parse result to count rows
+            lines = result.strip().split('\n')
+            data_rows = [line for line in lines[1:] if line.strip()] if len(lines) > 1 else []
+            row_count = len(data_rows)
+            
+            print(f"   Result: {row_count} rows, {len(result)} characters")
+            
+            # If > 5 rows, format with CSV (same logic as LIST queries)
+            if row_count > 5:
+                print(f"   Large result detected ({row_count} rows), generating CSV...")
+                formatted_result = format_result_with_csv(result, max_preview_rows=5)
+                print(f"   Formatted result with CSV link")
+                print(f"{'='*80}\n")
+                return formatted_result
+            else:
+                # <= 5 rows, return as-is
+                result_preview = result[:300] + "..." if len(result) > 300 else result
+                print(f"   Preview: {result_preview}")
+                print(f"{'='*80}\n")
+                return result
 
 
 def _is_restricted_user_query(user_question: str) -> Tuple[bool, Optional[str]]:
