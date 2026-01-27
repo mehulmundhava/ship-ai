@@ -264,7 +264,97 @@ class CacheAnswerService:
         self.similarity_threshold = settings.VECTOR_CACHE_SIMILARITY_THRESHOLD
         self.sql_db = sql_db
         self.user_id = user_id
-    
+
+    def check_80_match_and_execute(
+        self,
+        question: str,
+        question_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        80% match and execute: uses only base columns of ai_vector_examples,
+        no cache columns. When the user's question is >= threshold similar to an
+        example, run that example's SQL (or an adapted version) and return the result
+        without calling the LLM. Never reads or writes cache columns.
+
+        Args:
+            question: User's question
+            question_type: 'journey' or 'non_journey' (for execution path)
+
+        Returns:
+            Dict with answer, sql_query, result_data, similarity, original_question
+            if a candidate matched and execution succeeded; None otherwise.
+        """
+        if not self.sql_db:
+            logger.debug("80% path: SQL database not available")
+            return None
+        threshold = getattr(settings, "VECTOR_80_SIMILARITY_THRESHOLD", 0.80)
+        try:
+            query_embedding = self.vector_store.embed_query(question)
+            embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
+
+            # Base-columns-only query: no entry_type, is_active, question_type, user_type
+            search_query = text(f"""
+                SELECT
+                    id,
+                    question,
+                    sql_query,
+                    metadata,
+                    {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance,
+                    1 - ({self.embedding_field_name} <-> '{embedding_str}'::vector) AS similarity
+                FROM ai_vector_examples
+                WHERE {self.embedding_field_name} IS NOT NULL
+                ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
+                LIMIT 3
+            """)
+
+            with self.engine.connect() as conn:
+                result = conn.execute(search_query)
+                candidates = result.fetchall()
+
+            if not candidates:
+                return None
+
+            current_params = extract_params_from_question(question)
+
+            for row in candidates:
+                sim = float(row.similarity) if row.similarity else 0.0
+                if sim < threshold:
+                    continue
+                sql_query = getattr(row, "sql_query", None)
+                if not sql_query:
+                    continue
+
+                example_params: Dict[str, List[str]] = {}
+                meta = getattr(row, "metadata", None)
+                if meta:
+                    try:
+                        d = meta if isinstance(meta, dict) else json.loads(meta) if isinstance(meta, str) else {}
+                        if isinstance(d.get("params"), dict):
+                            example_params = {k: v if isinstance(v, list) else [v] for k, v in d["params"].items()}
+                    except Exception:
+                        pass
+                if not example_params:
+                    example_params = extract_sql_parameters(sql_query)
+
+                adapted_result = self._try_adapt_and_execute_sql(
+                    cached_sql=sql_query,
+                    cached_params=example_params,
+                    current_params=current_params,
+                    question=question,
+                    question_type=question_type,
+                    similarity=sim,
+                )
+                if adapted_result:
+                    logger.info(
+                        f"80% match-and-execute success (similarity={sim:.4f}, question_type={question_type})"
+                    )
+                    return adapted_result
+
+            return None
+        except Exception as e:
+            logger.warning(f"80% match-and-execute error: {e}")
+            return None
+
     def check_cached_answer(
         self,
         question: str,

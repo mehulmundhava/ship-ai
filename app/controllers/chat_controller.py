@@ -84,10 +84,39 @@ def process_chat(
     
     # Initialize cache service with sql_db and user_id for SQL adaptation
     cache_service = CacheAnswerService(vector_store, sql_db=sql_db, user_id=payload.user_id)
-    
-    # Check cache BEFORE LLM execution
+
+    # 80% match-and-execute path (no cache): use only base example columns, run SQL and return
+    if getattr(settings, "VECTOR_80_MATCH_ENABLED", False):
+        try:
+            match_result = cache_service.check_80_match_and_execute(
+                question=payload.question,
+                question_type=question_type,
+            )
+            if match_result:
+                logger.info(
+                    f"✅ 80% match-and-execute hit (similarity: {match_result['similarity']:.4f})"
+                )
+                return ChatResponse(
+                    token_id=payload.token_id,
+                    answer=match_result["answer"],
+                    sql_query=match_result.get("sql_query"),
+                    results=match_result.get("result_data"),
+                    cached=False,
+                    similarity=match_result["similarity"],
+                    llm_used=False,
+                    debug={
+                        "cache_hit": False,
+                        "match_80": True,
+                        "original_question": match_result.get("original_question", payload.question),
+                        "question_type": question_type,
+                    },
+                )
+        except Exception as e:
+            logger.warning(f"80% match-and-execute failed (continuing with LLM): {e}")
+
+    # Check cache BEFORE LLM execution (only when not in 80%-only mode)
     cached_result = None
-    if settings.VECTOR_CACHE_ENABLED:
+    if settings.VECTOR_CACHE_ENABLED and not getattr(settings, "VECTOR_80_MATCH_ENABLED", False):
         try:
             cached_result = cache_service.check_cached_answer(
                 question=payload.question,
@@ -207,8 +236,12 @@ def process_chat(
         
         logger.info(f"Agent completed - Answer length: {len(answer)}, SQL query: {bool(sql_query)}, Query result: {bool(query_result)}")
         
-        # Save to cache AFTER successful LLM response (if deterministic)
-        if settings.VECTOR_CACHE_ENABLED and settings.VECTOR_CACHE_AUTO_SAVE:
+        # Save to cache AFTER successful LLM response (if deterministic). Skip when 80%-only mode.
+        if (
+            settings.VECTOR_CACHE_ENABLED
+            and settings.VECTOR_CACHE_AUTO_SAVE
+            and not getattr(settings, "VECTOR_80_MATCH_ENABLED", False)
+        ):
             if answer and not result.get("error"):
                 try:
                     cache_id = cache_service.save_answer_to_cache(
