@@ -78,86 +78,45 @@ def process_chat(
             detail="Session ID is not proper"
         )
     
-    # Detect question type and user type for cache context matching
+    # Detect question type for 80% match and agent
     question_type = detect_question_type(payload.question)
-    user_type = "admin" if payload.user_id == "admin" else "user"
-    
-    # Initialize cache service with sql_db and user_id for SQL adaptation
+
+    # Match-and-execute service (80% path: base example columns only, no cache)
     cache_service = CacheAnswerService(vector_store, sql_db=sql_db, user_id=payload.user_id)
 
-    # 80% match-and-execute path (no cache): use only base example columns, run SQL and return
-    if getattr(settings, "VECTOR_80_MATCH_ENABLED", False):
-        try:
-            match_result = cache_service.check_80_match_and_execute(
-                question=payload.question,
-                question_type=question_type,
+    # 80% match-and-execute: always check. Base columns only, no cache. If similarity ≥ 0.80,
+    # run example SQL (adapted or as-is) and return without LLM.
+    try:
+        match_result = cache_service.check_80_match_and_execute(
+            question=payload.question,
+            question_type=question_type,
+        )
+        if match_result:
+            logger.info(
+                f"✅ 80% match-and-execute hit (similarity: {match_result['similarity']:.4f})"
             )
-            if match_result:
-                logger.info(
-                    f"✅ 80% match-and-execute hit (similarity: {match_result['similarity']:.4f})"
-                )
-                return ChatResponse(
-                    token_id=payload.token_id,
-                    answer=match_result["answer"],
-                    sql_query=match_result.get("sql_query"),
-                    results=match_result.get("result_data"),
-                    cached=False,
-                    similarity=match_result["similarity"],
-                    llm_used=False,
-                    debug={
-                        "cache_hit": False,
-                        "match_80": True,
-                        "original_question": match_result.get("original_question", payload.question),
-                        "question_type": question_type,
-                    },
-                )
-        except Exception as e:
-            logger.warning(f"80% match-and-execute failed (continuing with LLM): {e}")
+            return ChatResponse(
+                token_id=payload.token_id,
+                answer=match_result["answer"],
+                sql_query=match_result.get("sql_query"),
+                results=match_result.get("result_data"),
+                cached=False,
+                similarity=match_result["similarity"],
+                llm_used=False,
+                debug={
+                    "cache_hit": False,
+                    "match_80": True,
+                    "original_question": match_result.get("original_question", payload.question),
+                    "question_type": question_type,
+                },
+            )
+    except Exception as e:
+        logger.warning(f"80% match-and-execute failed (continuing with LLM): {e}")
 
-    # Check cache BEFORE LLM execution (only when not in 80%-only mode)
-    cached_result = None
-    if settings.VECTOR_CACHE_ENABLED and not getattr(settings, "VECTOR_80_MATCH_ENABLED", False):
-        try:
-            cached_result = cache_service.check_cached_answer(
-                question=payload.question,
-                user_type=user_type,
-                question_type=question_type
-            )
-            
-            if cached_result:
-                # Cache hit - return immediately (skip LLM)
-                logger.info(f"✅ Cache HIT - Returning cached answer (similarity: {cached_result['similarity']:.4f})")
-                print(f"\n{'='*80}")
-                print(f"✅ CACHE HIT - Skipping LLM")
-                print(f"   Similarity: {cached_result['similarity']:.4f}")
-                print(f"   Question Type: {question_type}")
-                print(f"   User Type: {user_type}")
-                print(f"{'='*80}\n")
-                
-                return ChatResponse(
-                    token_id=payload.token_id,
-                    answer=cached_result["answer"],
-                    sql_query=cached_result.get("sql_query"),
-                    results=cached_result.get("result_data"),
-                    cached=True,
-                    similarity=cached_result["similarity"],
-                    llm_used=False,
-                    tokens_saved="~8000-11000",
-                    debug={
-                        "cache_hit": True,
-                        "original_question": cached_result["original_question"],
-                        "question_type": question_type,
-                        "user_type": user_type
-                    }
-                )
-        except Exception as e:
-            logger.warning(f"Error checking cache (continuing with LLM): {e}")
-            # Continue with LLM flow if cache check fails
-    
-    # Cache miss - proceed with existing LLM flow
-    logger.info("Cache MISS - Proceeding with LLM execution")
+    # No ≥80% match or execution failed — proceed with LLM
+    logger.info("Proceeding with LLM execution")
     print(f"\n{'='*80}")
-    print(f"❌ CACHE MISS - Proceeding with LLM")
+    print(f"Proceeding with LLM")
     print(f"{'='*80}\n")
     
     # Process user question
@@ -235,33 +194,7 @@ def process_chat(
                 result_data = {"raw_result": str(query_result)}
         
         logger.info(f"Agent completed - Answer length: {len(answer)}, SQL query: {bool(sql_query)}, Query result: {bool(query_result)}")
-        
-        # Save to cache AFTER successful LLM response (if deterministic). Skip when 80%-only mode.
-        if (
-            settings.VECTOR_CACHE_ENABLED
-            and settings.VECTOR_CACHE_AUTO_SAVE
-            and not getattr(settings, "VECTOR_80_MATCH_ENABLED", False)
-        ):
-            if answer and not result.get("error"):
-                try:
-                    cache_id = cache_service.save_answer_to_cache(
-                        question=payload.question,
-                        answer=answer,
-                        sql_query=sql_query,
-                        result_data=result_data,
-                        question_type=question_type,
-                        user_type=user_type
-                    )
-                    
-                    if cache_id:
-                        logger.info(f"✅ Answer saved to cache (ID: {cache_id})")
-                        print(f"✅ Answer saved to cache (ID: {cache_id})")
-                    else:
-                        logger.debug("Answer not saved to cache (not deterministic or validation failed)")
-                except Exception as e:
-                    logger.warning(f"Error saving to cache (non-critical): {e}")
-                    # Don't fail the request if cache save fails
-        
+
     except Exception as e:
         # Handle any errors that occur during processing
         logger.error(f"Error processing question: {e}")

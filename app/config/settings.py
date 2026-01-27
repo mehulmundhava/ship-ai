@@ -79,10 +79,6 @@ class Settings(BaseSettings):
     VECTOR_CACHE_AUTO_SAVE: bool = True
     VECTOR_CACHE_DETERMINISTIC_ONLY: bool = True
 
-    # 80% match without cache: when True, use example similarity + execute SQL (no cache read/write)
-    VECTOR_80_MATCH_ENABLED: bool = False
-    VECTOR_80_SIMILARITY_THRESHOLD: float = 0.80
-    
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=False,
