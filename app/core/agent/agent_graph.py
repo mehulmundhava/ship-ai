@@ -131,14 +131,12 @@ class SQLAgentGraph:
         ]
         
         # Regular tools (for non-journey questions)
+        # OPTIMIZATION: Reduced tool set to save tokens
+        # Removed: count_query_tool, list_query_tool (execute_db_query handles these)
+        # Removed: get_table_list, get_table_structure (fallback handled via auto-retry)
         self.regular_tools = [
-            self.get_examples_tool,
             self.execute_db_query_tool,
-            self.count_query_tool,
-            self.list_query_tool,
-            self.get_extra_examples_tool,
-            self.get_table_list_tool,
-            self.get_table_structure_tool
+            self.get_examples_tool
         ]
         
         # Keep all tools for ToolNode (needs access to all tools for execution)
@@ -857,6 +855,9 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 print(f"{'='*80}\n")
                 state["query_validated"] = True
             
+            # Determine if this is a journey question for prompt optimization
+            is_journey = self._is_journey_question(state["question"])
+            
             # STEP 2: Initialize messages with FULL prompt (only if query is validated)
             # Pre-load examples in the system prompt to reduce token usage
             system_prompt = get_system_prompt(
@@ -864,7 +865,8 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 top_k=self.top_k,
                 question=state["question"],
                 vector_store_manager=self.vector_store_manager,
-                preload_examples=True
+                preload_examples=True,
+                is_journey=is_journey
             )
             base_messages = [
                 SystemMessage(content=system_prompt),

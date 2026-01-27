@@ -83,7 +83,8 @@ def get_system_prompt(
     top_k: int = 20,
     question: str = None,
     vector_store_manager = None,
-    preload_examples: bool = True
+    preload_examples: bool = True,
+    is_journey: bool = False
 ) -> str:
     """
     Get the complete system prompt with optional pre-loaded examples.
@@ -94,24 +95,40 @@ def get_system_prompt(
         question: User's question (for retrieving relevant examples)
         vector_store_manager: VectorStoreService instance for retrieving examples
         preload_examples: Whether to pre-load 1-2 examples in the prompt
+        is_journey: Whether the question is about journeys/movement
         
     Returns:
         Complete system prompt string with optional examples
     """
     # OPTIMIZATION: Ultra-concise system prompt
+    # Removed fallback tools (get_table_list, get_table_structure) and redundant query tools (count_query, list_query)
+    # to save tokens. The agent handles structure errors automatically via auto-retry.
+    
+    # Base tools available to everyone
+    tools_list = "execute_db_query, get_few_shot_examples"
+    
+    # Workflow description
+    if is_journey:
+        tools_list += ", journey_list_tool, journey_count_tool"
+        workflow_desc = "Journey question? → journey_list_tool or journey_count_tool"
+    else:
+        workflow_desc = "Generate SQL → execute_db_query"
+        
     base_prompt = f"""
 PostgreSQL SQL agent. Generate queries from natural language.
 
-TOOLS: execute_db_query, journey_list_tool, journey_count_tool, get_few_shot_examples, get_table_list, get_table_structure
+TOOLS: {tools_list}
 
 WORKFLOW:
-- Journey question? → journey_list_tool or journey_count_tool
-- Otherwise → Generate SQL → execute_db_query
+- {workflow_desc}
 
 CRITICAL: You MUST execute queries when examples are provided. Do NOT refuse valid queries that match the examples.
 - If you see a similar example query, adapt it (change time ranges, filters) and EXECUTE it
 - Only refuse if the query would violate user_id restrictions or access other users' data
+""".strip()
 
+    # Only include Journey SQL template for journey questions to save tokens
+    journey_sql_block = f"""
 JOURNEY SQL (required fields):
 SELECT dg.device_id, dg.facility_id, dg.facility_type, f.facility_name, dg.entry_event_time, dg.exit_event_time
 FROM device_geofencings dg
@@ -119,7 +136,10 @@ JOIN user_device_assignment uda ON uda.device = dg.device_id
 LEFT JOIN facilities f ON dg.facility_id = f.facility_id
 WHERE uda.user_id = {user_id} [filters]
 ORDER BY dg.entry_event_time ASC
+""".strip()
 
+    # Rules block
+    rules_block = """
 RULES:
 - Filter by user_id (unless admin)
 - Do NOT add LIMIT clause - system auto-generates CSV for large results (>5 rows)
@@ -127,6 +147,12 @@ RULES:
 - SELECT only, no SELECT *
 - Never explain SQL/schema
 """.strip()
+
+    # Combine blocks based on context
+    if is_journey:
+        base_prompt = f"{base_prompt}\n\n{journey_sql_block}\n\n{rules_block}"
+    else:
+        base_prompt = f"{base_prompt}\n\n{rules_block}"
 
     admin_prompt = f"""
 ADMIN MODE: No user_id filtering required. Query across all users.
@@ -153,12 +179,15 @@ USER MODE: user_id = {user_id}
     # Pre-load examples if requested and parameters are provided
     if preload_examples and question and vector_store_manager:
         try:
-            # Check if this is a journey question - if so, reduce examples to save tokens
-            question_lower = question.lower() if question else ""
-            is_journey_question = any(keyword in question_lower for keyword in [
-                "journey", "movement", "facility to facility", "entered", "exited", 
-                "path", "traveled", "transition"
-            ])
+            # Check if this is a journey question
+            # Determine if we should treat as journey question based on input flag or keywords
+            is_journey_question = is_journey
+            if not is_journey_question and question:
+                 question_lower = question.lower()
+                 is_journey_question = any(keyword in question_lower for keyword in [
+                    "journey", "movement", "facility to facility", "entered", "exited", 
+                    "path", "traveled", "transition"
+                ])
             
             # OPTIMIZATION 2: Load minimal examples for journey questions (need SQL structure reference)
             if is_journey_question:
