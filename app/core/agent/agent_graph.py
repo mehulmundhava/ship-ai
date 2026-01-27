@@ -669,6 +669,54 @@ class SQLAgentGraph:
     def _agent_node(self, state: AgentState) -> AgentState:
         """Agent node that decides what to do next."""
         messages = state.get("messages", [])
+        iteration_count = state.get("iteration_count", 0)
+        
+        # Check for column errors in ToolMessages and automatically call get_table_structure
+        for msg in reversed(messages):
+            if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query"]:
+                result_content = msg.content if hasattr(msg, 'content') else str(msg)
+                
+                # Detect column errors (UndefinedColumn)
+                if isinstance(result_content, str) and "UndefinedColumn" in result_content and "column" in result_content.lower() and "does not exist" in result_content.lower():
+                    sql_query = state.get("sql_query", "")
+                    if sql_query:
+                        # Extract table name from SQL query
+                        alias_match = re.search(r'FROM\s+(\w+)\s+(\w+)', sql_query, re.IGNORECASE)
+                        if alias_match:
+                            table_name = alias_match.group(1)
+                            
+                            # Check if we've already called get_table_structure for this table
+                            already_called = any(
+                                isinstance(m, ToolMessage) and m.name == "get_table_structure" and table_name in (m.content if hasattr(m, 'content') else str(m))
+                                for m in messages
+                            )
+                            
+                            # Only auto-call if we haven't already and haven't exceeded max iterations
+                            if iteration_count < 4 and not already_called:
+                                logger.info(f"🔍 Agent node: Detected column error for table {table_name}, auto-calling get_table_structure")
+                                print(f"\n{'='*80}")
+                                print(f"🔍 AGENT NODE: Auto-calling get_table_structure for {table_name}")
+                                print(f"{'='*80}\n")
+                                
+                                try:
+                                    table_structure_result = self.get_table_structure_tool.invoke({"table_names": table_name})
+                                    
+                                    # Add the table structure as a ToolMessage
+                                    structure_message = ToolMessage(
+                                        content=table_structure_result,
+                                        name="get_table_structure",
+                                        tool_call_id="auto_table_structure_002"
+                                    )
+                                    messages.append(structure_message)
+                                    state["messages"] = messages
+                                    
+                                    logger.info(f"✅ Agent node: Retrieved table structure for {table_name}")
+                                    print(f"✅ Retrieved table structure for {table_name}")
+                                    print(f"{'='*80}\n")
+                                except Exception as e:
+                                    logger.error(f"Error calling get_table_structure in agent node: {e}")
+                                    import traceback
+                                    traceback.print_exc()
         
         # Ensure we have SystemMessage and HumanMessage
         has_system = any(isinstance(m, SystemMessage) for m in messages)
@@ -1171,13 +1219,52 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
         Check if we should format answer directly after tool execution.
         If we have query results, skip the agent node and go directly to format_answer.
         This saves tokens by avoiding another LLM call with full message history.
+        
+        However, if the result is a column error, automatically call get_table_structure
+        and route back to agent to retry with correct schema.
         """
         messages = state.get("messages", [])
+        iteration_count = state.get("iteration_count", 0)
         
         # Check if we have query results from any query tool (including journey tools)
         for msg in reversed(messages):
             if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
-                # We have query results - format answer directly without another agent call
+                # Check if the result is an error about undefined columns
+                result_content = msg.content if hasattr(msg, 'content') else str(msg)
+                
+                # Detect column errors (UndefinedColumn) - route back to agent to handle
+                if isinstance(result_content, str) and "UndefinedColumn" in result_content and "column" in result_content.lower() and "does not exist" in result_content.lower():
+                    # Extract table name from SQL query to check if we should retry
+                    sql_query = state.get("sql_query", "")
+                    if sql_query:
+                        alias_match = re.search(r'FROM\s+(\w+)\s+(\w+)', sql_query, re.IGNORECASE)
+                        if alias_match:
+                            table_name = alias_match.group(1)
+                            
+                            # Check if we've already called get_table_structure for this table
+                            already_called = any(
+                                isinstance(m, ToolMessage) and m.name == "get_table_structure" and table_name in (m.content if hasattr(m, 'content') else str(m))
+                                for m in messages
+                            )
+                            
+                            # Only retry if we haven't exceeded max iterations and haven't already called get_table_structure
+                            if iteration_count < 4 and not already_called:
+                                logger.info(f"🔍 Detected column error for table {table_name}, routing back to agent for retry")
+                                print(f"\n{'='*80}")
+                                print(f"⚠️  COLUMN ERROR DETECTED - Routing back to agent")
+                                print(f"   Table: {table_name}")
+                                print(f"   Error: {result_content[:200]}...")
+                                print(f"   Agent will call get_table_structure and retry")
+                                print(f"{'='*80}\n")
+                                return "continue"
+                            else:
+                                if already_called:
+                                    logger.warning(f"Already called get_table_structure for {table_name}, formatting error message instead")
+                                else:
+                                    logger.warning(f"Max iterations reached ({iteration_count}), formatting error message instead")
+                                # Fall through to format the error
+                
+                # We have query results (or error) - format answer directly without another agent call
                 logger.info(f"TOOL RESULT DETECTED ({msg.name}) - Routing directly to format_answer")
                 print(f"\n{'='*80}")
                 print(f"✅ TOOL RESULT DETECTED ({msg.name}) - Routing directly to format_answer")
@@ -1277,26 +1364,94 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
         # Extract query result from messages if not in state
         query_result = state.get("query_result", "")
         journey_tool_used = False
+        
+        # CRITICAL: Check if query_result in state is an error - if so, clear it and re-extract
+        if query_result and isinstance(query_result, str):
+            is_error_in_state = (
+                query_result.startswith("Error executing query") or
+                "UndefinedColumn" in query_result or
+                "does not exist" in query_result.lower() or
+                query_result.startswith("::::::")
+            )
+            if is_error_in_state:
+                logger.warning(f"⚠️  State contains error message, clearing and re-extracting from ToolMessages")
+                print(f"⚠️  State contains error message, clearing and re-extracting")
+                query_result = ""  # Clear the error so we can find the successful result
+        
         if not query_result:
             # Try to extract from tool messages (check all query tools, including journey tools)
+            # IMPORTANT: Skip error messages and only use successful results
             for msg in reversed(messages):
                 if isinstance(msg, ToolMessage):
                     tool_name = getattr(msg, 'name', '')
                     if tool_name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
-                        query_result = msg.content
-                        if tool_name in ["journey_list_tool", "journey_count_tool"]:
-                            journey_tool_used = True
-                        print(f"✅ Found query result from ToolMessage ({tool_name}): {query_result[:200]}...")
-                        break
+                        content = msg.content if hasattr(msg, 'content') else str(msg)
+                        # Skip error messages - look for successful results only
+                        if isinstance(content, str):
+                            # Check if this is an error message
+                            is_error = (
+                                content.startswith("Error executing query") or
+                                "UndefinedColumn" in content or
+                                "does not exist" in content.lower() or
+                                content.startswith("::::::")
+                            )
+                            
+                            if not is_error:
+                                # This is a successful result - use it
+                                query_result = content
+                                if tool_name in ["journey_list_tool", "journey_count_tool"]:
+                                    journey_tool_used = True
+                                logger.info(f"✅ Found successful query result from ToolMessage ({tool_name}): {query_result[:200]}...")
+                                print(f"✅ Found successful query result from ToolMessage ({tool_name}): {query_result[:200]}...")
+                                break
+                            else:
+                                # This is an error - skip it and continue looking
+                                logger.debug(f"⏭️  Skipping error ToolMessage ({tool_name}): {content[:100]}...")
+                                continue
+                        else:
+                            # Not a string, use it as-is
+                            query_result = content
+                            if tool_name in ["journey_list_tool", "journey_count_tool"]:
+                                journey_tool_used = True
+                            logger.info(f"✅ Found query result from ToolMessage ({tool_name})")
+                            print(f"✅ Found query result from ToolMessage ({tool_name})")
+                            break
         
         # Extract SQL query from messages if not in state
+        # IMPORTANT: Match SQL query to the successful result (not the error)
         sql_query = state.get("sql_query", "")
         if not sql_query:
             # Try to find SQL query in tool calls (check all query tools, including journey tools)
+            # Match it to the successful ToolMessage if we found one
             logger.debug("SQL query not in state, searching in messages...")
+            
+            # First, find the successful ToolMessage to get its tool_call_id
+            successful_tool_call_id = None
+            for msg in reversed(messages):
+                if isinstance(msg, ToolMessage):
+                    tool_name = getattr(msg, 'name', '')
+                    if tool_name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
+                        content = msg.content if hasattr(msg, 'content') else str(msg)
+                        if isinstance(content, str):
+                            is_error = (
+                                content.startswith("Error executing query") or
+                                "UndefinedColumn" in content or
+                                "does not exist" in content.lower() or
+                                content.startswith("::::::")
+                            )
+                            if not is_error:
+                                successful_tool_call_id = getattr(msg, 'tool_call_id', None)
+                                break
+            
+            # Now find the AIMessage with the matching tool_call_id
             for msg in reversed(messages):
                 if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
                     for tool_call in msg.tool_calls:
+                        tool_call_id = tool_call.get("id", "")
+                        # If we found a successful result, only use SQL from that tool call
+                        if successful_tool_call_id and tool_call_id != successful_tool_call_id:
+                            continue
+                            
                         tool_name = tool_call.get("name", "")
                         if tool_name in ["execute_db_query", "count_query", "list_query"]:
                             sql_query = tool_call["args"].get("query", "")
@@ -1311,6 +1466,25 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                             break
                     if sql_query:
                         break
+            
+            # Fallback: if no successful result found, just get the latest SQL query
+            if not sql_query:
+                for msg in reversed(messages):
+                    if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
+                        for tool_call in msg.tool_calls:
+                            tool_name = tool_call.get("name", "")
+                            if tool_name in ["execute_db_query", "count_query", "list_query"]:
+                                sql_query = tool_call["args"].get("query", "")
+                                logger.info(f"✅ Found SQL query from tool call ({tool_name}): {sql_query[:100]}...")
+                                print(f"✅ Found SQL query from tool call ({tool_name}): {sql_query}")
+                                break
+                            elif tool_name in ["journey_list_tool", "journey_count_tool"]:
+                                sql_query = tool_call["args"].get("sql", "")
+                                logger.info(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query[:100]}...")
+                                print(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query}")
+                                break
+                        if sql_query:
+                            break
             
             # If still not found, try extracting from text messages
             if not sql_query:
@@ -1330,6 +1504,42 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
         print(f"📊 Query Result: {query_result[:200] if query_result else 'None'}...")
         
         # If we have query results, format them
+        # CRITICAL: Double-check that query_result is not an error message
+        if query_result:
+            # Final safety check: reject if it's still an error
+            if isinstance(query_result, str):
+                is_still_error = (
+                    query_result.startswith("Error executing query") or
+                    "UndefinedColumn" in query_result or
+                    query_result.startswith("::::::")
+                )
+                if is_still_error:
+                    logger.error(f"❌ CRITICAL: query_result is still an error after extraction! This should not happen.")
+                    logger.error(f"   Error content: {query_result[:300]}...")
+                    print(f"❌ CRITICAL: query_result is still an error - this is a bug!")
+                    # Try one more time to find successful result
+                    for msg in reversed(messages):
+                        if isinstance(msg, ToolMessage):
+                            tool_name = getattr(msg, 'name', '')
+                            if tool_name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
+                                content = msg.content if hasattr(msg, 'content') else str(msg)
+                                if isinstance(content, str) and not (
+                                    content.startswith("Error executing query") or
+                                    "UndefinedColumn" in content or
+                                    content.startswith("::::::")
+                                ):
+                                    query_result = content
+                                    logger.warning(f"⚠️  Recovered successful result from ToolMessage ({tool_name})")
+                                    print(f"⚠️  Recovered successful result from ToolMessage ({tool_name})")
+                                    break
+                    # If still an error, we can't format it
+                    if isinstance(query_result, str) and (
+                        query_result.startswith("Error executing query") or
+                        "UndefinedColumn" in query_result
+                    ):
+                        logger.error(f"❌ Cannot format answer - only error messages found")
+                        query_result = None
+        
         if query_result and not query_result.startswith("::::::"):
             logger.info("Formatting final answer from query results")
             
@@ -1447,6 +1657,23 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             except (json.JSONDecodeError, KeyError, TypeError):
                 # Not JSON or no CSV link, try text format
                 pass
+            
+            # Also check for CSV link in text format (for regular SQL queries with CSV)
+            if not csv_download_url:
+                # Look for "CSV Download Link: /download-csv/..." pattern
+                csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result, re.IGNORECASE)
+                if csv_link_match:
+                    csv_path = csv_link_match.group(1)
+                    csv_download_url = f"http://localhost:3009{csv_path}"
+                    logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
+                    print(f"✅ Extracted CSV download link from text: {csv_download_url}")
+                    
+                    # Also try to extract CSV ID if present
+                    csv_id_match = re.search(r'CSV ID:\s*([a-f0-9\-]+)', query_result, re.IGNORECASE)
+                    if csv_id_match:
+                        csv_id = csv_id_match.group(1)
+                        logger.info(f"✅ Extracted CSV ID: {csv_id}")
+                        print(f"✅ Extracted CSV ID: {csv_id}")
             
             # For journey tools, reduce token usage by filtering/truncating results before format_answer
             if journey_tool_used and result_dict:
@@ -1632,6 +1859,8 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             return {
                 **state,
                 "final_answer": final_answer,
+                "query_result": query_result,  # Update state with successful result (not error)
+                "sql_query": sql_query,  # Update state with correct SQL query
                 "llm_call_history": llm_call_history,
                 "token_usage": updated_token_usage
             }

@@ -122,7 +122,8 @@ ORDER BY dg.entry_event_time ASC
 
 RULES:
 - Filter by user_id (unless admin)
-- Limit {top_k} results
+- Do NOT add LIMIT clause - system auto-generates CSV for large results (>5 rows)
+- For small results (≤5 rows), show all rows directly
 - SELECT only, no SELECT *
 - Never explain SQL/schema
 """.strip()
