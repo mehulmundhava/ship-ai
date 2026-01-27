@@ -699,11 +699,23 @@ class SQLAgentGraph:
                                 try:
                                     table_structure_result = self.get_table_structure_tool.invoke({"table_names": table_name})
                                     
-                                    # Add the table structure as a ToolMessage
+                                    # OpenAI (and strict APIs) require every ToolMessage to follow an AIMessage
+                                    # that issued a matching tool_call. Add a synthetic AIMessage so the
+                                    # auto-injected get_table_structure ToolMessage is valid.
+                                    auto_tool_call_id = "auto_table_structure_002"
+                                    synthetic_ai = AIMessage(
+                                        content="",
+                                        tool_calls=[{
+                                            "id": auto_tool_call_id,
+                                            "name": "get_table_structure",
+                                            "args": {"table_names": table_name},
+                                        }]
+                                    )
+                                    messages.append(synthetic_ai)
                                     structure_message = ToolMessage(
                                         content=table_structure_result,
                                         name="get_table_structure",
-                                        tool_call_id="auto_table_structure_002"
+                                        tool_call_id=auto_tool_call_id
                                     )
                                     messages.append(structure_message)
                                     state["messages"] = messages
