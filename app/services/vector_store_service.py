@@ -204,7 +204,8 @@ class VectorStoreService:
                 if doc.metadata:
                     distance = doc.metadata.get('distance')
                     if distance is not None:
-                        print(f"       Distance: {distance:.4f}")
+                        similarity = 1 - distance
+                        print(f"       Distance: {distance:.4f}, Similarity: {similarity:.4f}")
             print(f"{'='*80}\n")
             
             return documents
@@ -306,7 +307,8 @@ class VectorStoreService:
                 if doc.metadata:
                     distance = doc.metadata.get('distance')
                     if distance is not None:
-                        print(f"       Distance: {distance:.4f}")
+                        similarity = 1 - distance
+                        print(f"       Distance: {distance:.4f}, Similarity: {similarity:.4f}")
             print(f"{'='*80}\n")
             
             return documents

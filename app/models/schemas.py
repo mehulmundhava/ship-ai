@@ -29,6 +29,7 @@ class ChatResponse(BaseModel):
     cached: Optional[bool] = False  # True if answer came from cache
     similarity: Optional[float] = None  # Similarity score (only when cached)
     llm_used: Optional[bool] = True  # False if answer came from cache
+    llm_type: Optional[str] = None  # Model used when LLM was used (e.g. OPENAI/gpt-4o)
     tokens_saved: Optional[str] = None  # Estimated tokens saved (only when cached)
     debug: Optional[Dict[str, Any]] = None
 
