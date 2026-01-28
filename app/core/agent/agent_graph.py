@@ -25,6 +25,7 @@ from app.core.agent.agent_tools import (
 )
 from app.core.prompts import get_system_prompt
 from app.services.vector_store_service import VectorStoreService
+from app.config.settings import settings
 import logging
 import re
 
@@ -1738,7 +1739,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     if 'csv_download_link' in result_dict:
                         csv_path = result_dict['csv_download_link']
                         csv_id = result_dict.get('csv_id')
-                        csv_download_url = f"http://localhost:3009{csv_path}"
+                        csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                         logger.info(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
                         print(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
             except (json.JSONDecodeError, KeyError, TypeError):
@@ -1751,7 +1752,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result, re.IGNORECASE)
                 if csv_link_match:
                     csv_path = csv_link_match.group(1)
-                    csv_download_url = f"http://localhost:3009{csv_path}"
+                    csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                     logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
                     print(f"✅ Extracted CSV download link from text: {csv_download_url}")
                     
@@ -1778,14 +1779,14 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     if not csv_download_url:
                         csv_path = result_dict.get('csv_download_link')
                         if csv_path:
-                            csv_download_url = f"http://localhost:3009{csv_path}"
+                            csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                             csv_id = result_dict.get('csv_id')
                     
                     # Create minimal summary - NO full data, just counts and CSV link
                     # This dramatically reduces token usage (from 44K chars to ~200 chars)
                     minimal_summary = {
                         "total_journeys": total_journeys,  # This is the ACTUAL total (58), not preview count (5)
-                        "csv_download_link": result_dict.get('csv_download_link') or (csv_download_url.replace("http://localhost:3009", "") if csv_download_url else None),
+                        "csv_download_link": result_dict.get('csv_download_link') or (csv_download_url.replace(settings.get_api_base_url(), "") if csv_download_url else None),
                         "csv_id": result_dict.get('csv_id') or csv_id,
                         "note": f"Full data available in CSV. Showing summary only to reduce token usage."
                     }
@@ -1821,7 +1822,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
                 if csv_link_match:
                     csv_path = csv_link_match.group(1)
-                    csv_download_url = f"http://localhost:3009{csv_path}"
+                    csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                     logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
                     print(f"✅ Extracted CSV download link from text: {csv_download_url}")
                     
@@ -1853,7 +1854,7 @@ Note: Full data available in CSV. Showing summary only."""
                         if isinstance(query_result, str) and query_result.strip().startswith('{'):
                             temp_dict = json.loads(query_result)
                             total = temp_dict.get('total_journeys', 'unknown')
-                            csv_link = temp_dict.get('csv_download_link') or (csv_download_url.replace("http://localhost:3009", "") if csv_download_url else "")
+                            csv_link = temp_dict.get('csv_download_link') or (csv_download_url.replace(settings.get_api_base_url(), "") if csv_download_url else "")
                             query_result = f'{{"total_journeys": {total}, "csv_download_link": "{csv_link}", "note": "Full data in CSV"}}'
                         else:
                             query_result = f'Total journeys available in CSV. Download link: {csv_download_url}'
@@ -2004,7 +2005,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                             if 'csv_download_link' in result_dict:
                                                 csv_path = result_dict['csv_download_link']
                                                 csv_id = result_dict.get('csv_id')
-                                                csv_download_url = f"http://localhost:3009{csv_path}"
+                                                csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                                                 logger.info(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
                                                 print(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
                                     except (json.JSONDecodeError, KeyError, TypeError):
@@ -2015,7 +2016,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                         csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
                                         if csv_link_match:
                                             csv_path = csv_link_match.group(1)
-                                            csv_download_url = f"http://localhost:3009{csv_path}"
+                                            csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                                             logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
                                             print(f"✅ Extracted CSV download link from text: {csv_download_url}")
 

@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     LOG_TO_CONSOLE: bool = True
     LOG_TO_FILE: bool = True
     
+    # API base URL for CSV download links (e.g. http://localhost:3009 or http://54.183.26.153/postgre)
+    API_BASE_URL: str = "http://localhost:3009"
+
     # Vector Cache Configuration
     VECTOR_CACHE_ENABLED: bool = True
     VECTOR_CACHE_SIMILARITY_THRESHOLD: float = 0.80
@@ -142,6 +145,10 @@ class Settings(BaseSettings):
     def groq_api_key(self) -> Optional[str]:
         return self.GROQ_API_KEY
     
+    def get_api_base_url(self) -> str:
+        """Base URL for API (e.g. CSV download links). No trailing slash."""
+        return (self.API_BASE_URL or "http://localhost:3009").rstrip("/")
+
     @property
     def embedding_model_name(self) -> str:
         """Get the embedding model name from HUGGING_FACE_MODEL or fallback to EMBEDDING_MODEL_NAME."""

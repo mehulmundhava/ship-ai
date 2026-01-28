@@ -104,6 +104,7 @@ def process_chat(
                 cached=False,
                 similarity=match_result["similarity"],
                 llm_used=False,
+                llm_type=None,
                 debug={
                     "cache_hit": False,
                     "match_80": True,
@@ -119,7 +120,9 @@ def process_chat(
     print(f"\n{'='*80}")
     print(f"Proceeding with LLM")
     print(f"{'='*80}\n")
-    
+
+    llm_type = None  # Set when LLM is used (e.g. OPENAI/gpt-4o)
+
     # Process user question
     try:
         logger.info("="*80)
@@ -140,7 +143,8 @@ def process_chat(
         llm = llm_model.get_llm_model()
         model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', None) or 'Unknown'
         provider = llm_model.get_provider()
-        
+        llm_type = f"{provider}/{model_name}"
+
         logger.info(f"LLM Provider: {provider}")
         logger.info(f"LLM Model: {model_name}")
         print(f"🤖 LLM Provider: {provider}")
@@ -222,6 +226,7 @@ def process_chat(
         results=result_data if 'result_data' in locals() else None,
         cached=False,
         llm_used=True,
+        llm_type=llm_type,
         debug=debug_info
     )
 
