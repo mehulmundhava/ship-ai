@@ -177,7 +177,21 @@ class SQLAgentGraph:
         # Only re-bind if tools changed
         if self._current_tools_bound != tool_type:
             print(f"🔧 OPTIMIZATION: Binding {tool_type} tools only ({len(tools_to_bind)} tools) - saving ~{3000 if tool_type == 'journey' else 3000} tokens")
-            self.llm_with_tools = self.llm.bind_tools(tools_to_bind)
+            
+            # Groq-specific: Some models need explicit tool_choice or have tool calling issues
+            # Try standard bind_tools first, but we'll catch errors and retry if needed
+            try:
+                if self.provider == "GROQ":
+                    # For Groq, ensure tools are properly formatted
+                    # Some Groq models work better without explicit tool_choice
+                    self.llm_with_tools = self.llm.bind_tools(tools_to_bind)
+                else:
+                    self.llm_with_tools = self.llm.bind_tools(tools_to_bind)
+            except Exception as e:
+                logger.warning(f"Error binding tools to LLM: {e}. Will retry on first invocation.")
+                # Set to None so we can retry with fallback on first use
+                self.llm_with_tools = None
+            
             self._current_tools_bound = tool_type
     
     def _get_fallback_llm(self, use_tools=False, question=""):
@@ -216,10 +230,134 @@ class SQLAgentGraph:
         else:
             return self._fallback_llm
     
+    def _invoke_groq_with_recovery(self, messages, use_tools=False, question=""):
+        """
+        Groq-specific invocation with recovery mechanisms.
+        - If use_tools=False: Direct invocation (for Security Guard, Format Answer)
+        - If use_tools=True: Tries tool calling first, then without tools, then extracts SQL from text.
+        
+        Args:
+            messages: List of messages to send to LLM
+            use_tools: Whether to use tool binding
+            question: Question text for context
+        
+        Returns:
+            LLM response or synthetic AIMessage with tool calls, or None if all recovery fails
+        """
+        model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
+        logger.info(f"🔵 Using GROQ LLM: {model_name}")
+        print(f"🔵 Using GROQ LLM: {model_name}")
+        
+        # Simple path: No tools needed (Security Guard, Format Answer, etc.)
+        if not use_tools:
+            try:
+                return self.llm.invoke(messages)
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                logger.warning(f"Groq invocation failed (no tools): {error_type} - {error_str[:200]}")
+                # For non-tool calls, just return None to trigger OpenAI fallback
+                return None
+        
+        # Tool calling path: Try with recovery mechanisms
+        error_str = None
+        error_type = None
+        
+        # Step 1: Try with tool binding (if requested)
+        if self.llm_with_tools:
+            try:
+                return self.llm_with_tools.invoke(messages)
+            except Exception as tool_error:
+                error_str = str(tool_error)
+                error_type = type(tool_error).__name__
+                if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
+                    logger.info("🔧 Groq tool calling failed, attempting recovery...")
+                    print(f"🔧 Groq tool calling failed, attempting recovery...")
+                    # Continue to recovery steps below
+                else:
+                    # Non-tool-calling error, log and continue to recovery
+                    logger.warning(f"Groq tool invocation error: {error_type} - {error_str[:200]}")
+        
+        # Step 2: Try without tool binding (Groq might generate SQL in text)
+        if use_tools:
+            try:
+                logger.info("🔧 Attempting Groq recovery: invoking without tool binding...")
+                print(f"🔧 Attempting Groq recovery: invoking without tool binding...")
+                response_without_tools = self.llm.invoke(messages)
+                
+                # Check if response contains SQL
+                if hasattr(response_without_tools, 'content') and response_without_tools.content:
+                    content = response_without_tools.content
+                    # Try to extract SQL from the text response
+                    sql_match = re.search(r'(?:SELECT|WITH|INSERT|UPDATE|DELETE)\s+.*?(?:;|$)', content, re.IGNORECASE | re.DOTALL)
+                    if sql_match:
+                        sql_query = sql_match.group(0).strip().rstrip(';')
+                        logger.info(f"✅ Extracted SQL from Groq text response: {sql_query[:100]}...")
+                        print(f"✅ Extracted SQL from Groq text response")
+                        # Create synthetic tool response
+                        synthetic_response = self._create_synthetic_tool_response(
+                            "execute_db_query",
+                            {"query": sql_query},
+                            messages
+                        )
+                        return synthetic_response
+                    else:
+                        logger.warning("Groq response doesn't contain SQL")
+            except Exception as recovery_error:
+                logger.warning(f"Groq recovery (no tools) failed: {recovery_error}")
+                if not error_str:
+                    error_str = str(recovery_error)
+                    error_type = type(recovery_error).__name__
+        
+        # Step 3: Try to extract SQL from error message (if we have one)
+        if error_str and ("tool_use_failed" in error_str or "Failed to call a function" in error_str):
+            logger.info("🔧 Attempting to extract SQL from Groq error message...")
+            print(f"🔧 Attempting to extract SQL from Groq error message...")
+            extracted = self._extract_sql_from_groq_error(error_str)
+            if extracted and use_tools:
+                try:
+                    synthetic_response = self._create_synthetic_tool_response(
+                        extracted.get("tool_name", "execute_db_query"),
+                        extracted.get("args", {}),
+                        messages
+                    )
+                    logger.info("✅ Created synthetic response from Groq error extraction")
+                    print(f"✅ Recovered from Groq error - extracted SQL")
+                    return synthetic_response
+                except Exception as synth_error:
+                    logger.warning(f"Failed to create synthetic response: {synth_error}")
+        
+        # If all Groq recovery attempts fail, return None to trigger OpenAI fallback
+        logger.warning("All Groq recovery mechanisms failed")
+        return None
+    
+    def _invoke_openai(self, messages, use_tools=False, question=""):
+        """
+        OpenAI-specific invocation (direct, no special recovery needed).
+        
+        Args:
+            messages: List of messages to send to LLM
+            use_tools: Whether to use tool binding
+            question: Question text for tool binding
+        
+        Returns:
+            LLM response
+        """
+        model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
+        logger.info(f"🔵 Using OPENAI LLM: {model_name}")
+        print(f"🔵 Using OPENAI LLM: {model_name}")
+        
+        if use_tools and self.llm_with_tools:
+            return self.llm_with_tools.invoke(messages)
+        else:
+            return self.llm.invoke(messages)
+    
     def _invoke_llm_with_fallback(self, messages, use_tools=False, question=""):
         """
-        Invoke LLM with automatic fallback to ChatGPT if Groq fails.
-        If both fail but we can extract SQL from error, create synthetic response.
+        Invoke LLM with provider-specific handling and automatic fallback.
+        - Groq: Uses recovery mechanisms (tool calling → no tools → SQL extraction)
+        - OpenAI: Direct invocation
+        - Fallback: Only if Groq completely fails, use OpenAI
         
         Args:
             messages: List of messages to send to LLM
@@ -229,111 +367,46 @@ class SQLAgentGraph:
         Returns:
             LLM response or synthetic AIMessage with tool calls
         """
+        # Route to provider-specific handler
+        if self.provider == "GROQ":
+            # Try Groq with recovery mechanisms
+            groq_response = self._invoke_groq_with_recovery(messages, use_tools, question)
+            if groq_response is not None:
+                return groq_response
+            
+            # Groq recovery failed, fall back to OpenAI
+            logger.warning("All Groq recovery mechanisms failed, falling back to OpenAI...")
+            print(f"⚠️  All Groq recovery mechanisms failed, falling back to OpenAI...")
+        else:
+            # OpenAI: direct invocation
+            try:
+                return self._invoke_openai(messages, use_tools, question)
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                logger.error(f"OpenAI invocation failed: {error_type} - {error_str[:200]}")
+                print(f"❌ OpenAI Error: {error_type}")
+                raise
+        
+        # If we get here, Groq failed and we need to fall back to OpenAI
         try:
-            # Log which LLM we're using (primary)
-            model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
-            provider_name = type(self.llm).__name__
-            logger.info(f"🔵 Using PRIMARY LLM: {provider_name} ({model_name})")
-            print(f"🔵 Using PRIMARY LLM: {provider_name} ({model_name})")
+            fallback_llm = self._get_fallback_llm(use_tools, question)
+            fallback_model_name = getattr(fallback_llm, 'model_name', None) or getattr(fallback_llm, 'model', None) or 'Unknown'
+            logger.info(f"🟢 Using FALLBACK LLM (OpenAI): {fallback_model_name}")
+            print(f"🟢 Using FALLBACK LLM (OpenAI): {fallback_model_name}")
             
-            if use_tools and self.llm_with_tools:
-                return self.llm_with_tools.invoke(messages)
-            else:
-                return self.llm.invoke(messages)
-        except Exception as e:
-            # Check if it's a Groq-specific error
-            error_str = str(e)
-            error_type = type(e).__name__
-            
-            # Log the error for debugging
-            logger.warning(f"❌ LLM Error: {error_type} - {error_str[:200]}")
-            print(f"❌ LLM Error: {error_type}")
-            print(f"   Error preview: {error_str[:200]}...")
-            
-            # Groq-specific error patterns (expanded to catch authentication errors)
-            error_lower = error_str.lower()
-            is_groq_error = (
-                "groq" in error_lower or
-                "BadRequestError" in error_type or
-                "tool_use_failed" in error_str or
-                "Failed to call a function" in error_str or
-                "groq.BadRequestError" in error_type or
-                "authentication" in error_lower or
-                "unauthorized" in error_lower or
-                "invalid" in error_lower and "api" in error_lower and "key" in error_lower or
-                "api" in error_lower and "key" in error_lower and "invalid" in error_lower or
-                "401" in error_str or
-                "403" in error_str or
-                "AuthenticationError" in error_type or
-                "UnauthorizedError" in error_type or
-                "ForbiddenError" in error_type or
-                "InvalidApiKeyError" in error_type
-            )
-            
-            if is_groq_error and self.provider == "GROQ":
-                logger.warning(f"Groq API error detected: {error_type}. Falling back to ChatGPT...")
-                print(f"⚠️  Groq API error detected: {error_type}")
-                print(f"🔄 Falling back to ChatGPT...")
-                
-                # Get fallback LLM (ChatGPT)
-                fallback_llm = self._get_fallback_llm(use_tools, question)
-                
-                # Log which LLM we're using (fallback)
-                fallback_model_name = getattr(fallback_llm, 'model_name', None) or getattr(fallback_llm, 'model', None) or 'Unknown'
-                fallback_provider_name = type(fallback_llm).__name__
-                logger.info(f"🟢 Using FALLBACK LLM: {fallback_provider_name} ({fallback_model_name})")
-                print(f"🟢 Using FALLBACK LLM: {fallback_provider_name} ({fallback_model_name})")
-                
-                # Retry with ChatGPT
-                try:
-                    response = fallback_llm.invoke(messages)
-                    
-                    logger.info("✅ Successfully got response from ChatGPT fallback")
-                    print(f"✅ Successfully got response from ChatGPT fallback")
-                    return response
-                except Exception as e2:
-                    logger.error(f"ChatGPT fallback also failed: {e2}")
-                    logger.exception("ChatGPT fallback error")
-                    print(f"❌ ChatGPT fallback also failed: {e2}")
-                    
-                    # Try to recover by extracting SQL from Groq error
-                    if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
-                        logger.info("Attempting to extract SQL query from Groq error for recovery...")
-                        print(f"🔧 Attempting to extract SQL from Groq error for recovery...")
-                        print(f"   Error string preview: {error_str[:500]}...")
-                        
-                        extracted = self._extract_sql_from_groq_error(error_str)
-                        
-                        if extracted:
-                            logger.info(f"✅ Successfully extracted: tool_name={extracted.get('tool_name')}, has_args={bool(extracted.get('args'))}")
-                            print(f"✅ Successfully extracted: {extracted.get('tool_name')}")
-                            
-                            if use_tools:
-                                # Create synthetic response with extracted tool call
-                                try:
-                                    synthetic_response = self._create_synthetic_tool_response(
-                                        extracted["tool_name"],
-                                        extracted["args"],
-                                        messages
-                                    )
-                                    logger.info("✅ Created synthetic response from Groq error - workflow can continue")
-                                    print(f"✅ Recovered from Groq error - extracted and will execute: {extracted['tool_name']}")
-                                    return synthetic_response
-                                except Exception as synth_error:
-                                    logger.error(f"Failed to create synthetic response: {synth_error}")
-                                    print(f"❌ Failed to create synthetic response: {synth_error}")
-                            else:
-                                logger.warning("Extraction succeeded but use_tools is False - cannot create synthetic response")
-                                print(f"⚠️  Extraction succeeded but use_tools is False")
-                        else:
-                            logger.warning("Failed to extract SQL from Groq error")
-                            print(f"❌ Failed to extract SQL from Groq error")
-                    
-                    # If we can't recover, re-raise original error
-                    raise e
-            else:
-                # Not a Groq error, re-raise
-                raise e
+            response = fallback_llm.invoke(messages)
+            logger.info("✅ Successfully got response from OpenAI fallback")
+            print(f"✅ Successfully got response from OpenAI fallback")
+            return response
+        except Exception as e2:
+            logger.error(f"OpenAI fallback also failed: {e2}")
+            logger.exception("OpenAI fallback error")
+            print(f"❌ OpenAI fallback also failed: {e2}")
+            raise
+        
+        # This should never be reached, but just in case
+        raise Exception("All LLM invocation attempts failed")
     
     def _extract_sql_from_groq_error(self, error_str: str) -> Optional[Dict[str, Any]]:
         """

@@ -313,13 +313,19 @@ class CacheAnswerService:
                 candidates = result.fetchall()
 
             if not candidates:
+                logger.debug("80% path: No candidates found in ai_vector_examples")
                 return None
 
             current_params = extract_params_from_question(question)
+            
+            # Log top candidates for debugging
+            top_similarities = [float(row.similarity) if row.similarity else 0.0 for row in candidates[:3]]
+            logger.info(f"80% path: Top similarities: {[f'{s:.4f}' for s in top_similarities]} (threshold: {threshold})")
 
             for row in candidates:
                 sim = float(row.similarity) if row.similarity else 0.0
                 if sim < threshold:
+                    logger.debug(f"80% path: Skipping candidate (similarity {sim:.4f} < {threshold})")
                     continue
                 sql_query = getattr(row, "sql_query", None)
                 if not sql_query:
@@ -351,6 +357,10 @@ class CacheAnswerService:
                     )
                     return adapted_result
 
+            if top_similarities:
+                logger.info(f"80% path: No candidate met threshold {threshold} (top similarity: {top_similarities[0]:.4f})")
+            else:
+                logger.info(f"80% path: No candidate met threshold {threshold}")
             return None
         except Exception as e:
             logger.warning(f"80% match-and-execute error: {e}")
@@ -638,6 +648,30 @@ class CacheAnswerService:
                     # Check if it's an empty result
                     if '0 rows' in raw or 'no rows' in raw.lower():
                         return "No results found matching your criteria."
+                    
+                    # Single-value result (e.g. "max_temperature\n17.75" or "count\n42")
+                    q_lower = (question or "").lower()
+                    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                    if len(lines) >= 2:
+                        # Header line + value line(s); treat first data line as primary value
+                        header = lines[0]
+                        first_val = lines[1] if len(lines) > 1 else ""
+                        if "\t" in first_val:
+                            first_val = first_val.split("\t")[0].strip()
+                        if first_val.lower() in ("none", "null", ""):
+                            if "maximum temperature" in q_lower or "max temperature" in q_lower:
+                                return "The maximum temperature for the specified device and date is not available."
+                            if "minimum temperature" in q_lower or "min temperature" in q_lower:
+                                return "The minimum temperature for the specified device and date is not available."
+                            return "No results found matching your criteria."
+                        # One numeric/value result with a sensible sentence
+                        if "maximum temperature" in q_lower or "max temperature" in q_lower:
+                            return f"The maximum temperature was {first_val}°C."
+                        if "minimum temperature" in q_lower or "min temperature" in q_lower:
+                            return f"The minimum temperature was {first_val}°C."
+                        if "count" in header.lower() or "total" in header.lower():
+                            return f"The result is {first_val}."
+                        return f"The result is {first_val}."
                     
                     # Otherwise, return a generic message
                     return f"Query executed successfully. {raw[:200]}..."

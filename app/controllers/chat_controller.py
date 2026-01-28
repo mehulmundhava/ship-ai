@@ -86,6 +86,7 @@ def process_chat(
 
     # 80% match-and-execute: always check. Base columns only, no cache. If similarity ≥ 0.80,
     # run example SQL (adapted or as-is) and return without LLM.
+    logger.info("🔍 Checking 80% match-and-execute path...")
     try:
         match_result = cache_service.check_80_match_and_execute(
             question=payload.question,
