@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     token_id: str
     question: str
     user_id: Optional[str] = None
+    login_id: Optional[str] = None
     chat_history: Optional[List[Tuple[str, str]]] = []
 
 

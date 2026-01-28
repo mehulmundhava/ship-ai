@@ -11,6 +11,7 @@ from app.config.database import sync_engine
 from app.config.settings import settings
 from app.models.schemas import ChatRequest, ChatResponse
 from app.services.cache_answer_service import CacheAnswerService
+from app.services.message_history_service import save_message_to_history
 
 import logging
 
@@ -96,7 +97,7 @@ def process_chat(
             logger.info(
                 f"✅ 80% match-and-execute hit (similarity: {match_result['similarity']:.4f})"
             )
-            return ChatResponse(
+            resp = ChatResponse(
                 token_id=payload.token_id,
                 answer=match_result["answer"],
                 sql_query=match_result.get("sql_query"),
@@ -112,6 +113,23 @@ def process_chat(
                     "question_type": question_type,
                 },
             )
+            save_message_to_history(
+                user_id=payload.user_id,
+                login_id=payload.login_id,
+                token_id=payload.token_id,
+                question=payload.question,
+                response=resp.answer,
+                sql_query=resp.sql_query,
+                cached=False,
+                similarity=match_result["similarity"],
+                llm_used=False,
+                llm_type=None,
+                question_type=question_type,
+                debug_info=resp.debug,
+                result_data=match_result.get("result_data"),
+                chat_history_length=len(payload.chat_history or []),
+            )
+            return resp
     except Exception as e:
         logger.warning(f"80% match-and-execute failed (continuing with LLM): {e}")
 
@@ -215,11 +233,12 @@ def process_chat(
             "question": payload.question,
             "chat_history_length": len(payload.chat_history or [])
         }
-    
+        error_message = str(e)
+        result_data = None
+
     # Format and return response
     sql_query_str = sql_query if sql_query else None
-    
-    return ChatResponse(
+    resp = ChatResponse(
         token_id=payload.token_id,
         answer=answer,
         sql_query=sql_query_str,
@@ -229,4 +248,22 @@ def process_chat(
         llm_type=llm_type,
         debug=debug_info
     )
+    save_message_to_history(
+        user_id=payload.user_id,
+        login_id=payload.login_id,
+        token_id=payload.token_id,
+        question=payload.question,
+        response=resp.answer,
+        sql_query=resp.sql_query,
+        cached=False,
+        similarity=None,
+        llm_used=True,
+        llm_type=llm_type,
+        question_type=question_type,
+        debug_info=resp.debug,
+        result_data=resp.results,
+        error_message=error_message if 'error_message' in locals() else None,
+        chat_history_length=len(payload.chat_history or []),
+    )
+    return resp
 
