@@ -6,12 +6,15 @@ from fastapi import APIRouter, Request
 from app.controllers.embeddings_controller import (
     reload_vector_store,
     generate_embeddings_examples,
-    generate_embeddings_extra_prompts
+    generate_embeddings_extra_prompts,
+    get_text_embedding
 )
 from app.models.schemas import (
     GenerateEmbeddingsRequest,
     GenerateEmbeddingsResponse,
-    ReloadVectorStoreResponse
+    ReloadVectorStoreResponse,
+    GetTextEmbeddingRequest,
+    GetTextEmbeddingResponse
 )
 
 router = APIRouter()
@@ -48,4 +51,15 @@ def generate_embeddings_extra_prompts_route(request: Request, payload: GenerateE
     """
     vector_store = request.app.state.vector_store
     return generate_embeddings_extra_prompts(payload, vector_store)
+
+
+@router.post("/get-text-embedding", response_model=GetTextEmbeddingResponse)
+def get_text_embedding_route(request: Request, payload: GetTextEmbeddingRequest):
+    """
+    Get Embedding for Given Text
+    
+    Generates and returns embedding vector for the provided text.
+    """
+    vector_store = request.app.state.vector_store
+    return get_text_embedding(payload, vector_store)
 

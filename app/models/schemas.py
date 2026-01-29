@@ -99,3 +99,19 @@ class VectorSearchResponse(BaseModel):
     extra_prompts: Optional[List[VectorSearchResult]] = None
     total_results: int
 
+
+class GetTextEmbeddingRequest(BaseModel):
+    """
+    Request model for the /get-text-embedding API endpoint.
+    """
+    text: str
+
+
+class GetTextEmbeddingResponse(BaseModel):
+    """
+    Response model for the /get-text-embedding API endpoint.
+    """
+    status: str
+    text: str
+    embedding: List[float]
+    embedding_dimension: int

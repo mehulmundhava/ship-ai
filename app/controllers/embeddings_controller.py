@@ -11,7 +11,9 @@ from app.config.settings import settings
 from app.models.schemas import (
     GenerateEmbeddingsRequest,
     GenerateEmbeddingsResponse,
-    ReloadVectorStoreResponse
+    ReloadVectorStoreResponse,
+    GetTextEmbeddingRequest,
+    GetTextEmbeddingResponse
 )
 
 
@@ -330,5 +332,63 @@ def generate_embeddings_extra_prompts(
             status="error",
             message=error_msg,
             processed_count=0
+        )
+
+
+def get_text_embedding(
+    payload: GetTextEmbeddingRequest,
+    vector_store
+) -> GetTextEmbeddingResponse:
+    """
+    Get Embedding for Given Text
+    
+    Generates and returns embedding vector for the provided text.
+    
+    Args:
+        payload: GetTextEmbeddingRequest with text field
+        vector_store: VectorStoreService instance
+        
+    Returns:
+        GetTextEmbeddingResponse with status, text, and embedding vector
+    """
+    print(f"\n{'='*80}")
+    print(f"🔧 GET TEXT EMBEDDING")
+    print(f"{'='*80}")
+    print(f"   Text: {payload.text[:100] + '...' if len(payload.text) > 100 else payload.text}")
+    print(f"{'='*80}\n")
+    
+    try:
+        if not payload.text or not payload.text.strip():
+            return GetTextEmbeddingResponse(
+                status="error",
+                text=payload.text,
+                embedding=[],
+                embedding_dimension=0
+            )
+        
+        # Generate embedding from text
+        embedding = vector_store.embed_query(payload.text)
+        
+        print(f"✅ Embedding generated successfully!")
+        print(f"   Dimension: {len(embedding)}")
+        print(f"{'='*80}\n")
+        
+        return GetTextEmbeddingResponse(
+            status="success",
+            text=payload.text,
+            embedding=embedding,
+            embedding_dimension=len(embedding)
+        )
+        
+    except Exception as e:
+        error_msg = f"Error generating embedding: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return GetTextEmbeddingResponse(
+            status="error",
+            text=payload.text,
+            embedding=[],
+            embedding_dimension=0
         )
 
