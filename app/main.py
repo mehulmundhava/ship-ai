@@ -86,12 +86,7 @@ async def lifespan(app: FastAPI):
         logger.exception("Database initialization error")
         app.state.sql_db = None
     
-    logger.info("✅ Application ready to serve requests")
-    
-    # Print red cross marks to indicate startup completion
-    print("\n" + "❌" * 50)
-    print("INFO:     Application startup complete.")
-    print("❌" * 50 + "\n")
+    logger.info("Application startup complete.")
     
     # Yield control back to FastAPI
     yield

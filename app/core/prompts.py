@@ -199,7 +199,6 @@ USER MODE: user_id = {user_id}
                     use_description_only=False  # Need SQL structure, so include SQL
                 )
                 extra_docs = []
-                print(f"✅ OPTIMIZATION: Loaded 1 example for journey question (SQL structure reference) - saving ~1,000 tokens vs 2 examples")
             else:
                 # Non-journey questions still need examples
                 example_count = 2
@@ -222,10 +221,8 @@ USER MODE: user_id = {user_id}
             if examples_section_parts:
                 examples_section = "".join(examples_section_parts)
                 main_prompt += examples_section
-                print(f"✅ Pre-loaded {len(example_docs)} examples and {len(extra_docs)} business rules into system prompt")
         except Exception as e:
-            # If example retrieval fails, continue without examples
-            print(f"⚠️  Warning: Failed to pre-load examples: {e}. Continuing without examples.")
+            pass  # Continue without examples
     
     return main_prompt
 

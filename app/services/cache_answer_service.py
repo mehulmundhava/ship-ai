@@ -317,10 +317,7 @@ class CacheAnswerService:
                 return None
 
             current_params = extract_params_from_question(question)
-            
-            # Log top candidates for debugging
             top_similarities = [float(row.similarity) if row.similarity else 0.0 for row in candidates[:3]]
-            logger.info(f"80% path: Top similarities: {[f'{s:.4f}' for s in top_similarities]} (threshold: {threshold})")
 
             for row in candidates:
                 sim = float(row.similarity) if row.similarity else 0.0
@@ -352,15 +349,11 @@ class CacheAnswerService:
                     similarity=sim,
                 )
                 if adapted_result:
-                    logger.info(
-                        f"80% match-and-execute success (similarity={sim:.4f}, question_type={question_type})"
-                    )
+                    logger.info(f"[80% path] hit similarity={sim:.4f} question_type={question_type}")
                     return adapted_result
 
-            if top_similarities:
-                logger.info(f"80% path: No candidate met threshold {threshold} (top similarity: {top_similarities[0]:.4f})")
-            else:
-                logger.info(f"80% path: No candidate met threshold {threshold}")
+            top = top_similarities[0] if top_similarities else 0.0
+            logger.info(f"[80% path] miss top={top:.4f} threshold={threshold}")
             return None
         except Exception as e:
             logger.warning(f"80% match-and-execute error: {e}")

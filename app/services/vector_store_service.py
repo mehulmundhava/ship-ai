@@ -7,8 +7,11 @@ Uses Hugging Face embeddings instead of OpenAI for cost efficiency.
 """
 
 import json
+import logging
 from typing import List, Optional
 from langchain_huggingface import HuggingFaceEmbeddings
+
+logger = logging.getLogger("ship_rag_ai")
 from langchain.schema import Document
 from sqlalchemy import text
 from app.config.database import sync_engine
@@ -110,14 +113,6 @@ class VectorStoreService:
         Returns:
             List of similar example documents
         """
-        print(f"\n{'='*80}")
-        print(f"🔍 VECTOR STORE SEARCH - Examples")
-        print(f"{'='*80}")
-        print(f"   Query: {query}")
-        print(f"   K: {k}")
-        if example_id:
-            print(f"   Filtering by ID: {example_id}")
-        
         try:
             # Generate embedding for the query
             query_embedding = self.embed_query(query)
@@ -166,9 +161,7 @@ class VectorStoreService:
                 content_parts = [f"Question: {row.question}"]
                 
                 if use_description_only and row.description:
-                    # Use description only - skip SQL to save tokens
                     content_parts.append(f"Description: {row.description}")
-                    print(f"   ✅ Using description-only format (saving ~{len(row.sql_query)} characters)")
                 else:
                     # Normal format: include description if available, then SQL
                     if row.description:
@@ -197,23 +190,11 @@ class VectorStoreService:
                 )
                 documents.append(doc)
             
-            print(f"   Found {len(documents)} results:")
-            for i, doc in enumerate(documents, 1):
-                content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-                print(f"   [{i}] {content_preview}")
-                if doc.metadata:
-                    distance = doc.metadata.get('distance')
-                    if distance is not None:
-                        similarity = 1 - distance
-                        print(f"       Distance: {distance:.4f}, Similarity: {similarity:.4f}")
-            print(f"{'='*80}\n")
-            
+            logger.debug(f"vector examples k={k} found={len(documents)}")
             return documents
             
         except Exception as e:
-            print(f"❌ Error searching examples: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"Error searching examples: {e}")
             return []
     
     def search_extra_prompts(self, query: str, k: int = 2, extra_prompts_id: Optional[int] = None) -> List[Document]:
@@ -228,14 +209,6 @@ class VectorStoreService:
         Returns:
             List of relevant prompt documents
         """
-        print(f"\n{'='*80}")
-        print(f"🔍 VECTOR STORE SEARCH - Extra Prompts")
-        print(f"{'='*80}")
-        print(f"   Query: {query}")
-        print(f"   K: {k}")
-        if extra_prompts_id:
-            print(f"   Filtering by ID: {extra_prompts_id}")
-        
         try:
             # Generate embedding for the query
             query_embedding = self.embed_query(query)
@@ -300,23 +273,11 @@ class VectorStoreService:
                 )
                 documents.append(doc)
             
-            print(f"   Found {len(documents)} results:")
-            for i, doc in enumerate(documents, 1):
-                content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-                print(f"   [{i}] {content_preview}")
-                if doc.metadata:
-                    distance = doc.metadata.get('distance')
-                    if distance is not None:
-                        similarity = 1 - distance
-                        print(f"       Distance: {distance:.4f}, Similarity: {similarity:.4f}")
-            print(f"{'='*80}\n")
-            
+            logger.debug(f"vector extra_prompts k={k} found={len(documents)}")
             return documents
             
         except Exception as e:
-            print(f"❌ Error searching extra prompts: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"Error searching extra prompts: {e}")
             return []
     
     def reload_stores(self):

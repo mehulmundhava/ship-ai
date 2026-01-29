@@ -14,6 +14,7 @@ from app.services.cache_answer_service import CacheAnswerService
 from app.services.message_history_service import save_message_to_history
 
 import logging
+import time
 
 # Get logger for this module
 logger = logging.getLogger("ship_rag_ai")
@@ -87,16 +88,15 @@ def process_chat(
 
     # 80% match-and-execute: always check. Base columns only, no cache. If similarity ≥ 0.80,
     # run example SQL (adapted or as-is) and return without LLM.
-    logger.info("🔍 Checking 80% match-and-execute path...")
+    t0 = time.perf_counter()
     try:
         match_result = cache_service.check_80_match_and_execute(
             question=payload.question,
             question_type=question_type,
         )
         if match_result:
-            logger.info(
-                f"✅ 80% match-and-execute hit (similarity: {match_result['similarity']:.4f})"
-            )
+            elapsed = time.perf_counter() - t0
+            logger.info(f"[80% path] hit in {elapsed:.2f}s similarity={match_result['similarity']:.4f}")
             resp = ChatResponse(
                 token_id=payload.token_id,
                 answer=match_result["answer"],
@@ -130,32 +130,18 @@ def process_chat(
                 chat_history_length=len(payload.chat_history or []),
             )
             return resp
+        elapsed_80 = time.perf_counter() - t0
+        logger.info(f"[80% path] miss in {elapsed_80:.2f}s → LLM")
     except Exception as e:
-        logger.warning(f"80% match-and-execute failed (continuing with LLM): {e}")
+        logger.warning(f"80% match failed (continuing with LLM): {e}")
 
     # No ≥80% match or execution failed — proceed with LLM
-    logger.info("Proceeding with LLM execution")
-    print(f"\n{'='*80}")
-    print(f"Proceeding with LLM")
-    print(f"{'='*80}\n")
-
     llm_type = None  # Set when LLM is used (e.g. OPENAI/gpt-4o)
+    t_request = time.perf_counter()
 
     # Process user question
     try:
-        logger.info("="*80)
-        logger.info("📥 API REQUEST RECEIVED")
-        logger.info(f"Question: {payload.question}")
-        logger.info(f"User ID: {payload.user_id}")
-        logger.info(f"Chat History Length: {len(payload.chat_history or [])}")
-        
-        print(f"\n{'='*80}")
-        print(f"📥 API REQUEST RECEIVED")
-        print(f"{'='*80}")
-        print(f"   Question: {payload.question}")
-        print(f"   User ID: {payload.user_id}")
-        print(f"   Chat History Length: {len(payload.chat_history or [])}")
-        print(f"{'='*80}\n")
+        logger.info(f"[chat] user_id={payload.user_id} question_len={len(payload.question)} history_len={len(payload.chat_history or [])}")
         
         # Get LLM instance (OpenAI or Groq based on LLM_PROVIDER env var)
         llm = llm_model.get_llm_model()
@@ -163,11 +149,6 @@ def process_chat(
         provider = llm_model.get_provider()
         llm_type = f"{provider}/{model_name}"
 
-        logger.info(f"LLM Provider: {provider}")
-        logger.info(f"LLM Model: {model_name}")
-        print(f"🤖 LLM Provider: {provider}")
-        print(f"🤖 LLM Model: {model_name}")
-        
         # Create SQL agent graph
         agent = SQLAgentGraph(
             llm=llm,
@@ -178,8 +159,9 @@ def process_chat(
         )
         
         # Process the question
-        logger.info("Starting agent invocation")
         result = agent.invoke(payload.question)
+        elapsed_request = time.perf_counter() - t_request
+        logger.info(f"[chat] agent done in {elapsed_request:.2f}s")
         
         answer = result.get("answer", "No answer generated")
         sql_query = result.get("sql_query", "")
@@ -216,15 +198,10 @@ def process_chat(
                 logger.debug(f"Error parsing query_result for cache: {e}")
                 result_data = {"raw_result": str(query_result)}
         
-        logger.info(f"Agent completed - Answer length: {len(answer)}, SQL query: {bool(sql_query)}, Query result: {bool(query_result)}")
-
     except Exception as e:
         # Handle any errors that occur during processing
         logger.error(f"Error processing question: {e}")
         logger.exception("Full error traceback")
-        print(f"Error processing question: {e}")
-        import traceback
-        traceback.print_exc()
         answer = f"An error occurred while processing your request: {str(e)}"
         sql_query = None
         query_result = None
