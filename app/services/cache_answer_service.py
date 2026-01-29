@@ -10,6 +10,7 @@ import re
 from typing import Dict, List, Optional, Any
 from sqlalchemy import text
 from langchain_community.utilities.sql_database import SQLDatabase
+from langchain.schema import Document
 from app.config.database import sync_engine
 from app.config.settings import settings
 from app.services.vector_store_service import VectorStoreService
@@ -299,12 +300,13 @@ class CacheAnswerService:
             # #endregion
             embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
-            # Base-columns-only query: no entry_type, is_active, question_type, user_type
+            # Base-columns-only query: include description so we can pass example docs to agent on miss (avoids duplicate vector search)
             search_query = text(f"""
                 SELECT
                     id,
                     question,
                     sql_query,
+                    description,
                     metadata,
                     {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance,
                     1 - ({self.embedding_field_name} <-> '{embedding_str}'::vector) AS similarity
@@ -368,9 +370,34 @@ class CacheAnswerService:
                     return adapted_result
 
             top = top_similarities[0] if top_similarities else 0.0
-            logger.info(f"[80% path] miss top={top:.4f} threshold={threshold}")
-            # Return miss payload with query_embedding so controller can pass it to agent (avoids re-embedding twice)
-            return {"_miss": True, "query_embedding": query_embedding}
+            embed_ms = round((_t1 - _t0) * 1000)
+            db_ms = round((_t2 - _t1) * 1000)
+            logger.info(
+                "[80%% path] miss top=%s threshold=%s (embed_ms=%s db_ms=%s)",
+                f"{top:.4f}", threshold, embed_ms, db_ms,
+            )
+            # Build example docs in same format as search_examples_with_embedding so agent can skip duplicate vector search
+            example_docs = []
+            for row in candidates:
+                content_parts = [f"Question: {row.question}"]
+                if getattr(row, "description", None):
+                    content_parts.append(f"Description: {row.description}")
+                content_parts.append(f"\nSQL Query:\n{row.sql_query}")
+                content = "\n\n".join(content_parts)
+                meta = getattr(row, "metadata", None)
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                elif not isinstance(meta, dict):
+                    meta = {}
+                meta = dict(meta)
+                meta["distance"] = float(row.distance) if row.distance else None
+                meta["id"] = row.id
+                example_docs.append(Document(page_content=content, metadata=meta))
+            # Return miss payload with query_embedding and top_example_docs so agent skips second vector search
+            return {"_miss": True, "query_embedding": query_embedding, "top_example_docs": example_docs}
         except Exception as e:
             logger.warning(f"80% match-and-execute error: {e}")
             return None

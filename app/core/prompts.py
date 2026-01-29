@@ -86,6 +86,7 @@ def get_system_prompt(
     preload_examples: bool = True,
     is_journey: bool = False,
     precomputed_embedding: Optional[List[float]] = None,
+    preloaded_example_docs: Optional[List] = None,
 ) -> str:
     """
     Get the complete system prompt with optional pre-loaded examples.
@@ -98,6 +99,7 @@ def get_system_prompt(
         preload_examples: Whether to pre-load 1-2 examples in the prompt
         is_journey: Whether the question is about journeys/movement
         precomputed_embedding: Optional embedding from 80% path miss to avoid re-embedding (saves ~450ms)
+        preloaded_example_docs: Optional list of Document-like objects from 80% path miss; when set, skips vector search (saves ~1.5s)
         
     Returns:
         Complete system prompt string with optional examples
@@ -178,50 +180,55 @@ USER MODE: user_id = {user_id}
     else:
         main_prompt = "\n\n".join([base_prompt, user_prompt])
     
-    # Pre-load examples if requested and parameters are provided
-    if preload_examples and (question or precomputed_embedding is not None) and vector_store_manager:
-        try:
-            # Check if this is a journey question
-            is_journey_question = is_journey
-            if not is_journey_question and question:
-                question_lower = question.lower()
-                is_journey_question = any(keyword in question_lower for keyword in [
-                    "journey", "movement", "facility to facility", "entered", "exited",
-                    "path", "traveled", "transition"
-                ])
+    # Pre-load examples: use preloaded from 80% path miss (skips vector search), or fetch from vector store
+    if preload_examples:
+        example_docs = None
+        if preloaded_example_docs:
+            example_docs = preloaded_example_docs
+            logger.info("get_system_prompt: using preloaded_example_docs (no vector search)")
+        elif (question or precomputed_embedding is not None) and vector_store_manager:
+            try:
+                # Check if this is a journey question
+                is_journey_question = is_journey
+                if not is_journey_question and question:
+                    question_lower = question.lower()
+                    is_journey_question = any(keyword in question_lower for keyword in [
+                        "journey", "movement", "facility to facility", "entered", "exited",
+                        "path", "traveled", "transition"
+                    ])
 
-            # Training data from ai_vector_examples only (no ai_vector_extra_prompts)
-            if precomputed_embedding is not None:
-                logger.info("get_system_prompt: using precomputed_embedding (no re-embed)")
-                if is_journey_question:
-                    example_docs = vector_store_manager.search_examples_with_embedding(
-                        precomputed_embedding, k=1, use_description_only=False
-                    )
+                # Training data from ai_vector_examples only (no ai_vector_extra_prompts)
+                if precomputed_embedding is not None:
+                    logger.info("get_system_prompt: using precomputed_embedding (no re-embed)")
+                    if is_journey_question:
+                        example_docs = vector_store_manager.search_examples_with_embedding(
+                            precomputed_embedding, k=1, use_description_only=False
+                        )
+                    else:
+                        example_count = 3
+                        example_docs = vector_store_manager.search_examples_with_embedding(
+                            precomputed_embedding, k=example_count
+                        )
                 else:
-                    example_count = 3
-                    example_docs = vector_store_manager.search_examples_with_embedding(
-                        precomputed_embedding, k=example_count
-                    )
-            else:
-                if is_journey_question:
-                    example_docs = vector_store_manager.search_examples(
-                        question, k=1, use_description_only=False
-                    )
-                else:
-                    example_count = 3
-                    example_docs = vector_store_manager.search_examples(question, k=example_count)
+                    if is_journey_question:
+                        example_docs = vector_store_manager.search_examples(
+                            question, k=1, use_description_only=False
+                        )
+                    else:
+                        example_count = 3
+                        example_docs = vector_store_manager.search_examples(question, k=example_count)
+            except Exception as e:
+                pass  # Continue without examples
 
-            examples_section_parts = []
-            if example_docs:
-                examples_section_parts.append("\n\n=== RELEVANT EXAMPLE QUERIES (ai_vector_examples) ===\n")
-                for i, doc in enumerate(example_docs, 1):
-                    examples_section_parts.append(f"Example {i}:\n{doc.page_content}\n")
-            
-            if examples_section_parts:
-                examples_section = "".join(examples_section_parts)
-                main_prompt += examples_section
-        except Exception as e:
-            pass  # Continue without examples
+        # Build examples section (whether example_docs came from preloaded or vector store)
+        examples_section_parts = []
+        if example_docs:
+            examples_section_parts.append("\n\n=== RELEVANT EXAMPLE QUERIES (ai_vector_examples) ===\n")
+            for i, doc in enumerate(example_docs, 1):
+                examples_section_parts.append(f"Example {i}:\n{doc.page_content}\n")
+        if examples_section_parts:
+            examples_section = "".join(examples_section_parts)
+            main_prompt += examples_section
     
     return main_prompt
 

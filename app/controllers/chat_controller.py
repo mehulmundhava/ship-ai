@@ -86,6 +86,7 @@ def process_chat(
     # Match-and-execute service (80% path: base example columns only, no cache)
     cache_service = CacheAnswerService(vector_store, sql_db=sql_db, user_id=payload.user_id)
     precomputed_embedding = None  # set when 80% path misses so agent can reuse (saves ~450ms)
+    preloaded_example_docs = None  # set when 80% path misses so agent skips duplicate vector search (~1.5s)
     elapsed_80_sec = None  # time spent in 80% check when we proceed to LLM (for steps_time)
 
     # 80% match-and-execute: always check. Base columns only, no cache. If similarity ≥ 0.80,
@@ -96,9 +97,10 @@ def process_chat(
             question=payload.question,
             question_type=question_type,
         )
-        # Miss payload: {"_miss": True, "query_embedding": [...]} — pass embedding to agent to avoid re-embedding
+        # Miss payload: {"_miss": True, "query_embedding": [...], "top_example_docs": [...]} — pass to agent to avoid re-embed and duplicate vector search
         if match_result and match_result.get("_miss"):
             precomputed_embedding = match_result.get("query_embedding")
+            preloaded_example_docs = match_result.get("top_example_docs")
             elapsed_80_sec = time.perf_counter() - t0
             logger.info(f"[80% path] miss in {elapsed_80_sec:.2f}s → LLM (reusing embedding)")
         elif match_result:
@@ -152,11 +154,13 @@ def process_chat(
             return resp
         if match_result is None:
             precomputed_embedding = None
+            preloaded_example_docs = None
             elapsed_80_sec = time.perf_counter() - t0
             logger.info(f"[80% path] miss in {elapsed_80_sec:.2f}s → LLM")
     except Exception as e:
         logger.warning(f"80% match failed (continuing with LLM): {e}")
         precomputed_embedding = None
+        preloaded_example_docs = None
 
     # No ≥80% match or execution failed — proceed with LLM
     llm_type = None  # Set from agent result (actual model used, e.g. OPENAI/gpt-4o when fallback used)
@@ -176,8 +180,12 @@ def process_chat(
             top_k=20
         )
         
-        # Process the question (pass precomputed_embedding when 80% path missed to save ~450ms)
-        result = agent.invoke(payload.question, precomputed_embedding=precomputed_embedding)
+        # Process the question (pass precomputed_embedding and preloaded_example_docs when 80% path missed to save ~450ms + ~1.5s)
+        result = agent.invoke(
+            payload.question,
+            precomputed_embedding=precomputed_embedding,
+            preloaded_example_docs=preloaded_example_docs,
+        )
         elapsed_request = time.perf_counter() - t_request
         logger.info(f"[chat] agent done in {elapsed_request:.2f}s")
         
