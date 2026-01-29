@@ -617,7 +617,7 @@ class CacheAnswerService:
                 
                 if csv_download_link:
                     path = csv_download_link if csv_download_link.startswith("/") else (f"/download-csv/{csv_id}" if csv_id else csv_download_link)
-                    return f"The device has a total of {total_journeys} facility-to-facility movements. You can download the complete data here: [Download CSV]({path})."
+                    return f"The device has a total of {total_journeys} facility-to-facility movements. [Download CSV]({path})"
                 elif total_journeys > 0:
                     return f"Found {total_journeys} facility-to-facility movement(s) for the device."
                 else:
@@ -636,7 +636,7 @@ class CacheAnswerService:
                         if csv_match and row_match:
                             csv_path = csv_match.group(1)
                             row_count = row_match.group(1)
-                            return f"Found {row_count} result(s). You can download the complete data here: [Download CSV]({csv_path})."
+                            return f"Found {row_count} result(s). [Download CSV]({csv_path})"
                     
                     # Check if it's an empty result
                     if '0 rows' in raw or 'no rows' in raw.lower():
