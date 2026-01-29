@@ -54,6 +54,8 @@ class AgentState(TypedDict):
     query_validated: Optional[bool]  # Track if user query has been validated
     llm_call_history: Optional[List[Dict[str, Any]]]  # Track what was sent/received for each LLM call
     stage_breakdown: Optional[List[Dict[str, Any]]]  # Per-stage timing and token counts for request summary
+    csv_id: Optional[str]  # CSV download ID for API response (relative path: /download-csv/{csv_id})
+    csv_download_path: Optional[str]  # Relative path e.g. /download-csv/{uuid} for UI/Postman
 
 
 class SQLAgentGraph:
@@ -1478,6 +1480,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
 
             # Extract CSV download link from query_result if present
             csv_download_url = None
+            csv_path = None
             csv_id = None
             
             # Try to parse as JSON first (for journey tools)
@@ -1583,10 +1586,10 @@ Note: Full data available in CSV. Showing summary only."""
                         query_result = minimal_summary
                         logger.debug(f"Token optimization: minimal summary rows={row_count}")
 
-            # Build the prompt with CSV link if available
+            # Build the prompt with CSV link if available (use relative path only for UI and Postman)
             csv_link_instruction = ""
-            if csv_download_url:
-                csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link with ALL the data. You MUST include this full URL in your answer: {csv_download_url}"
+            if csv_download_url and csv_path:
+                csv_link_instruction = f"\n\nIMPORTANT: Add exactly ONE download link at the end. Do NOT write the words 'Download CSV' or 'using the following link' before the link. Mention the count, then add only this link: [Download CSV]({csv_path})"
 
             # OPTIMIZATION: Ultra-minimal prompt when CSV is available
             # Safety check: If CSV is available but query_result is still large, force minimal summary
@@ -1621,7 +1624,7 @@ Note: Full data available in CSV. Showing summary only."""
 
 Query results summary: {query_result}
 
-IMPORTANT: Use the EXACT "total_journeys" count from the results (not the preview count). Mention this exact total number in your answer, then provide the CSV download link.{csv_link_instruction}""".strip()
+IMPORTANT: Use the EXACT "total_journeys" count from the results (not the preview count). Mention this total number, then add only the download link (do not write 'using the following link' or repeat 'Download CSV' before the link).{csv_link_instruction}""".strip()
             else:
                 # Regular prompt for small results
                 final_prompt = f"""User asked: {user_question}
@@ -1635,6 +1638,18 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             final_messages = [HumanMessage(content=final_prompt)]
             response = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
             final_answer = response.content if hasattr(response, 'content') else str(response)
+            # Normalize CSV link: use relative path and remove duplicate "Download CSV" phrasing
+            if csv_path:
+                if settings.get_api_base_url():
+                    base = settings.get_api_base_url().rstrip("/")
+                    final_answer = re.sub(rf"\(({re.escape(base)}/download-csv/[a-f0-9\-]+)\)", f"({csv_path})", final_answer)
+                # Remove redundant "using the following link: [Download CSV]" so only the link shows once
+                final_answer = re.sub(
+                    r"\s*[Uu]sing the following link:\s*\[Download CSV\]\s*",
+                    " ",
+                    final_answer,
+                    flags=re.IGNORECASE,
+                )
             elapsed_format = time.perf_counter() - t_format
             call_token_usage = {"input": 0, "output": 0, "total": 0}
             if hasattr(response, "response_metadata") and response.response_metadata:
@@ -1676,8 +1691,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                 "token_usage": call_token_usage
             }
             llm_call_history.append(llm_call_info)
-            
-            return {
+            out = {
                 **state,
                 "final_answer": final_answer,
                 "query_result": query_result,  # Update state with successful result (not error)
@@ -1685,6 +1699,10 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                 "llm_call_history": llm_call_history,
                 "token_usage": updated_token_usage
             }
+            if csv_path:
+                out["csv_download_path"] = csv_path
+                out["csv_id"] = csv_id if csv_id else csv_path.replace("/download-csv/", "").strip()
+            return out
         elif query_result and query_result.startswith("::::::"):
             # Empty result
             final_answer = f"Based on the query, there are no results matching your criteria for the question: {state['question']}"
@@ -1750,10 +1768,10 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                             csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                                             logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
 
-                                    # Build the prompt with CSV link if available
+                                    # Build the prompt with CSV link if available (relative path only for UI/Postman)
                                     csv_link_instruction = ""
-                                    if csv_download_url:
-                                        csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link. You MUST include this full URL in your answer: {csv_download_url}"
+                                    if csv_download_url and csv_path:
+                                        csv_link_instruction = f"\n\nIMPORTANT: Add exactly ONE download link at the end. Do NOT write 'Download CSV' or 'using the following link' before the link. Mention the count, then add only: [Download CSV]({csv_path})"
                                     
                                     final_prompt = f"""
                                         You are a helpful assistant. Your task is ONLY to explain database query results
@@ -1830,7 +1848,9 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             "token_usage": {"input": 0, "output": 0, "total": 0},
             "query_validated": False,
             "llm_call_history": [],
-            "stage_breakdown": []
+            "stage_breakdown": [],
+            "csv_id": None,
+            "csv_download_path": None,
         }
         
         final_state = self.graph.invoke(initial_state)
@@ -1872,7 +1892,9 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             "answer": final_state.get("final_answer", "No answer generated"),
             "sql_query": sql_query or final_state.get("sql_query", ""),
             "query_result": query_result or "",
-            "debug": debug_info
+            "debug": debug_info,
+            "csv_id": final_state.get("csv_id"),
+            "csv_download_path": final_state.get("csv_download_path"),
         }
     
     def _build_debug_info(self, state: AgentState, question: str) -> Dict[str, Any]:

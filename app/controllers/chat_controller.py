@@ -97,6 +97,11 @@ def process_chat(
         if match_result:
             elapsed = time.perf_counter() - t0
             logger.info(f"[80% path] hit in {elapsed:.2f}s similarity={match_result['similarity']:.4f}")
+            result_data = match_result.get("result_data") or {}
+            csv_path = result_data.get("csv_download_link")
+            csv_id_80 = result_data.get("csv_id")
+            if csv_path and not csv_path.startswith("/"):
+                csv_path = f"/download-csv/{csv_id_80}" if csv_id_80 else csv_path
             resp = ChatResponse(
                 token_id=payload.token_id,
                 answer=match_result["answer"],
@@ -112,6 +117,8 @@ def process_chat(
                     "original_question": match_result.get("original_question", payload.question),
                     "question_type": question_type,
                 },
+                csv_id=csv_id_80,
+                csv_download_path=csv_path,
             )
             save_message_to_history(
                 user_id=payload.user_id,
@@ -167,6 +174,8 @@ def process_chat(
         sql_query = result.get("sql_query", "")
         query_result = result.get("query_result", "")
         debug_info = result.get("debug", {})
+        csv_id = result.get("csv_id")
+        csv_download_path = result.get("csv_download_path")
         
         # Extract result data for caching (if available)
         result_data = None
@@ -223,7 +232,9 @@ def process_chat(
         cached=False,
         llm_used=True,
         llm_type=llm_type,
-        debug=debug_info
+        debug=debug_info,
+        csv_id=csv_id if 'csv_id' in locals() else None,
+        csv_download_path=csv_download_path if 'csv_download_path' in locals() else None,
     )
     save_message_to_history(
         user_id=payload.user_id,

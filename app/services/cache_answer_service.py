@@ -616,8 +616,8 @@ class CacheAnswerService:
                 csv_id = result_data.get('csv_id')
                 
                 if csv_download_link:
-                    csv_url = f"{settings.get_api_base_url()}{csv_download_link}" if not csv_download_link.startswith('http') else csv_download_link
-                    return f"The device has a total of {total_journeys} facility-to-facility movements. To access the detailed journey timing information for all these movements, you can download the complete data in CSV format from the following link: {csv_url}. This link provides the full data for the {total_journeys} journeys."
+                    path = csv_download_link if csv_download_link.startswith("/") else (f"/download-csv/{csv_id}" if csv_id else csv_download_link)
+                    return f"The device has a total of {total_journeys} facility-to-facility movements. You can download the complete data here: [Download CSV]({path})."
                 elif total_journeys > 0:
                     return f"Found {total_journeys} facility-to-facility movement(s) for the device."
                 else:
@@ -630,13 +630,13 @@ class CacheAnswerService:
                     raw = result_data['raw_result']
                     # Check if it mentions CSV
                     if 'CSV Download Link' in raw:
-                        # Extract CSV link and row count
+                        # Extract CSV link and row count (use relative path for UI/Postman)
                         csv_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', raw)
                         row_match = re.search(r'Total rows:\s*(\d+)', raw)
                         if csv_match and row_match:
-                            csv_url = f"{settings.get_api_base_url()}{csv_match.group(1)}"
+                            csv_path = csv_match.group(1)
                             row_count = row_match.group(1)
-                            return f"Found {row_count} result(s). You can download the complete data in CSV format from: {csv_url}."
+                            return f"Found {row_count} result(s). You can download the complete data here: [Download CSV]({csv_path})."
                     
                     # Check if it's an empty result
                     if '0 rows' in raw or 'no rows' in raw.lower():

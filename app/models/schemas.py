@@ -33,6 +33,8 @@ class ChatResponse(BaseModel):
     llm_type: Optional[str] = None  # Model used when LLM was used (e.g. OPENAI/gpt-4o)
     tokens_saved: Optional[str] = None  # Estimated tokens saved (only when cached)
     debug: Optional[Dict[str, Any]] = None
+    csv_id: Optional[str] = None  # CSV download ID; use GET /download-csv/{csv_id} (same base URL as /chat)
+    csv_download_path: Optional[str] = None  # Relative path e.g. /download-csv/{uuid} for UI/Postman
 
 
 class HealthCheckResponse(BaseModel):
