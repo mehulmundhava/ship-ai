@@ -115,3 +115,31 @@ class GetTextEmbeddingResponse(BaseModel):
     text: str
     embedding: List[float]
     embedding_dimension: int
+
+
+class SearchEmbeddingRequest(BaseModel):
+    """
+    Request model for the /search-embedding API endpoint.
+    """
+    text: str
+    limit: Optional[int] = 5
+
+
+class SearchEmbeddingResult(BaseModel):
+    """
+    Individual search result item for embedding search.
+    """
+    id: int
+    content: str
+    similarity: float
+
+
+class SearchEmbeddingResponse(BaseModel):
+    """
+    Response model for the /search-embedding API endpoint.
+    """
+    status: str
+    text: str
+    limit: int
+    results: List[SearchEmbeddingResult]
+    total_results: int

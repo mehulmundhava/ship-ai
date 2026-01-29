@@ -6,14 +6,17 @@ Uses update database connection for write operations.
 """
 
 from sqlalchemy import text
-from app.config.database import sync_engine_update
+from app.config.database import sync_engine_update, sync_engine
 from app.config.settings import settings
 from app.models.schemas import (
     GenerateEmbeddingsRequest,
     GenerateEmbeddingsResponse,
     ReloadVectorStoreResponse,
     GetTextEmbeddingRequest,
-    GetTextEmbeddingResponse
+    GetTextEmbeddingResponse,
+    SearchEmbeddingRequest,
+    SearchEmbeddingResponse,
+    SearchEmbeddingResult
 )
 
 
@@ -390,5 +393,112 @@ def get_text_embedding(
             text=payload.text,
             embedding=[],
             embedding_dimension=0
+        )
+
+
+def search_embedding(
+    payload: SearchEmbeddingRequest,
+    vector_store
+) -> SearchEmbeddingResponse:
+    """
+    Search Embedding in PostgreSQL Table
+    
+    Generates embedding for the provided text and searches the ai_vector_examples
+    table for similar records using cosine similarity.
+    
+    Args:
+        payload: SearchEmbeddingRequest with text and limit fields
+        vector_store: VectorStoreService instance
+        
+    Returns:
+        SearchEmbeddingResponse with status, text, limit, and search results
+    """
+    print(f"\n{'='*80}")
+    print(f"🔍 SEARCH EMBEDDING")
+    print(f"{'='*80}")
+    print(f"   Text: {payload.text[:100] + '...' if len(payload.text) > 100 else payload.text}")
+    print(f"   Limit: {payload.limit}")
+    print(f"{'='*80}\n")
+    
+    try:
+        if not payload.text or not payload.text.strip():
+            return SearchEmbeddingResponse(
+                status="error",
+                text=payload.text,
+                limit=payload.limit,
+                results=[],
+                total_results=0
+            )
+        
+        # Generate embedding from text
+        query_embedding = vector_store.embed_query(payload.text)
+        
+        # Convert to PostgreSQL array format string
+        embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+        
+        # Get the embedding field name based on the model
+        embedding_field = settings.get_embedding_field_name()
+        print(f"   Using embedding field: {embedding_field}")
+        
+        # Execute the search query using CTE (Common Table Expression)
+        # Using cosine similarity: 1 - (distance) where distance is <=> operator
+        search_query = text(f"""
+            WITH query AS (
+                SELECT
+                    '{embedding_str}'::vector
+                    AS query_embedding
+            )
+            SELECT
+                a.id,
+                COALESCE(a.content, a.question, '') AS content,
+                1 - (a.{embedding_field} <=> q.query_embedding) AS similarity
+            FROM public.ai_vector_examples AS a
+            CROSS JOIN query AS q
+            WHERE a.{embedding_field} IS NOT NULL
+            ORDER BY a.{embedding_field} <=> q.query_embedding
+            LIMIT :limit
+        """)
+        
+        # Use read-only engine for search operations
+        with sync_engine.connect() as conn:
+            result = conn.execute(search_query, {"limit": payload.limit})
+            rows = result.fetchall()
+        
+        # Convert results to SearchEmbeddingResult objects
+        results = []
+        for row in rows:
+            results.append(SearchEmbeddingResult(
+                id=row.id,
+                content=row.content if row.content else "",
+                similarity=float(row.similarity) if row.similarity is not None else 0.0
+            ))
+        
+        print(f"✅ Search completed successfully!")
+        print(f"   Found {len(results)} result(s)")
+        for i, result_item in enumerate(results, 1):
+            content_preview = result_item.content[:80] + "..." if len(result_item.content) > 80 else result_item.content
+            print(f"   [{i}] ID: {result_item.id}, Similarity: {result_item.similarity:.4f}")
+            print(f"       Content: {content_preview}")
+        print(f"{'='*80}\n")
+        
+        return SearchEmbeddingResponse(
+            status="success",
+            text=payload.text,
+            limit=payload.limit,
+            results=results,
+            total_results=len(results)
+        )
+        
+    except Exception as e:
+        error_msg = f"Error searching embedding: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return SearchEmbeddingResponse(
+            status="error",
+            text=payload.text,
+            limit=payload.limit,
+            results=[],
+            total_results=0
         )
 
