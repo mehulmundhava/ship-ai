@@ -54,6 +54,7 @@ def save_message_to_history(
     result_data: Any = None,
     error_message: Optional[str] = None,
     chat_history_length: Optional[int] = None,
+    steps_time: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Insert one row into ai_message_history. Does not raise; logs on failure.
@@ -69,6 +70,13 @@ def save_message_to_history(
             except (TypeError, ValueError):
                 debug_json = {"_error": "serialization_failed"}
 
+        steps_time_json = None
+        if steps_time is not None:
+            try:
+                steps_time_json = json.dumps(steps_time)
+            except (TypeError, ValueError):
+                steps_time_json = json.dumps({"_error": "serialization_failed"})
+
         with sync_engine_update.connect() as conn:
             conn.execute(
                 text("""
@@ -76,12 +84,12 @@ def save_message_to_history(
                         user_id, login_id, token_id, question, response,
                         sql_query, cached, similarity, llm_used, llm_type,
                         question_type, debug_info, result_data, error_message,
-                        chat_history_length
+                        chat_history_length, steps_time
                     ) VALUES (
                         :user_id, :login_id, :token_id, :question, :response,
                         :sql_query, :cached, :similarity, :llm_used, :llm_type,
                         :question_type, :debug_info, :result_data, :error_message,
-                        :chat_history_length
+                        :chat_history_length, :steps_time
                     )
                 """),
                 {
@@ -100,6 +108,7 @@ def save_message_to_history(
                     "result_data": json.dumps(result_json) if result_json is not None else None,
                     "error_message": error_message,
                     "chat_history_length": chat_history_length,
+                    "steps_time": steps_time_json,
                 },
             )
             conn.commit()

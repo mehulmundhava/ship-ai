@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS ai_message_history (
     result_data         JSONB,
     error_message       TEXT,
     chat_history_length INTEGER,
+    steps_time          JSONB,
     created_at          TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'utc')
 );
 
@@ -47,4 +48,5 @@ COMMENT ON COLUMN ai_message_history.debug_info   IS 'Full debug dict for troubl
 COMMENT ON COLUMN ai_message_history.result_data  IS 'Query result summary (JSON)';
 COMMENT ON COLUMN ai_message_history.error_message IS 'Error text if request failed';
 COMMENT ON COLUMN ai_message_history.chat_history_length IS 'Length of chat_history in request';
+COMMENT ON COLUMN ai_message_history.steps_time   IS 'Exact time taken per step (ms) for all paths: match_80, llm, stage_breakdown';
 COMMENT ON COLUMN ai_message_history.created_at   IS 'UTC timestamp of the message';

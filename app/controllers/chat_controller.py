@@ -86,6 +86,7 @@ def process_chat(
     # Match-and-execute service (80% path: base example columns only, no cache)
     cache_service = CacheAnswerService(vector_store, sql_db=sql_db, user_id=payload.user_id)
     precomputed_embedding = None  # set when 80% path misses so agent can reuse (saves ~450ms)
+    elapsed_80_sec = None  # time spent in 80% check when we proceed to LLM (for steps_time)
 
     # 80% match-and-execute: always check. Base columns only, no cache. If similarity ≥ 0.80,
     # run example SQL (adapted or as-is) and return without LLM.
@@ -98,8 +99,8 @@ def process_chat(
         # Miss payload: {"_miss": True, "query_embedding": [...]} — pass embedding to agent to avoid re-embedding
         if match_result and match_result.get("_miss"):
             precomputed_embedding = match_result.get("query_embedding")
-            elapsed_80 = time.perf_counter() - t0
-            logger.info(f"[80% path] miss in {elapsed_80:.2f}s → LLM (reusing embedding)")
+            elapsed_80_sec = time.perf_counter() - t0
+            logger.info(f"[80% path] miss in {elapsed_80_sec:.2f}s → LLM (reusing embedding)")
         elif match_result:
             elapsed = time.perf_counter() - t0
             logger.info(f"[80% path] hit in {elapsed:.2f}s similarity={match_result['similarity']:.4f}")
@@ -126,6 +127,11 @@ def process_chat(
                 csv_id=csv_id_80,
                 csv_download_path=csv_path,
             )
+            steps_time = {
+                "path": "match_80",
+                "total_ms": round(elapsed * 1000),
+                "match_and_execute_ms": round(elapsed * 1000),
+            }
             save_message_to_history(
                 user_id=payload.user_id,
                 login_id=payload.login_id,
@@ -141,31 +147,27 @@ def process_chat(
                 debug_info=resp.debug,
                 result_data=match_result.get("result_data"),
                 chat_history_length=len(payload.chat_history or []),
+                steps_time=steps_time,
             )
             return resp
         if match_result is None:
             precomputed_embedding = None
-            elapsed_80 = time.perf_counter() - t0
-            logger.info(f"[80% path] miss in {elapsed_80:.2f}s → LLM")
+            elapsed_80_sec = time.perf_counter() - t0
+            logger.info(f"[80% path] miss in {elapsed_80_sec:.2f}s → LLM")
     except Exception as e:
         logger.warning(f"80% match failed (continuing with LLM): {e}")
         precomputed_embedding = None
 
     # No ≥80% match or execution failed — proceed with LLM
-    llm_type = None  # Set when LLM is used (e.g. OPENAI/gpt-4o)
+    llm_type = None  # Set from agent result (actual model used, e.g. OPENAI/gpt-4o when fallback used)
     t_request = time.perf_counter()
 
     # Process user question (precomputed_embedding from 80% path miss avoids re-embedding in get_system_prompt)
     try:
         logger.info(f"[chat] user_id={payload.user_id} question_len={len(payload.question)} history_len={len(payload.chat_history or [])}")
         
-        # Get LLM instance (OpenAI or Groq based on LLM_PROVIDER env var)
         llm = llm_model.get_llm_model()
-        model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', None) or 'Unknown'
-        provider = llm_model.get_provider()
-        llm_type = f"{provider}/{model_name}"
-
-        # Create SQL agent graph
+        # Create SQL agent graph (llm_type will come from agent result so fallback is reported correctly)
         agent = SQLAgentGraph(
             llm=llm,
             db=sql_db,
@@ -179,6 +181,8 @@ def process_chat(
         elapsed_request = time.perf_counter() - t_request
         logger.info(f"[chat] agent done in {elapsed_request:.2f}s")
         
+        # Use actual LLM used by agent (e.g. OPENAI/gpt-4o when Groq failed and fallback was used)
+        llm_type = result.get("actual_llm_type") or llm_type
         answer = result.get("answer", "No answer generated")
         sql_query = result.get("sql_query", "")
         query_result = result.get("query_result", "")
@@ -220,6 +224,7 @@ def process_chat(
         # Handle any errors that occur during processing
         logger.error(f"Error processing question: {e}")
         logger.exception("Full error traceback")
+        elapsed_request = time.perf_counter() - t_request
         answer = f"An error occurred while processing your request: {str(e)}"
         sql_query = None
         query_result = None
@@ -230,6 +235,16 @@ def process_chat(
         }
         error_message = str(e)
         result_data = None
+
+    # Build steps_time for LLM path (all non-80%-hit requests)
+    steps_time = {
+        "path": "llm",
+        "match_80_check_ms": round((elapsed_80_sec or 0) * 1000),
+        "agent_total_ms": round(elapsed_request * 1000),
+        "total_ms": round(((elapsed_80_sec or 0) + elapsed_request) * 1000),
+    }
+    if "result" in locals() and result and result.get("stage_breakdown"):
+        steps_time["stage_breakdown"] = result["stage_breakdown"]
 
     # Format and return response
     sql_query_str = sql_query if sql_query else None
@@ -261,6 +276,7 @@ def process_chat(
         result_data=resp.results,
         error_message=error_message if 'error_message' in locals() else None,
         chat_history_length=len(payload.chat_history or []),
+        steps_time=steps_time,
     )
     return resp
 

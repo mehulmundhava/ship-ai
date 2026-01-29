@@ -13,13 +13,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_community.utilities.sql_database import SQLDatabase
 from app.core.agent.agent_tools import (
-    create_get_few_shot_examples_tool, 
     create_execute_db_query_tool,
     create_get_table_list_tool,
     create_get_table_structure_tool,
     create_count_query_tool,
     create_list_query_tool,
-    create_get_extra_examples_tool,
     create_journey_list_tool,
     create_journey_count_tool
 )
@@ -57,12 +55,15 @@ class AgentState(TypedDict):
     csv_id: Optional[str]  # CSV download ID for API response (relative path: /download-csv/{csv_id})
     csv_download_path: Optional[str]  # Relative path e.g. /download-csv/{uuid} for UI/Postman
     precomputed_embedding: Optional[List[float]]  # From 80% path miss to avoid re-embedding in get_system_prompt
+    actual_llm_type: Optional[str]  # Actual provider/model used (e.g. OPENAI/gpt-4o when fallback used)
 
 
 class SQLAgentGraph:
     """
     LangGraph-based SQL agent with RAG capabilities.
     """
+    # Process-level: after first Groq 401 in this process, skip Groq for all requests until restart
+    _groq_401_seen_process: bool = False
     
     def __init__(
         self,
@@ -87,20 +88,20 @@ class SQLAgentGraph:
         self.vector_store_manager = vector_store_manager
         self.user_id = user_id
         self.top_k = top_k
+        # Per-request: after first Groq 401, skip Groq for rest of request to avoid repeated fail-then-fallback latency
+        self._groq_401_seen_this_request = False
         
         # Store provider info for fallback logic
         from app.services.llm_service import LLMService
         llm_service = LLMService()
         self.provider = llm_service.get_provider()
         
-        # Create tools
-        self.get_examples_tool = create_get_few_shot_examples_tool(vector_store_manager)
+        # Create tools (training data comes from ai_vector_examples only, loaded in system prompt)
         self.execute_db_query_tool = create_execute_db_query_tool(db, vector_store_manager)
         self.get_table_list_tool = create_get_table_list_tool(db)
         self.get_table_structure_tool = create_get_table_structure_tool(db)
         self.count_query_tool = create_count_query_tool(db)
         self.list_query_tool = create_list_query_tool(db)
-        self.get_extra_examples_tool = create_get_extra_examples_tool(vector_store_manager)
         self.journey_list_tool = create_journey_list_tool(db, user_id)
         self.journey_count_tool = create_journey_count_tool(db, user_id)
         
@@ -117,12 +118,11 @@ class SQLAgentGraph:
         ]
         
         # Regular tools (for non-journey questions)
-        # OPTIMIZATION: Reduced tool set to save tokens
-        # Removed: count_query_tool, list_query_tool (execute_db_query handles these)
-        # Removed: get_table_list, get_table_structure (fallback handled via auto-retry)
+        # Examples from ai_vector_examples only, pre-loaded in system prompt; get_table_* are last-resort fallbacks
         self.regular_tools = [
             self.execute_db_query_tool,
-            self.get_examples_tool
+            self.get_table_list_tool,
+            self.get_table_structure_tool,
         ]
         
         # Keep all tools for ToolNode (needs access to all tools for execution)
@@ -237,12 +237,16 @@ class SQLAgentGraph:
                 return self.llm.invoke(messages)
             except Exception as e:
                 error_str = str(e)
+                if "401" in error_str or "expired_api_key" in error_str:
+                    self._groq_401_seen_this_request = True
+                    SQLAgentGraph._groq_401_seen_process = True
+                    logger.warning("Groq 401/invalid key: skipping Groq for this request, using OpenAI fallback")
+                    return None
                 error_type = type(e).__name__
                 logger.warning(f"Groq invocation failed (no tools): {error_type} - {error_str[:200]}")
-                # For non-tool calls, just return None to trigger OpenAI fallback
                 return None
-        
-        # Tool calling path: Try with recovery mechanisms
+
+        # Tool calling path: Try with recovery mechanisms (except on 401 — do not retry Groq)
         error_str = None
         error_type = None
         
@@ -252,16 +256,19 @@ class SQLAgentGraph:
                 return self.llm_with_tools.invoke(messages)
             except Exception as tool_error:
                 error_str = str(tool_error)
+                if "401" in error_str or "expired_api_key" in error_str:
+                    self._groq_401_seen_this_request = True
+                    SQLAgentGraph._groq_401_seen_process = True
+                    logger.warning("Groq 401/invalid key: skipping Groq for this request, using OpenAI fallback")
+                    return None
                 error_type = type(tool_error).__name__
                 if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
                     logger.info("🔧 Groq tool calling failed, attempting recovery...")
                     logger.debug("Groq tool calling failed, attempting recovery")
-                    # Continue to recovery steps below
                 else:
-                    # Non-tool-calling error, log and continue to recovery
                     logger.warning(f"Groq tool invocation error: {error_type} - {error_str[:200]}")
         
-        # Step 2: Try without tool binding (Groq might generate SQL in text)
+        # Step 2: Try without tool binding (Groq might generate SQL in text) — skip if 401 already handled above
         if use_tools:
             try:
                 logger.info("🔧 Attempting Groq recovery: invoking without tool binding...")
@@ -287,9 +294,13 @@ class SQLAgentGraph:
                     else:
                         logger.warning("Groq response doesn't contain SQL")
             except Exception as recovery_error:
+                err_str = str(recovery_error)
+                if "401" in err_str or "expired_api_key" in err_str:
+                    self._groq_401_seen_this_request = True
+                    SQLAgentGraph._groq_401_seen_process = True
                 logger.warning(f"Groq recovery (no tools) failed: {recovery_error}")
                 if not error_str:
-                    error_str = str(recovery_error)
+                    error_str = err_str
                     error_type = type(recovery_error).__name__
         
         # Step 3: Try to extract SQL from error message (if we have one)
@@ -311,6 +322,9 @@ class SQLAgentGraph:
                     logger.warning(f"Failed to create synthetic response: {synth_error}")
         
         # If all Groq recovery attempts fail, return None to trigger OpenAI fallback
+        if error_str and ("401" in error_str or "expired_api_key" in error_str):
+            self._groq_401_seen_this_request = True
+            SQLAgentGraph._groq_401_seen_process = True
         logger.warning("All Groq recovery mechanisms failed")
         return None
     
@@ -338,31 +352,39 @@ class SQLAgentGraph:
     def _invoke_llm_with_fallback(self, messages, use_tools=False, question=""):
         """
         Invoke LLM with provider-specific handling and automatic fallback.
-        - Groq: Uses recovery mechanisms (tool calling → no tools → SQL extraction)
+        - Groq: Uses recovery mechanisms (tool calling → no tools → SQL extraction); on 401, no retry, use fallback.
         - OpenAI: Direct invocation
         - Fallback: Only if Groq completely fails, use OpenAI
         
-        Args:
-            messages: List of messages to send to LLM
-            use_tools: Whether to use tool binding (llm_with_tools)
-            question: Question text for tool binding (if use_tools=True)
-        
         Returns:
-            LLM response or synthetic AIMessage with tool calls
+            Tuple of (response, llm_type_used) where llm_type_used is e.g. "GROQ/llama-3.3-70b" or "OPENAI/gpt-4o"
         """
+        primary_model = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
+        primary_llm_type = f"{self.provider}/{primary_model}"
+
         # Route to provider-specific handler
         if self.provider == "GROQ":
-            # Try Groq with recovery mechanisms
-            groq_response = self._invoke_groq_with_recovery(messages, use_tools, question)
+            # Skip Groq if disabled via env, or 401 seen this request, or 401 seen this process (avoid repeated fail-then-fallback latency)
+            skip = (
+                getattr(settings, "GROQ_DISABLED", False)
+                or getattr(self, "_groq_401_seen_this_request", False)
+                or getattr(SQLAgentGraph, "_groq_401_seen_process", False)
+            )
+            if skip:
+                logger.info("Skipping Groq (GROQ_DISABLED or 401 seen), using fallback directly")
+                groq_response = None
+            else:
+                groq_response = self._invoke_groq_with_recovery(messages, use_tools, question)
             if groq_response is not None:
-                return groq_response
+                return groq_response, primary_llm_type
             
-            # Groq recovery failed, fall back to OpenAI
-            logger.warning("Groq recovery failed, falling back to OpenAI")
+            # Groq failed for this request, fall back to OpenAI
+            logger.warning("Groq failed for this request, falling back to OpenAI")
         else:
             # OpenAI: direct invocation
             try:
-                return self._invoke_openai(messages, use_tools, question)
+                response = self._invoke_openai(messages, use_tools, question)
+                return response, primary_llm_type
             except Exception as e:
                 error_str = str(e)
                 error_type = type(e).__name__
@@ -374,20 +396,16 @@ class SQLAgentGraph:
         try:
             fallback_llm = self._get_fallback_llm(use_tools, question)
             fallback_model_name = getattr(fallback_llm, 'model_name', None) or getattr(fallback_llm, 'model', None) or 'Unknown'
-            logger.debug(f"Using FALLBACK LLM (OpenAI): {fallback_model_name}")
+            fallback_llm_type = f"OPENAI/{fallback_model_name}"
             logger.debug(f"Using FALLBACK LLM (OpenAI): {fallback_model_name}")
             
             response = fallback_llm.invoke(messages)
             logger.debug("Got response from OpenAI fallback")
-            logger.debug("Got response from OpenAI fallback")
-            return response
+            return response, fallback_llm_type
         except Exception as e2:
             logger.error(f"OpenAI fallback also failed: {e2}")
             logger.exception("OpenAI fallback error")
             raise
-        
-        # This should never be reached, but just in case
-        raise Exception("All LLM invocation attempts failed")
     
     def _extract_sql_from_groq_error(self, error_str: str) -> Optional[Dict[str, Any]]:
         """
@@ -775,7 +793,8 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     HumanMessage(content=user_question)
                 ]
                 
-                security_response = self._invoke_llm_with_fallback(security_messages, use_tools=False, question=user_question)
+                security_response, llm_type_used = self._invoke_llm_with_fallback(security_messages, use_tools=False, question=user_question)
+                state["actual_llm_type"] = llm_type_used
                 security_decision = security_response.content.strip().upper() if hasattr(security_response, 'content') else ""
                 elapsed_security = time.perf_counter() - t_security
                 security_token_usage = {"input": 0, "output": 0, "total": 0}
@@ -994,7 +1013,8 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             try:
                 if self.llm_with_tools is None:
                     self._bind_tools_conditionally(question if question else "")
-                response = self._invoke_llm_with_fallback(messages, use_tools=True, question=question)
+                response, llm_type_used = self._invoke_llm_with_fallback(messages, use_tools=True, question=question)
+                state["actual_llm_type"] = llm_type_used
             except Exception as e:
                 error_str = str(e)
                 error_type = type(e).__name__
@@ -1638,7 +1658,8 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             llm_call_history = state.get("llm_call_history", [])
             from langchain_core.messages import HumanMessage
             final_messages = [HumanMessage(content=final_prompt)]
-            response = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+            response, llm_type_used = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+            state["actual_llm_type"] = llm_type_used
             final_answer = response.content if hasattr(response, 'content') else str(response)
             # When CSV is available: keep the single [Download CSV](path) link; only remove duplicate phrasing so "Download CSV" appears once
             if csv_path:
@@ -1794,7 +1815,8 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                     
                                     from langchain_core.messages import HumanMessage
                                     final_messages = [HumanMessage(content=final_prompt)]
-                                    response = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+                                    response, llm_type_used = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+                                    state["actual_llm_type"] = llm_type_used
                                     final_answer = response.content if hasattr(response, 'content') else str(response)
                                     logger.info(f"✅ Generated final answer from query results")
                                     return {
@@ -1832,6 +1854,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             Dictionary with answer, SQL query, and results
         """
         t_request = time.perf_counter()
+        self._groq_401_seen_this_request = False
         logger.info(f"process=request start user_id={self.user_id} question_len={len(question)}")
         
         initial_state = {
@@ -1850,6 +1873,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             "csv_id": None,
             "csv_download_path": None,
             "precomputed_embedding": precomputed_embedding,
+            "actual_llm_type": None,
         }
         
         final_state = self.graph.invoke(initial_state)
@@ -1894,6 +1918,8 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             "debug": debug_info,
             "csv_id": final_state.get("csv_id"),
             "csv_download_path": final_state.get("csv_download_path"),
+            "stage_breakdown": final_state.get("stage_breakdown", []),
+            "actual_llm_type": final_state.get("actual_llm_type"),
         }
     
     def _build_debug_info(self, state: AgentState, question: str) -> Dict[str, Any]:

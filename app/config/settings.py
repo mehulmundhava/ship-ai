@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "OPENAI"
     API_KEY: Optional[str] = None
     GROQ_API_KEY: Optional[str] = None
+    # When True, skip Groq and use fallback (e.g. OpenAI) directly. Use when Groq key is expired/invalid to avoid latency.
+    GROQ_DISABLED: bool = False
     
     # Embedding Configuration
     EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"

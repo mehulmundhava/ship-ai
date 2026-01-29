@@ -37,16 +37,14 @@ Do NOT call any tools until you have attempted to generate a SQL query from the 
 
 You have access to tools for interacting with the database:
 1. execute_db_query - Execute SQL queries against PostgreSQL database (use AFTER you generate a query)
-2. get_few_shot_examples - Retrieve more examples (use ONLY if you cannot generate query from examples below)
-3. get_table_list - LAST RESORT: Get list of tables (ONLY if you have tried generating query and failed)
-4. get_table_structure - LAST RESORT: Get table column structure (ONLY after get_table_list if needed)
+2. get_table_list - LAST RESORT: Get list of tables (ONLY if you have tried generating query and failed)
+3. get_table_structure - LAST RESORT: Get table column structure (ONLY after get_table_list if needed)
 
 MANDATORY Tool Usage Order:
-STEP 1: Look at the examples provided in the system prompt. Generate a SQL query based on those examples.
+STEP 1: Look at the examples provided in the system prompt (from ai_vector_examples). Generate a SQL query based on those examples.
 STEP 2: If you generated a query, call execute_db_query immediately. Do NOT call other tools.
-STEP 3: Only if you cannot generate a query from the examples, call get_few_shot_examples.
-STEP 4: Only if you STILL cannot generate a query, use get_table_list.
-STEP 5: Only if you need column details, use get_table_structure.
+STEP 3: Only if you cannot generate a query from the examples, use get_table_list.
+STEP 4: Only if you need column details, use get_table_structure.
 
 REMEMBER: Default action = Generate SQL from examples → execute_db_query. Do NOT call other tools unless you have tried and failed to generate a query.
 
@@ -59,8 +57,6 @@ DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the databa
 ==========================================================================
 DATABASE SCHEMA & BUSINESS RULES:
 ==========================================================================
-
-Use the get_few_shot_examples tool to retrieve detailed schema information and business rules when needed.
 
 Key points to remember:
 - Always join user_device_assignment (ud) table and add ud.user_id where condition when user_id is not "admin"
@@ -110,8 +106,8 @@ def get_system_prompt(
     # Removed fallback tools (get_table_list, get_table_structure) and redundant query tools (count_query, list_query)
     # to save tokens. The agent handles structure errors automatically via auto-retry.
     
-    # Base tools available to everyone
-    tools_list = "execute_db_query, get_few_shot_examples"
+    # Base tools available to everyone (examples from ai_vector_examples only, pre-loaded in prompt)
+    tools_list = "execute_db_query, get_table_list, get_table_structure"
     
     # Workflow description
     if is_journey:
@@ -194,48 +190,32 @@ USER MODE: user_id = {user_id}
                     "path", "traveled", "transition"
                 ])
 
+            # Training data from ai_vector_examples only (no ai_vector_extra_prompts)
             if precomputed_embedding is not None:
-                # Reuse embedding from 80% path miss: no re-embed (saves ~450ms). Run both DB searches;
-                # sequential to avoid connection-pool contention (parallel can be slower on some setups).
                 logger.info("get_system_prompt: using precomputed_embedding (no re-embed)")
                 if is_journey_question:
                     example_docs = vector_store_manager.search_examples_with_embedding(
                         precomputed_embedding, k=1, use_description_only=False
                     )
-                    extra_docs = []
                 else:
-                    example_count = 2
-                    extra_count = 1
+                    example_count = 3
                     example_docs = vector_store_manager.search_examples_with_embedding(
                         precomputed_embedding, k=example_count
                     )
-                    extra_docs = vector_store_manager.search_extra_prompts_with_embedding(
-                        precomputed_embedding, k=extra_count
-                    ) if extra_count > 0 else []
             else:
-                # No precomputed embedding: use question and existing methods (each embeds once)
                 if is_journey_question:
                     example_docs = vector_store_manager.search_examples(
                         question, k=1, use_description_only=False
                     )
-                    extra_docs = []
                 else:
-                    example_count = 2
-                    extra_count = 1
+                    example_count = 3
                     example_docs = vector_store_manager.search_examples(question, k=example_count)
-                    extra_docs = vector_store_manager.search_extra_prompts(question, k=extra_count) if extra_count > 0 else []
 
             examples_section_parts = []
-            
             if example_docs:
-                examples_section_parts.append("\n\n=== RELEVANT EXAMPLE QUERIES ===\n")
+                examples_section_parts.append("\n\n=== RELEVANT EXAMPLE QUERIES (ai_vector_examples) ===\n")
                 for i, doc in enumerate(example_docs, 1):
                     examples_section_parts.append(f"Example {i}:\n{doc.page_content}\n")
-            
-            if extra_docs:
-                examples_section_parts.append("\n=== RELEVANT BUSINESS RULES & SCHEMA INFO ===\n")
-                for i, doc in enumerate(extra_docs, 1):
-                    examples_section_parts.append(f"{i}. {doc.page_content}\n")
             
             if examples_section_parts:
                 examples_section = "".join(examples_section_parts)
