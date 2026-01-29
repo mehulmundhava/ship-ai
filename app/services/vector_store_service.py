@@ -114,9 +114,14 @@ class VectorStoreService:
             List of similar example documents
         """
         try:
+            # #region agent log
+            _t0 = __import__("time").perf_counter()
+            # #endregion
             # Generate embedding for the query
             query_embedding = self.embed_query(query)
-            
+            # #region agent log
+            _t1 = __import__("time").perf_counter()
+            # #endregion
             # Convert to PostgreSQL array format string for vector type
             # pgvector expects the format: '[1,2,3]'::vector
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
@@ -153,6 +158,15 @@ class VectorStoreService:
             with self.engine.connect() as conn:
                 result = conn.execute(search_query, query_params)
                 rows = result.fetchall()
+            # #region agent log
+            _t2 = __import__("time").perf_counter()
+            try:
+                _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "B", "location": "vector_store_service.py:search_examples", "message": "search_examples embed vs db", "data": {"embed_ms": round((_t1 - _t0) * 1000), "db_ms": round((_t2 - _t1) * 1000), "k": k}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                _f.close()
+            except Exception:
+                pass
+            # #endregion
             
             # Convert results to Document objects
             documents = []
@@ -210,9 +224,14 @@ class VectorStoreService:
             List of relevant prompt documents
         """
         try:
+            # #region agent log
+            _t0 = __import__("time").perf_counter()
+            # #endregion
             # Generate embedding for the query
             query_embedding = self.embed_query(query)
-            
+            # #region agent log
+            _t1 = __import__("time").perf_counter()
+            # #endregion
             # Convert to PostgreSQL array format string for vector type
             # pgvector expects the format: '[1,2,3]'::vector
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
@@ -247,6 +266,15 @@ class VectorStoreService:
             with self.engine.connect() as conn:
                 result = conn.execute(search_query, query_params)
                 rows = result.fetchall()
+            # #region agent log
+            _t2 = __import__("time").perf_counter()
+            try:
+                _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "B", "location": "vector_store_service.py:search_extra_prompts", "message": "search_extra_prompts embed vs db", "data": {"embed_ms": round((_t1 - _t0) * 1000), "db_ms": round((_t2 - _t1) * 1000), "k": k}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                _f.close()
+            except Exception:
+                pass
+            # #endregion
             
             # Convert results to Document objects
             documents = []
@@ -279,7 +307,108 @@ class VectorStoreService:
         except Exception as e:
             logger.warning(f"Error searching extra prompts: {e}")
             return []
-    
+
+    def search_examples_with_embedding(
+        self,
+        embedding: List[float],
+        k: int = 3,
+        example_id: Optional[int] = None,
+        use_description_only: bool = False,
+    ) -> List[Document]:
+        """Search examples by precomputed embedding (no embed_query). Used when 80% path misses."""
+        try:
+            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+            where_conditions = [f"{self.embedding_field_name} IS NOT NULL"]
+            query_params = {"k": k}
+            if example_id is not None:
+                where_conditions.append("id = :example_id")
+                query_params["example_id"] = example_id
+            where_clause = " AND ".join(where_conditions)
+            search_query = text(f"""
+                SELECT id, question, sql_query, description, metadata,
+                    {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
+                FROM ai_vector_examples
+                WHERE {where_clause}
+                ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
+                LIMIT :k
+            """)
+            with self.engine.connect() as conn:
+                result = conn.execute(search_query, query_params)
+                rows = result.fetchall()
+            documents = []
+            for row in rows:
+                content_parts = [f"Question: {row.question}"]
+                if use_description_only and row.description:
+                    content_parts.append(f"Description: {row.description}")
+                else:
+                    if row.description:
+                        content_parts.append(f"Description: {row.description}")
+                    content_parts.append(f"\nSQL Query:\n{row.sql_query}")
+                content = "\n\n".join(content_parts)
+                if isinstance(row.metadata, dict):
+                    metadata = row.metadata.copy()
+                elif isinstance(row.metadata, str):
+                    try:
+                        metadata = json.loads(row.metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                else:
+                    metadata = {}
+                metadata["distance"] = float(row.distance) if row.distance else None
+                metadata["id"] = row.id
+                documents.append(Document(page_content=content, metadata=metadata))
+            return documents
+        except Exception as e:
+            logger.warning(f"Error searching examples with embedding: {e}")
+            return []
+
+    def search_extra_prompts_with_embedding(
+        self,
+        embedding: List[float],
+        k: int = 2,
+        extra_prompts_id: Optional[int] = None,
+    ) -> List[Document]:
+        """Search extra prompts by precomputed embedding (no embed_query). Used when 80% path misses."""
+        try:
+            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+            where_conditions = [f"{self.embedding_field_name} IS NOT NULL"]
+            query_params = {"k": k}
+            if extra_prompts_id is not None:
+                where_conditions.append("id = :extra_prompts_id")
+                query_params["extra_prompts_id"] = extra_prompts_id
+            where_clause = " AND ".join(where_conditions)
+            search_query = text(f"""
+                SELECT id, content, note_type, metadata,
+                    {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
+                FROM ai_vector_extra_prompts
+                WHERE {where_clause}
+                ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
+                LIMIT :k
+            """)
+            with self.engine.connect() as conn:
+                result = conn.execute(search_query, query_params)
+                rows = result.fetchall()
+            documents = []
+            for row in rows:
+                if isinstance(row.metadata, dict):
+                    metadata = row.metadata.copy()
+                elif isinstance(row.metadata, str):
+                    try:
+                        metadata = json.loads(row.metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                else:
+                    metadata = {}
+                if row.note_type:
+                    metadata["note_type"] = row.note_type
+                metadata["distance"] = float(row.distance) if row.distance else None
+                metadata["id"] = row.id
+                documents.append(Document(page_content=row.content, metadata=metadata))
+            return documents
+        except Exception as e:
+            logger.warning(f"Error searching extra prompts with embedding: {e}")
+            return []
+
     def reload_stores(self):
         """
         Reload vector stores from PostgreSQL.

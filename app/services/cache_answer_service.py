@@ -290,7 +290,13 @@ class CacheAnswerService:
         # 0.80 bar is fixed in code; no env flag. If similarity ≥ 0.80, use example SQL.
         threshold = 0.80
         try:
+            # #region agent log
+            _t0 = __import__("time").perf_counter()
+            # #endregion
             query_embedding = self.vector_store.embed_query(question)
+            # #region agent log
+            _t1 = __import__("time").perf_counter()
+            # #endregion
             embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
             # Base-columns-only query: no entry_type, is_active, question_type, user_type
@@ -311,6 +317,15 @@ class CacheAnswerService:
             with self.engine.connect() as conn:
                 result = conn.execute(search_query)
                 candidates = result.fetchall()
+            # #region agent log
+            _t2 = __import__("time").perf_counter()
+            try:
+                _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "location": "cache_answer_service.py:80_path", "message": "80% path embed vs db", "data": {"embed_ms": round((_t1 - _t0) * 1000), "db_ms": round((_t2 - _t1) * 1000), "phase": "80_path"}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                _f.close()
+            except Exception:
+                pass
+            # #endregion
 
             if not candidates:
                 logger.debug("80% path: No candidates found in ai_vector_examples")
@@ -354,7 +369,8 @@ class CacheAnswerService:
 
             top = top_similarities[0] if top_similarities else 0.0
             logger.info(f"[80% path] miss top={top:.4f} threshold={threshold}")
-            return None
+            # Return miss payload with query_embedding so controller can pass it to agent (avoids re-embedding twice)
+            return {"_miss": True, "query_embedding": query_embedding}
         except Exception as e:
             logger.warning(f"80% match-and-execute error: {e}")
             return None

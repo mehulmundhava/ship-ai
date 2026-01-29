@@ -430,10 +430,16 @@ class QuerySQLDatabaseTool:
                 # For other errors, return error message (similar to run_no_throw behavior)
                 return f"Error executing query: {str(e)}"
         
+        # #region agent log
+        _t_sql_start = __import__("time").perf_counter()
+        # #endregion
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(_execute_query)
                 output = future.result(timeout=QUERY_TIMEOUT_SECONDS + 10)  # Add 10s buffer
+            # #region agent log
+            _t_sql_end = __import__("time").perf_counter()
+            # #endregion
         except FutureTimeoutError:
             # Python-level timeout occurred - query should be killed by PostgreSQL
             error_msg = f"Query execution exceeded {QUERY_TIMEOUT_SECONDS} seconds and was killed."
@@ -516,7 +522,19 @@ class QuerySQLDatabaseTool:
             # If > 5 rows, format with CSV
             if row_count > 5:
                 print(f"   Large result detected ({row_count} rows), generating CSV...")
+                # #region agent log
+                _t_csv_start = __import__("time").perf_counter()
+                # #endregion
                 formatted_result = format_result_with_csv(result, max_preview_rows=5)
+                # #region agent log
+                _t_csv_end = __import__("time").perf_counter()
+                try:
+                    _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                    _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "D", "location": "agent_tools.py:execute_db_query", "message": "tool_exec sql vs csv", "data": {"sql_ms": round((_t_sql_end - _t_sql_start) * 1000), "csv_ms": round((_t_csv_end - _t_csv_start) * 1000), "row_count": row_count}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                    _f.close()
+                except Exception:
+                    pass
+                # #endregion
                 print(f"   Formatted result with CSV link")
                 print(f"{'='*80}\n")
                 return formatted_result

@@ -5,6 +5,10 @@ This module contains system prompts with optional pre-loaded examples.
 Examples are retrieved from PostgreSQL vector store (pgvector) and embedded in the initial prompt
 to reduce token usage by eliminating the need for a separate tool call.
 """
+import logging
+from typing import Optional, List
+
+logger = logging.getLogger("ship_rag_ai")
 
 # Security and access control instructions
 STRICT_INSTRUCTION = """
@@ -79,12 +83,13 @@ JOURNEY CALCULATION RULES (CRITICAL):
 
 
 def get_system_prompt(
-    user_id: str, 
+    user_id: str,
     top_k: int = 20,
     question: str = None,
     vector_store_manager = None,
     preload_examples: bool = True,
-    is_journey: bool = False
+    is_journey: bool = False,
+    precomputed_embedding: Optional[List[float]] = None,
 ) -> str:
     """
     Get the complete system prompt with optional pre-loaded examples.
@@ -96,6 +101,7 @@ def get_system_prompt(
         vector_store_manager: VectorStoreService instance for retrieving examples
         preload_examples: Whether to pre-load 1-2 examples in the prompt
         is_journey: Whether the question is about journeys/movement
+        precomputed_embedding: Optional embedding from 80% path miss to avoid re-embedding (saves ~450ms)
         
     Returns:
         Complete system prompt string with optional examples
@@ -177,35 +183,48 @@ USER MODE: user_id = {user_id}
         main_prompt = "\n\n".join([base_prompt, user_prompt])
     
     # Pre-load examples if requested and parameters are provided
-    if preload_examples and question and vector_store_manager:
+    if preload_examples and (question or precomputed_embedding is not None) and vector_store_manager:
         try:
             # Check if this is a journey question
-            # Determine if we should treat as journey question based on input flag or keywords
             is_journey_question = is_journey
             if not is_journey_question and question:
-                 question_lower = question.lower()
-                 is_journey_question = any(keyword in question_lower for keyword in [
-                    "journey", "movement", "facility to facility", "entered", "exited", 
+                question_lower = question.lower()
+                is_journey_question = any(keyword in question_lower for keyword in [
+                    "journey", "movement", "facility to facility", "entered", "exited",
                     "path", "traveled", "transition"
                 ])
-            
-            # OPTIMIZATION 2: Load minimal examples for journey questions (need SQL structure reference)
-            if is_journey_question:
-                # Load 1 example to show correct SQL structure (table names, joins)
-                # Use description-only format to save tokens (Optimization 3)
-                example_docs = vector_store_manager.search_examples(
-                    question, 
-                    k=1,
-                    use_description_only=False  # Need SQL structure, so include SQL
-                )
-                extra_docs = []
+
+            if precomputed_embedding is not None:
+                # Reuse embedding from 80% path miss: no re-embed (saves ~450ms). Run both DB searches;
+                # sequential to avoid connection-pool contention (parallel can be slower on some setups).
+                logger.info("get_system_prompt: using precomputed_embedding (no re-embed)")
+                if is_journey_question:
+                    example_docs = vector_store_manager.search_examples_with_embedding(
+                        precomputed_embedding, k=1, use_description_only=False
+                    )
+                    extra_docs = []
+                else:
+                    example_count = 2
+                    extra_count = 1
+                    example_docs = vector_store_manager.search_examples_with_embedding(
+                        precomputed_embedding, k=example_count
+                    )
+                    extra_docs = vector_store_manager.search_extra_prompts_with_embedding(
+                        precomputed_embedding, k=extra_count
+                    ) if extra_count > 0 else []
             else:
-                # Non-journey questions still need examples
-                example_count = 2
-                extra_count = 1
-                example_docs = vector_store_manager.search_examples(question, k=example_count)
-                extra_docs = vector_store_manager.search_extra_prompts(question, k=extra_count) if extra_count > 0 else []
-            
+                # No precomputed embedding: use question and existing methods (each embeds once)
+                if is_journey_question:
+                    example_docs = vector_store_manager.search_examples(
+                        question, k=1, use_description_only=False
+                    )
+                    extra_docs = []
+                else:
+                    example_count = 2
+                    extra_count = 1
+                    example_docs = vector_store_manager.search_examples(question, k=example_count)
+                    extra_docs = vector_store_manager.search_extra_prompts(question, k=extra_count) if extra_count > 0 else []
+
             examples_section_parts = []
             
             if example_docs:

@@ -56,6 +56,7 @@ class AgentState(TypedDict):
     stage_breakdown: Optional[List[Dict[str, Any]]]  # Per-stage timing and token counts for request summary
     csv_id: Optional[str]  # CSV download ID for API response (relative path: /download-csv/{csv_id})
     csv_download_path: Optional[str]  # Relative path e.g. /download-csv/{uuid} for UI/Postman
+    precomputed_embedding: Optional[List[float]]  # From 80% path miss to avoid re-embedding in get_system_prompt
 
 
 class SQLAgentGraph:
@@ -887,7 +888,8 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 question=state["question"],
                 vector_store_manager=self.vector_store_manager,
                 preload_examples=True,
-                is_journey=is_journey
+                is_journey=is_journey,
+                precomputed_embedding=state.get("precomputed_embedding"),
             )
             elapsed_vector = time.perf_counter() - t_vector
             logger.info(f"process=vector_search time={elapsed_vector:.2f}s")
@@ -1818,12 +1820,13 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             "final_answer": final_answer
         }
     
-    def invoke(self, question: str) -> Dict[str, Any]:
+    def invoke(self, question: str, precomputed_embedding: Optional[List[float]] = None) -> Dict[str, Any]:
         """
         Process a question and return results.
         
         Args:
             question: User's natural language question
+            precomputed_embedding: Optional embedding from 80% path miss to avoid re-embedding in get_system_prompt
             
         Returns:
             Dictionary with answer, SQL query, and results
@@ -1846,6 +1849,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
             "stage_breakdown": [],
             "csv_id": None,
             "csv_download_path": None,
+            "precomputed_embedding": precomputed_embedding,
         }
         
         final_state = self.graph.invoke(initial_state)

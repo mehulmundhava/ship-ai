@@ -85,6 +85,7 @@ def process_chat(
 
     # Match-and-execute service (80% path: base example columns only, no cache)
     cache_service = CacheAnswerService(vector_store, sql_db=sql_db, user_id=payload.user_id)
+    precomputed_embedding = None  # set when 80% path misses so agent can reuse (saves ~450ms)
 
     # 80% match-and-execute: always check. Base columns only, no cache. If similarity ≥ 0.80,
     # run example SQL (adapted or as-is) and return without LLM.
@@ -94,7 +95,12 @@ def process_chat(
             question=payload.question,
             question_type=question_type,
         )
-        if match_result:
+        # Miss payload: {"_miss": True, "query_embedding": [...]} — pass embedding to agent to avoid re-embedding
+        if match_result and match_result.get("_miss"):
+            precomputed_embedding = match_result.get("query_embedding")
+            elapsed_80 = time.perf_counter() - t0
+            logger.info(f"[80% path] miss in {elapsed_80:.2f}s → LLM (reusing embedding)")
+        elif match_result:
             elapsed = time.perf_counter() - t0
             logger.info(f"[80% path] hit in {elapsed:.2f}s similarity={match_result['similarity']:.4f}")
             result_data = match_result.get("result_data") or {}
@@ -137,16 +143,19 @@ def process_chat(
                 chat_history_length=len(payload.chat_history or []),
             )
             return resp
-        elapsed_80 = time.perf_counter() - t0
-        logger.info(f"[80% path] miss in {elapsed_80:.2f}s → LLM")
+        if match_result is None:
+            precomputed_embedding = None
+            elapsed_80 = time.perf_counter() - t0
+            logger.info(f"[80% path] miss in {elapsed_80:.2f}s → LLM")
     except Exception as e:
         logger.warning(f"80% match failed (continuing with LLM): {e}")
+        precomputed_embedding = None
 
     # No ≥80% match or execution failed — proceed with LLM
     llm_type = None  # Set when LLM is used (e.g. OPENAI/gpt-4o)
     t_request = time.perf_counter()
 
-    # Process user question
+    # Process user question (precomputed_embedding from 80% path miss avoids re-embedding in get_system_prompt)
     try:
         logger.info(f"[chat] user_id={payload.user_id} question_len={len(payload.question)} history_len={len(payload.chat_history or [])}")
         
@@ -165,8 +174,8 @@ def process_chat(
             top_k=20
         )
         
-        # Process the question
-        result = agent.invoke(payload.question)
+        # Process the question (pass precomputed_embedding when 80% path missed to save ~450ms)
+        result = agent.invoke(payload.question, precomputed_embedding=precomputed_embedding)
         elapsed_request = time.perf_counter() - t_request
         logger.info(f"[chat] agent done in {elapsed_request:.2f}s")
         
