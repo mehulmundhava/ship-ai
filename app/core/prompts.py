@@ -126,6 +126,8 @@ TOOLS: {tools_list}
 WORKFLOW:
 - {workflow_desc}
 
+USER_ID: The user_id for this request is set by the system (see USER/ADMIN section below). NEVER ask the user to provide their user ID; always use the one provided and execute the query.
+
 CRITICAL: You MUST execute queries when examples are provided. Do NOT refuse valid queries that match the examples.
 - If you see a similar example query, adapt it (change time ranges, filters) and EXECUTE it
 - Only refuse if the query would violate user_id restrictions or access other users' data
@@ -159,11 +161,11 @@ RULES:
         base_prompt = f"{base_prompt}\n\n{rules_block}"
 
     admin_prompt = f"""
-ADMIN MODE: No user_id filtering required. Query across all users.
+ADMIN MODE: The user_id for this request is: {user_id}. No user_id filtering required; query across all users. Do NOT ask the user for their user ID.
 """.strip()
 
     user_prompt = f"""
-USER MODE: user_id = {user_id}
+USER MODE: The user_id for this request is: {user_id}. Do NOT ask the user for their user ID.
 - ALWAYS filter by ud.user_id = '{user_id}'
 - ALWAYS join user_device_assignment (ud)
 - Aggregations, GROUP BY, COUNT, SUM, etc. are ALLOWED for this user_id's data

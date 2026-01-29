@@ -1839,7 +1839,24 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                 logger.error(f"Error executing SQL from final message: {exec_error}")
                                 logger.exception("SQL execution error in format_answer")
                     
-                    final_answer = last_ai_message.content
+                    # If the model incorrectly asked for user ID, don't surface that—user_id is already set
+                    last_content = (last_ai_message.content or "").strip().lower()
+                    ask_user_id_phrases = (
+                        "provide your user id",
+                        "provide your user id so",
+                        "please provide your user id",
+                        "user id so i can",
+                        "your user id",
+                    )
+                    if any(phrase in last_content for phrase in ask_user_id_phrases):
+                        current_user_id = state.get("user_id", "")
+                        logger.warning("Last AI message asked for user ID; user_id is already set, overriding response")
+                        final_answer = (
+                            f"Your user ID is already set for this session ({current_user_id}). "
+                            "I'll use it to run your query. Please try asking your question again so I can execute it."
+                        )
+                    else:
+                        final_answer = last_ai_message.content
                 else:
                     logger.warning("No suitable AI message found for final answer")
                     final_answer = "I couldn't generate a response to your question."
