@@ -436,8 +436,8 @@ def search_embedding(
         # Convert to PostgreSQL array format string
         embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
         
-        # Get the embedding field name based on the model
-        embedding_field = settings.get_embedding_field_name()
+        # Use bge_large_embedding field for search
+        embedding_field = 'bge_large_embedding'
         print(f"   Using embedding field: {embedding_field}")
         
         # Execute the search query using CTE (Common Table Expression)
@@ -450,7 +450,7 @@ def search_embedding(
             )
             SELECT
                 a.id,
-                COALESCE(a.content, a.question, '') AS content,
+                a.question,
                 1 - (a.{embedding_field} <=> q.query_embedding) AS similarity
             FROM public.ai_vector_examples AS a
             CROSS JOIN query AS q
@@ -469,7 +469,7 @@ def search_embedding(
         for row in rows:
             results.append(SearchEmbeddingResult(
                 id=row.id,
-                content=row.content if row.content else "",
+                content=row.question if row.question else "",
                 similarity=float(row.similarity) if row.similarity is not None else 0.0
             ))
         
