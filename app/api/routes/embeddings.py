@@ -6,12 +6,18 @@ from fastapi import APIRouter, Request
 from app.controllers.embeddings_controller import (
     reload_vector_store,
     generate_embeddings_examples,
-    generate_embeddings_extra_prompts
+    generate_embeddings_extra_prompts,
+    get_text_embedding,
+    search_embedding
 )
 from app.models.schemas import (
     GenerateEmbeddingsRequest,
     GenerateEmbeddingsResponse,
-    ReloadVectorStoreResponse
+    ReloadVectorStoreResponse,
+    GetTextEmbeddingRequest,
+    GetTextEmbeddingResponse,
+    SearchEmbeddingRequest,
+    SearchEmbeddingResponse
 )
 
 router = APIRouter()
@@ -48,4 +54,38 @@ def generate_embeddings_extra_prompts_route(request: Request, payload: GenerateE
     """
     vector_store = request.app.state.vector_store
     return generate_embeddings_extra_prompts(payload, vector_store)
+
+
+@router.post("/get-text-embedding", response_model=GetTextEmbeddingResponse)
+def get_text_embedding_route(request: Request, payload: GetTextEmbeddingRequest):
+    """
+    Get Embedding for Given Text
+    
+    Generates and returns embedding vector for the provided text.
+    """
+    vector_store = request.app.state.vector_store
+    return get_text_embedding(payload, vector_store)
+
+
+@router.post("/search-embedding", response_model=SearchEmbeddingResponse)
+def search_embedding_route(request: Request, payload: SearchEmbeddingRequest):
+    """
+    Search Embedding in PostgreSQL Table
+    
+    Generates embedding for the provided text and searches the ai_vector_examples
+    table for similar records using cosine similarity.
+    
+    Request Body:
+    - text: The text to search for (required)
+    - limit: Number of results to return (default: 5)
+    
+    Returns:
+    - status: "success" or "error"
+    - text: The search text
+    - limit: The limit used
+    - results: List of search results with id, content, and similarity score
+    - total_results: Total number of results found
+    """
+    vector_store = request.app.state.vector_store
+    return search_embedding(payload, vector_store)
 
