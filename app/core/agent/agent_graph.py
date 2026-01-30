@@ -13,13 +13,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_community.utilities.sql_database import SQLDatabase
 from app.core.agent.agent_tools import (
-    create_get_few_shot_examples_tool, 
     create_execute_db_query_tool,
     create_get_table_list_tool,
     create_get_table_structure_tool,
     create_count_query_tool,
     create_list_query_tool,
-    create_get_extra_examples_tool,
     create_journey_list_tool,
     create_journey_count_tool
 )
@@ -28,35 +26,16 @@ from app.services.vector_store_service import VectorStoreService
 from app.config.settings import settings
 import logging
 import re
+import time
 
 # Get logger for this module
 logger = logging.getLogger("ship_rag_ai")
 
 
-def log_message_sequence(messages: List, step_name: str):
-    """Helper function to log message sequence in a readable format."""
-    print(f"\n{'='*80}")
-    print(f"📋 {step_name} - Message Sequence ({len(messages)} messages)")
-    print(f"{'='*80}")
-    for i, msg in enumerate(messages):
-        if isinstance(msg, SystemMessage):
-            content_preview = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
-            print(f"[{i}] SystemMessage: {content_preview}")
-        elif isinstance(msg, HumanMessage):
-            print(f"[{i}] HumanMessage: {msg.content}")
-        elif isinstance(msg, AIMessage):
-            tool_calls_info = ""
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tool_calls_info = f" (tool_calls: {[tc.get('name') for tc in msg.tool_calls]})"
-            content_preview = (msg.content[:100] + "...") if msg.content and len(msg.content) > 100 else (msg.content or "[No content]")
-            print(f"[{i}] AIMessage: {content_preview}{tool_calls_info}")
-        elif isinstance(msg, ToolMessage):
-            content_preview = (msg.content[:100] + "...") if len(msg.content) > 100 else msg.content
-            print(f"[{i}] ToolMessage: name={getattr(msg, 'name', 'unknown')}, tool_call_id={getattr(msg, 'tool_call_id', 'unknown')}")
-            print(f"     Content: {content_preview}")
-        else:
-            print(f"[{i}] {type(msg).__name__}: {str(msg)[:100]}")
-    print(f"{'='*80}\n")
+def _log_messages_debug(messages: List, step_name: str):
+    """Log message sequence only at DEBUG level."""
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[{step_name}] messages={len(messages)}")
 
 
 class AgentState(TypedDict):
@@ -72,12 +51,20 @@ class AgentState(TypedDict):
     token_usage: Optional[Dict[str, int]]  # Track token usage: input, output, total
     query_validated: Optional[bool]  # Track if user query has been validated
     llm_call_history: Optional[List[Dict[str, Any]]]  # Track what was sent/received for each LLM call
+    stage_breakdown: Optional[List[Dict[str, Any]]]  # Per-stage timing and token counts for request summary
+    csv_id: Optional[str]  # CSV download ID for API response (relative path: /download-csv/{csv_id})
+    csv_download_path: Optional[str]  # Relative path e.g. /download-csv/{uuid} for UI/Postman
+    precomputed_embedding: Optional[List[float]]  # From 80% path miss to avoid re-embedding in get_system_prompt
+    preloaded_example_docs: Optional[List]  # From 80% path miss to skip duplicate vector search (~1.5s)
+    actual_llm_type: Optional[str]  # Actual provider/model used (e.g. OPENAI/gpt-4o when fallback used)
 
 
 class SQLAgentGraph:
     """
     LangGraph-based SQL agent with RAG capabilities.
     """
+    # Process-level: after first Groq 401 in this process, skip Groq for all requests until restart
+    _groq_401_seen_process: bool = False
     
     def __init__(
         self,
@@ -102,20 +89,20 @@ class SQLAgentGraph:
         self.vector_store_manager = vector_store_manager
         self.user_id = user_id
         self.top_k = top_k
+        # Per-request: after first Groq 401, skip Groq for rest of request to avoid repeated fail-then-fallback latency
+        self._groq_401_seen_this_request = False
         
         # Store provider info for fallback logic
         from app.services.llm_service import LLMService
         llm_service = LLMService()
         self.provider = llm_service.get_provider()
         
-        # Create tools
-        self.get_examples_tool = create_get_few_shot_examples_tool(vector_store_manager)
+        # Create tools (training data comes from ai_vector_examples only, loaded in system prompt)
         self.execute_db_query_tool = create_execute_db_query_tool(db, vector_store_manager)
         self.get_table_list_tool = create_get_table_list_tool(db)
         self.get_table_structure_tool = create_get_table_structure_tool(db)
         self.count_query_tool = create_count_query_tool(db)
         self.list_query_tool = create_list_query_tool(db)
-        self.get_extra_examples_tool = create_get_extra_examples_tool(vector_store_manager)
         self.journey_list_tool = create_journey_list_tool(db, user_id)
         self.journey_count_tool = create_journey_count_tool(db, user_id)
         
@@ -132,12 +119,11 @@ class SQLAgentGraph:
         ]
         
         # Regular tools (for non-journey questions)
-        # OPTIMIZATION: Reduced tool set to save tokens
-        # Removed: count_query_tool, list_query_tool (execute_db_query handles these)
-        # Removed: get_table_list, get_table_structure (fallback handled via auto-retry)
+        # Examples from ai_vector_examples only, pre-loaded in system prompt; get_table_* are last-resort fallbacks
         self.regular_tools = [
             self.execute_db_query_tool,
-            self.get_examples_tool
+            self.get_table_list_tool,
+            self.get_table_structure_tool,
         ]
         
         # Keep all tools for ToolNode (needs access to all tools for execution)
@@ -177,8 +163,7 @@ class SQLAgentGraph:
         
         # Only re-bind if tools changed
         if self._current_tools_bound != tool_type:
-            print(f"🔧 OPTIMIZATION: Binding {tool_type} tools only ({len(tools_to_bind)} tools) - saving ~{3000 if tool_type == 'journey' else 3000} tokens")
-            
+            logger.debug(f"Binding {tool_type} tools ({len(tools_to_bind)} tools)")
             # Groq-specific: Some models need explicit tool_choice or have tool calling issues
             # Try standard bind_tools first, but we'll catch errors and retry if needed
             try:
@@ -212,8 +197,7 @@ class SQLAgentGraph:
             llm_service = LLMService()
             self._fallback_llm = llm_service.get_fallback_llm_model()
             
-            logger.info("✅ Created ChatGPT fallback LLM instance")
-            print(f"✅ Created ChatGPT fallback LLM instance")
+            logger.debug("Created ChatGPT fallback LLM instance")
         
         # If tools are needed, bind them
         if use_tools:
@@ -246,8 +230,7 @@ class SQLAgentGraph:
             LLM response or synthetic AIMessage with tool calls, or None if all recovery fails
         """
         model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
-        logger.info(f"🔵 Using GROQ LLM: {model_name}")
-        print(f"🔵 Using GROQ LLM: {model_name}")
+        logger.debug(f"Using GROQ LLM: {model_name}")
         
         # Simple path: No tools needed (Security Guard, Format Answer, etc.)
         if not use_tools:
@@ -255,12 +238,20 @@ class SQLAgentGraph:
                 return self.llm.invoke(messages)
             except Exception as e:
                 error_str = str(e)
+                if "401" in error_str or "expired_api_key" in error_str:
+                    self._groq_401_seen_this_request = True
+                    SQLAgentGraph._groq_401_seen_process = True
+                    logger.warning(
+                        "Groq 401/invalid key: skipping Groq for this request, using OpenAI fallback. "
+                        "Full error (check for expired/deleted/limit): %s",
+                        error_str[:500] if len(error_str) > 500 else error_str,
+                    )
+                    return None
                 error_type = type(e).__name__
                 logger.warning(f"Groq invocation failed (no tools): {error_type} - {error_str[:200]}")
-                # For non-tool calls, just return None to trigger OpenAI fallback
                 return None
-        
-        # Tool calling path: Try with recovery mechanisms
+
+        # Tool calling path: Try with recovery mechanisms (except on 401 — do not retry Groq)
         error_str = None
         error_type = None
         
@@ -270,20 +261,27 @@ class SQLAgentGraph:
                 return self.llm_with_tools.invoke(messages)
             except Exception as tool_error:
                 error_str = str(tool_error)
+                if "401" in error_str or "expired_api_key" in error_str:
+                    self._groq_401_seen_this_request = True
+                    SQLAgentGraph._groq_401_seen_process = True
+                    logger.warning(
+                        "Groq 401/invalid key: skipping Groq for this request, using OpenAI fallback. "
+                        "Full error (check for expired/deleted/limit): %s",
+                        error_str[:500] if len(error_str) > 500 else error_str,
+                    )
+                    return None
                 error_type = type(tool_error).__name__
                 if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
                     logger.info("🔧 Groq tool calling failed, attempting recovery...")
-                    print(f"🔧 Groq tool calling failed, attempting recovery...")
-                    # Continue to recovery steps below
+                    logger.debug("Groq tool calling failed, attempting recovery")
                 else:
-                    # Non-tool-calling error, log and continue to recovery
                     logger.warning(f"Groq tool invocation error: {error_type} - {error_str[:200]}")
         
-        # Step 2: Try without tool binding (Groq might generate SQL in text)
+        # Step 2: Try without tool binding (Groq might generate SQL in text) — skip if 401 already handled above
         if use_tools:
             try:
                 logger.info("🔧 Attempting Groq recovery: invoking without tool binding...")
-                print(f"🔧 Attempting Groq recovery: invoking without tool binding...")
+                logger.debug("Attempting Groq recovery: invoking without tool binding")
                 response_without_tools = self.llm.invoke(messages)
                 
                 # Check if response contains SQL
@@ -294,7 +292,7 @@ class SQLAgentGraph:
                     if sql_match:
                         sql_query = sql_match.group(0).strip().rstrip(';')
                         logger.info(f"✅ Extracted SQL from Groq text response: {sql_query[:100]}...")
-                        print(f"✅ Extracted SQL from Groq text response")
+                        logger.debug("Extracted SQL from Groq text response")
                         # Create synthetic tool response
                         synthetic_response = self._create_synthetic_tool_response(
                             "execute_db_query",
@@ -305,15 +303,19 @@ class SQLAgentGraph:
                     else:
                         logger.warning("Groq response doesn't contain SQL")
             except Exception as recovery_error:
+                err_str = str(recovery_error)
+                if "401" in err_str or "expired_api_key" in err_str:
+                    self._groq_401_seen_this_request = True
+                    SQLAgentGraph._groq_401_seen_process = True
                 logger.warning(f"Groq recovery (no tools) failed: {recovery_error}")
                 if not error_str:
-                    error_str = str(recovery_error)
+                    error_str = err_str
                     error_type = type(recovery_error).__name__
         
         # Step 3: Try to extract SQL from error message (if we have one)
         if error_str and ("tool_use_failed" in error_str or "Failed to call a function" in error_str):
             logger.info("🔧 Attempting to extract SQL from Groq error message...")
-            print(f"🔧 Attempting to extract SQL from Groq error message...")
+            logger.debug("Attempting to extract SQL from Groq error message")
             extracted = self._extract_sql_from_groq_error(error_str)
             if extracted and use_tools:
                 try:
@@ -323,12 +325,15 @@ class SQLAgentGraph:
                         messages
                     )
                     logger.info("✅ Created synthetic response from Groq error extraction")
-                    print(f"✅ Recovered from Groq error - extracted SQL")
+                    logger.debug("Recovered from Groq error - extracted SQL")
                     return synthetic_response
                 except Exception as synth_error:
                     logger.warning(f"Failed to create synthetic response: {synth_error}")
         
         # If all Groq recovery attempts fail, return None to trigger OpenAI fallback
+        if error_str and ("401" in error_str or "expired_api_key" in error_str):
+            self._groq_401_seen_this_request = True
+            SQLAgentGraph._groq_401_seen_process = True
         logger.warning("All Groq recovery mechanisms failed")
         return None
     
@@ -345,8 +350,8 @@ class SQLAgentGraph:
             LLM response
         """
         model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
-        logger.info(f"🔵 Using OPENAI LLM: {model_name}")
-        print(f"🔵 Using OPENAI LLM: {model_name}")
+        logger.debug(f"Using OPENAI LLM: {model_name}")
+        logger.debug(f"Using OPENAI LLM: {model_name}")
         
         if use_tools and self.llm_with_tools:
             return self.llm_with_tools.invoke(messages)
@@ -356,58 +361,60 @@ class SQLAgentGraph:
     def _invoke_llm_with_fallback(self, messages, use_tools=False, question=""):
         """
         Invoke LLM with provider-specific handling and automatic fallback.
-        - Groq: Uses recovery mechanisms (tool calling → no tools → SQL extraction)
+        - Groq: Uses recovery mechanisms (tool calling → no tools → SQL extraction); on 401, no retry, use fallback.
         - OpenAI: Direct invocation
         - Fallback: Only if Groq completely fails, use OpenAI
         
-        Args:
-            messages: List of messages to send to LLM
-            use_tools: Whether to use tool binding (llm_with_tools)
-            question: Question text for tool binding (if use_tools=True)
-        
         Returns:
-            LLM response or synthetic AIMessage with tool calls
+            Tuple of (response, llm_type_used) where llm_type_used is e.g. "GROQ/llama-3.3-70b" or "OPENAI/gpt-4o"
         """
+        primary_model = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
+        primary_llm_type = f"{self.provider}/{primary_model}"
+
         # Route to provider-specific handler
         if self.provider == "GROQ":
-            # Try Groq with recovery mechanisms
-            groq_response = self._invoke_groq_with_recovery(messages, use_tools, question)
+            # Skip Groq if disabled via env, or 401 seen this request, or 401 seen this process (avoid repeated fail-then-fallback latency)
+            skip = (
+                getattr(settings, "GROQ_DISABLED", False)
+                or getattr(self, "_groq_401_seen_this_request", False)
+                or getattr(SQLAgentGraph, "_groq_401_seen_process", False)
+            )
+            if skip:
+                logger.info("Skipping Groq (GROQ_DISABLED or 401 seen), using fallback directly")
+                groq_response = None
+            else:
+                groq_response = self._invoke_groq_with_recovery(messages, use_tools, question)
             if groq_response is not None:
-                return groq_response
+                return groq_response, primary_llm_type
             
-            # Groq recovery failed, fall back to OpenAI
-            logger.warning("All Groq recovery mechanisms failed, falling back to OpenAI...")
-            print(f"⚠️  All Groq recovery mechanisms failed, falling back to OpenAI...")
+            # Groq failed for this request, fall back to OpenAI
+            logger.warning("Groq failed for this request, falling back to OpenAI")
         else:
             # OpenAI: direct invocation
             try:
-                return self._invoke_openai(messages, use_tools, question)
+                response = self._invoke_openai(messages, use_tools, question)
+                return response, primary_llm_type
             except Exception as e:
                 error_str = str(e)
                 error_type = type(e).__name__
                 logger.error(f"OpenAI invocation failed: {error_type} - {error_str[:200]}")
-                print(f"❌ OpenAI Error: {error_type}")
+                logger.debug(f"OpenAI Error: {error_type}")
                 raise
         
         # If we get here, Groq failed and we need to fall back to OpenAI
         try:
             fallback_llm = self._get_fallback_llm(use_tools, question)
             fallback_model_name = getattr(fallback_llm, 'model_name', None) or getattr(fallback_llm, 'model', None) or 'Unknown'
-            logger.info(f"🟢 Using FALLBACK LLM (OpenAI): {fallback_model_name}")
-            print(f"🟢 Using FALLBACK LLM (OpenAI): {fallback_model_name}")
+            fallback_llm_type = f"OPENAI/{fallback_model_name}"
+            logger.debug(f"Using FALLBACK LLM (OpenAI): {fallback_model_name}")
             
             response = fallback_llm.invoke(messages)
-            logger.info("✅ Successfully got response from OpenAI fallback")
-            print(f"✅ Successfully got response from OpenAI fallback")
-            return response
+            logger.debug("Got response from OpenAI fallback")
+            return response, fallback_llm_type
         except Exception as e2:
             logger.error(f"OpenAI fallback also failed: {e2}")
             logger.exception("OpenAI fallback error")
-            print(f"❌ OpenAI fallback also failed: {e2}")
             raise
-        
-        # This should never be reached, but just in case
-        raise Exception("All LLM invocation attempts failed")
     
     def _extract_sql_from_groq_error(self, error_str: str) -> Optional[Dict[str, Any]]:
         """
@@ -457,7 +464,7 @@ class SQLAgentGraph:
                     query = query.rstrip(';').strip()
                     if query and query.upper().startswith('SELECT'):
                         logger.info(f"✅ Extracted SQL query from Groq error (method 3): {query[:100]}...")
-                        print(f"🔧 Extracted SQL query from Groq error: {tool_name}")
+                        logger.debug(f"Extracted SQL from Groq error: {tool_name}")
                         return {"tool_name": tool_name, "args": {"query": query}}
             
             # Method 4: Even more permissive - find function tag and extract query separately
@@ -476,7 +483,7 @@ class SQLAgentGraph:
                     query = query.rstrip(';').strip()
                     if query and query.upper().startswith('SELECT'):
                         logger.info(f"✅ Extracted SQL query from Groq error (permissive method): {query[:100]}...")
-                        print(f"🔧 Extracted SQL query from Groq error: {tool_name}")
+                        logger.debug(f"Extracted SQL from Groq error: {tool_name}")
                         return {"tool_name": tool_name, "args": {"query": query}}
             
             if match:
@@ -499,7 +506,7 @@ class SQLAgentGraph:
                         args = json.loads(args_str)
                         
                         logger.info(f"✅ Extracted tool call from Groq error: {tool_name} with args")
-                        print(f"🔧 Extracted tool call from Groq error: {tool_name}")
+                        logger.debug(f"Extracted tool call from Groq error: {tool_name}")
                         return {"tool_name": tool_name, "args": args}
                     except json.JSONDecodeError as je:
                         logger.debug(f"JSON decode failed: {je}, trying regex extraction")
@@ -516,7 +523,7 @@ class SQLAgentGraph:
                             query = query.rstrip(';').strip()
                             if query and query.upper().startswith('SELECT'):
                                 logger.info(f"✅ Extracted SQL query from Groq error (regex): {query[:100]}...")
-                                print(f"🔧 Extracted SQL query from Groq error: {tool_name}")
+                                logger.debug(f"Extracted SQL from Groq error: {tool_name}")
                                 return {"tool_name": tool_name, "args": {"query": query}}
                         else:
                             logger.warning(f"Could not extract query from args_str: {args_str[:200]}")
@@ -558,7 +565,7 @@ class SQLAgentGraph:
         )
         
         logger.info(f"✅ Created synthetic AIMessage with tool call: {tool_name}")
-        print(f"🔧 Created synthetic response with tool call: {tool_name}")
+        logger.debug(f"Created synthetic response with tool call: {tool_name}")
         
         return synthetic_response
     
@@ -641,62 +648,30 @@ class SQLAgentGraph:
                     match = re.search(pattern, user_question, re.IGNORECASE)
                     if match:
                         from_facility = match.group(1).strip()
-                        logger.info(f"✅ Extracted from_facility from question: {from_facility}")
-                        print(f"✅ Extracted from_facility from question: {from_facility}")
+                        logger.debug(f"Extracted from_facility: {from_facility}")
                         break
             
             if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                print(f"\n{'='*80}")
-                print(f"🛠️  TOOL EXECUTION PHASE")
-                print(f"{'='*80}")
+                tool_names = [tc.get("name", "unknown") for tc in last_message.tool_calls]
                 for tc in last_message.tool_calls:
                     tool_name = tc.get("name", "unknown")
                     tool_args = tc.get("args", {})
-                    
-                    # Inject from_facility into journey tool params if extracted from question
                     if from_facility and tool_name in ["journey_list_tool", "journey_count_tool"]:
                         if not tool_args.get("params"):
                             tool_args["params"] = {}
                         if "from_facility" not in tool_args["params"]:
                             tool_args["params"]["from_facility"] = from_facility
-                            # Update the tool_call args directly (dicts are mutable)
                             tc["args"] = tool_args
-                            logger.info(f"✅ Injected from_facility={from_facility} into {tool_name} params")
-                            print(f"✅ Injected from_facility={from_facility} into {tool_name} params")
-                    
-                    print(f"📞 Calling Tool: {tool_name}")
-                    if tool_name in ["execute_db_query", "count_query", "list_query"]:
-                        print(f"   SQL Query: {tool_args.get('query', 'N/A')}")
-                    elif tool_name in ["get_few_shot_examples", "get_extra_examples"]:
-                        print(f"   Search Query: {tool_args.get('question', 'N/A')}")
-                    elif tool_name in ["journey_list_tool", "journey_count_tool"]:
-                        print(f"   SQL Query: {tool_args.get('sql', 'N/A')[:100]}...")
-                        if tool_args.get("params"):
-                            print(f"   Params: {tool_args.get('params')}")
-                print(f"{'='*80}\n")
+                t_tools = time.perf_counter()
+                result = tool_node.invoke(state)
+                elapsed_tools = time.perf_counter() - t_tools
+                logger.info(f"process=tool_exec time={elapsed_tools:.2f}s tools={tool_names}")
+                _breakdown = state.get("stage_breakdown", [])
+                _breakdown.append({"stage": "tool_exec", "elapsed_s": round(elapsed_tools, 3), "in": 0, "out": 0, "total": 0, "tools": tool_names})
+                result["stage_breakdown"] = _breakdown
             
-            # Execute tools - this will return a state with only ToolMessages
-            result = tool_node.invoke(state)
-            
-            # CRITICAL: Merge the preserved messages with the new ToolMessages
-            # The ToolNode returns only ToolMessages, so we need to append them to the full history
             new_tool_messages = result.get("messages", [])
-            
-            # Combine: preserved messages (System, Human, AI) + new ToolMessages
             combined_messages = preserved_messages + new_tool_messages
-            
-            # Log tool results
-            tool_messages = [m for m in new_tool_messages if isinstance(m, ToolMessage)]
-            if tool_messages:
-                print(f"\n{'='*80}")
-                print(f"✅ TOOL EXECUTION RESULTS")
-                print(f"{'='*80}")
-                for tm in tool_messages:
-                    content_preview = (tm.content[:300] + "...") if len(tm.content) > 300 else tm.content
-                    print(f"Tool: {getattr(tm, 'name', 'unknown')}")
-                    print(f"Result: {content_preview}")
-                    print(f"{'-'*80}")
-                print(f"{'='*80}\n")
             
             # Return state with complete message history
             return {
@@ -766,9 +741,7 @@ class SQLAgentGraph:
                             # Only auto-call if we haven't already and haven't exceeded max iterations
                             if iteration_count < 4 and not already_called:
                                 logger.info(f"🔍 Agent node: Detected column error for table {table_name}, auto-calling get_table_structure")
-                                print(f"\n{'='*80}")
-                                print(f"🔍 AGENT NODE: Auto-calling get_table_structure for {table_name}")
-                                print(f"{'='*80}\n")
+                                logger.debug(f"Auto-calling get_table_structure for {table_name}")
                                 
                                 try:
                                     table_structure_result = self.get_table_structure_tool.invoke({"table_names": table_name})
@@ -794,9 +767,7 @@ class SQLAgentGraph:
                                     messages.append(structure_message)
                                     state["messages"] = messages
                                     
-                                    logger.info(f"✅ Agent node: Retrieved table structure for {table_name}")
-                                    print(f"✅ Retrieved table structure for {table_name}")
-                                    print(f"{'='*80}\n")
+                                    logger.debug(f"Retrieved table structure for {table_name}")
                                 except Exception as e:
                                     logger.error(f"Error calling get_table_structure in agent node: {e}")
                                     import traceback
@@ -813,10 +784,7 @@ class SQLAgentGraph:
             # FIRST: Validate user query with security guard LLM call (saves tokens)
             # Only validate for non-admin users (admin can query across all users)
             if not query_validated and str(self.user_id).lower() != "admin":
-                print(f"\n{'='*80}")
-                print(f"🔍 STEP 1: Security Guard - Validating user query (User ID: {self.user_id})")
-                print(f"{'='*80}")
-                
+                t_security = time.perf_counter()
                 # OPTIMIZATION 4: Optimized security guard prompt - more concise
                 security_guard_prompt = f"""Security Guard. User ID: {self.user_id}
 
@@ -834,11 +802,10 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     HumanMessage(content=user_question)
                 ]
                 
-                print(f"🤖 Calling Security Guard LLM...")
-                security_response = self._invoke_llm_with_fallback(security_messages, use_tools=False, question=user_question)
+                security_response, llm_type_used = self._invoke_llm_with_fallback(security_messages, use_tools=False, question=user_question)
+                state["actual_llm_type"] = llm_type_used
                 security_decision = security_response.content.strip().upper() if hasattr(security_response, 'content') else ""
-                
-                # Track token usage for security guard call
+                elapsed_security = time.perf_counter() - t_security
                 security_token_usage = {"input": 0, "output": 0, "total": 0}
                 if hasattr(security_response, "response_metadata") and security_response.response_metadata:
                     usage = security_response.response_metadata.get("token_usage", {})
@@ -848,15 +815,15 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                             "output": usage.get("completion_tokens", 0),
                             "total": usage.get("total_tokens", 0)
                         }
-                        print(f"📊 Security Guard Token Usage: Input={security_token_usage['input']}, Output={security_token_usage['output']}, Total={security_token_usage['total']}")
-                
-                print(f"   Security Decision: {security_decision}")
-                
+                logger.info(f"process=security_guard time={elapsed_security:.2f}s in={security_token_usage['input']} out={security_token_usage['output']} total={security_token_usage['total']}")
+                _breakdown = state.get("stage_breakdown", [])
+                _breakdown.append({"stage": "security_guard", "elapsed_s": round(elapsed_security, 3), "in": security_token_usage["input"], "out": security_token_usage["output"], "total": security_token_usage["total"]})
+                state["stage_breakdown"] = _breakdown
+
                 # Check if query is blocked
                 if "BLOCK" in security_decision:
                     error_msg = "Sorry, I cannot provide that information."
-                    print(f"❌ User query is BLOCKED by Security Guard. Stopping execution.")
-                    print(f"{'='*80}\n")
+                    logger.warning("User query BLOCKED by Security Guard")
                     
                     # Update token usage
                     current_token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
@@ -894,11 +861,10 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         "query_validated": True,
                         "token_usage": updated_token_usage,
                         "llm_call_history": llm_call_history,
-                        "messages": [HumanMessage(content=state["question"])]  # Minimal message for graph
+                        "messages": [HumanMessage(content=state["question"])],
+                        "stage_breakdown": state.get("stage_breakdown", [])
                     }
                 else:
-                    print(f"✅ User query is ALLOWED by Security Guard. Proceeding with full prompt.")
-                    print(f"{'='*80}\n")
                     # Mark as validated and continue with full prompt setup
                     state["query_validated"] = True
                     
@@ -933,27 +899,32 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     "total": current_token_usage.get("total", 0) + security_token_usage["total"]
                 }
             elif not query_validated and str(self.user_id).lower() == "admin":
-                # Admin users skip security guard validation
-                print(f"\n{'='*80}")
-                print(f"🔍 STEP 1: Skipping Security Guard (Admin user)")
-                print(f"{'='*80}")
-                print(f"✅ Admin user - no validation needed. Proceeding with full prompt.")
-                print(f"{'='*80}\n")
                 state["query_validated"] = True
+                logger.info("process=security_guard time=0s skipped=admin")
+                _breakdown = state.get("stage_breakdown", [])
+                _breakdown.append({"stage": "security_guard", "elapsed_s": 0.0, "in": 0, "out": 0, "total": 0, "note": "skipped (admin)"})
+                state["stage_breakdown"] = _breakdown
             
             # Determine if this is a journey question for prompt optimization
             is_journey = self._is_journey_question(state["question"])
             
             # STEP 2: Initialize messages with FULL prompt (only if query is validated)
-            # Pre-load examples in the system prompt to reduce token usage
+            t_vector = time.perf_counter()
             system_prompt = get_system_prompt(
                 user_id=self.user_id,
                 top_k=self.top_k,
                 question=state["question"],
                 vector_store_manager=self.vector_store_manager,
                 preload_examples=True,
-                is_journey=is_journey
+                is_journey=is_journey,
+                precomputed_embedding=state.get("precomputed_embedding"),
+                preloaded_example_docs=state.get("preloaded_example_docs"),
             )
+            elapsed_vector = time.perf_counter() - t_vector
+            logger.info(f"process=vector_search time={elapsed_vector:.2f}s")
+            _breakdown = state.get("stage_breakdown", [])
+            _breakdown.append({"stage": "vector_search", "elapsed_s": round(elapsed_vector, 3), "in": 0, "out": 0, "total": 0})
+            state["stage_breakdown"] = _breakdown
             base_messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=state["question"])
@@ -964,12 +935,9 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             existing_tools = [m for m in messages if isinstance(m, ToolMessage)]
             
             messages = base_messages + existing_ai + existing_tools
-            print(f"📝 Initialized message sequence with FULL prompt ({len(messages)} messages)")
-            log_message_sequence(messages, "Initial Messages Created (After Validation)")
+            _log_messages_debug(messages, "Initial Messages Created (After Validation)")
         else:
             # Messages are already in good shape, just validate the sequence
-            print(f"📋 Processing {len(messages)} existing messages")
-            
             # Validate message order: ToolMessages must follow their corresponding AIMessage
             valid_messages = []
             for i, msg in enumerate(messages):
@@ -991,36 +959,9 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                                 break
                     
                     if not has_matching_ai:
-                        # ToolMessage without matching AIMessage - this shouldn't happen
-                        # but keep it anyway to preserve tool results
-                        print(f"⚠️  ToolMessage {tool_call_id} has no matching AIMessage, but keeping it")
                         valid_messages.append(msg)
             
             messages = valid_messages
-            
-            # Log message types
-            msg_types = [type(m).__name__ for m in messages]
-            print(f"   Message types: {msg_types}")
-        
-        # Before invoking LLM, ensure message sequence is valid
-        # CRITICAL: Keep ALL messages including ToolMessages - they contain tool results!
-        # The LLM needs to see the tool results to make decisions
-        print(f"🔍 Validating message sequence before LLM invocation...")
-        
-        # Count message types
-        msg_counts = {}
-        for msg in messages:
-            msg_type = type(msg).__name__
-            msg_counts[msg_type] = msg_counts.get(msg_type, 0) + 1
-        
-        print(f"   Message counts: {msg_counts}")
-        
-        # Check if we have ToolMessages
-        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
-        if tool_messages:
-            print(f"   ⚠️  Found {len(tool_messages)} ToolMessage(s) - these MUST be included so LLM can see tool results!")
-            for tm in tool_messages:
-                print(f"      - ToolMessage: name={getattr(tm, 'name', 'unknown')}, tool_call_id={getattr(tm, 'tool_call_id', 'unknown')}")
         
         # Filter out check_user_query_restriction tool messages from history
         # This tool is only for validation and shouldn't be included in subsequent LLM calls
@@ -1031,7 +972,6 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 # Check if this is a check_user_query_restriction tool message
                 tool_name = getattr(msg, 'name', '')
                 if tool_name == 'check_user_query_restriction':
-                    print(f"   🔇 Filtering out check_user_query_restriction ToolMessage (not sent to LLM to save tokens)")
                     continue
             filtered_messages.append(msg)
         
@@ -1042,24 +982,11 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             if not messages:
                 raise ValueError("Cannot invoke LLM with empty messages array")
             
-            # Debug: Log message sequence before invoking
-            log_message_sequence(messages, f"Before LLM Invocation (Iteration {state.get('iteration_count', 0) + 1})")
-            
-            # Extract prompt details for logging
-            system_msg = next((m for m in messages if isinstance(m, SystemMessage)), None)
-            human_msg = next((m for m in messages if isinstance(m, HumanMessage)), None)
-            if system_msg:
-                print(f"📋 System Prompt Length: {len(system_msg.content)} characters")
-            if human_msg:
-                print(f"💬 User Question: {human_msg.content}")
-            
-            # OPTIMIZATION 1: Bind tools conditionally before invoking LLM
+            _log_messages_debug(messages, f"Before LLM Invocation (Iteration {state.get('iteration_count', 0) + 1})")
             question = state.get("question", "")
             self._bind_tools_conditionally(question)
-            
-            # Get model name in a provider-agnostic way
             model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'Unknown'
-            print(f"🤖 Invoking LLM (model: {model_name})...")
+            t_agent = time.perf_counter()
             
             # Track what messages are being sent TO the LLM
             iteration = state.get("iteration_count", 0) + 1
@@ -1094,37 +1021,20 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     })
             
             try:
-                # Ensure tools are bound (safety check)
                 if self.llm_with_tools is None:
-                    # Fallback: bind regular tools if not already bound
-                    print(f"⚠️  Tools not bound yet, binding regular tools as fallback")
                     self._bind_tools_conditionally(question if question else "")
-                
-                # Use fallback helper - it will automatically fallback to ChatGPT if Groq fails
-                response = self._invoke_llm_with_fallback(messages, use_tools=True, question=question)
+                response, llm_type_used = self._invoke_llm_with_fallback(messages, use_tools=True, question=question)
+                state["actual_llm_type"] = llm_type_used
             except Exception as e:
-                # This will only catch errors if both Groq AND ChatGPT fail
                 error_str = str(e)
                 error_type = type(e).__name__
-                
-                logger.error(f"Both Groq and ChatGPT failed")
-                logger.error(f"Error Type: {error_type}")
-                logger.error(f"Error Message: {error_str}")
-                logger.exception("Full exception details")
-                
-                print(f"\n{'='*80}")
-                print(f"❌ BOTH GROQ AND CHATGPT FAILED")
-                print(f"{'='*80}")
-                print(f"Error Type: {error_type}")
-                print(f"Error Message: {error_str}")
-                import traceback
-                print(f"Traceback:\n{traceback.format_exc()}")
-                print(f"{'='*80}\n")
+                logger.error(f"LLM failed: {error_type} - {error_str[:200]}")
+                logger.exception("Full exception")
                 raise e
             
+            elapsed_agent = time.perf_counter() - t_agent
             messages.append(response)
             
-            # Track token usage
             token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
             call_token_usage = {"input": 0, "output": 0, "total": 0}
             if hasattr(response, "response_metadata") and response.response_metadata:
@@ -1138,8 +1048,11 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     token_usage["input"] = token_usage.get("input", 0) + call_token_usage["input"]
                     token_usage["output"] = token_usage.get("output", 0) + call_token_usage["output"]
                     token_usage["total"] = token_usage.get("total", 0) + call_token_usage["total"]
-                    print(f"📊 Token Usage: Input={call_token_usage['input']}, Output={call_token_usage['output']}, Total={call_token_usage['total']}")
-            
+            logger.info(f"process=agent_node time={elapsed_agent:.2f}s in={call_token_usage['input']} out={call_token_usage['output']} total={call_token_usage['total']}")
+            _breakdown = state.get("stage_breakdown", [])
+            _breakdown.append({"stage": "agent_node", "elapsed_s": round(elapsed_agent, 3), "in": call_token_usage["input"], "out": call_token_usage["output"], "total": call_token_usage["total"]})
+            state["stage_breakdown"] = _breakdown
+
             # Record this LLM call in history
             llm_call_info = {
                 "iteration": iteration,
@@ -1175,81 +1088,31 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             
             llm_call_history.append(llm_call_info)
             
-            # Log LLM response
             if hasattr(response, "tool_calls") and response.tool_calls:
-                print(f"🔧 LLM Response: Requesting {len(response.tool_calls)} tool call(s)")
-                logger.info(f"LLM Response: Requesting {len(response.tool_calls)} tool call(s)")
-                for tc in response.tool_calls:
-                    print(f"   - Tool: {tc.get('name')}")
-                    logger.info(f"Tool call: {tc.get('name')}")
-                    if tc.get('name') in ['execute_db_query', 'count_query', 'list_query']:
-                        sql = tc.get('args', {}).get('query', 'N/A')
-                        print(f"     SQL Query: {sql}")
-                        logger.info(f"SQL Query from tool call ({tc.get('name')}): {sql[:200]}...")
+                tool_names = [tc.get('name') for tc in response.tool_calls]
+                logger.info(f"process=agent_node tool_calls={tool_names}")
             else:
-                content_preview = (response.content[:200] + "...") if response.content and len(response.content) > 200 else (response.content or "[No content]")
-                print(f"💬 LLM Response: {content_preview}")
-                logger.info(f"LLM Response (text only): {content_preview}")
-                
                 # Try to extract SQL from text response when tool calls fail
                 extracted_sql = None
                 if response.content:
                     extracted_sql = self._extract_sql_from_text(response.content)
-                
                 if extracted_sql:
-                    logger.info(f"🔍 EXTRACTED SQL FROM TEXT RESPONSE")
-                    logger.info(f"SQL Query: {extracted_sql}")
-                    print(f"\n{'='*80}")
-                    print(f"🔍 EXTRACTED SQL FROM TEXT RESPONSE")
-                    print(f"{'='*80}")
-                    print(f"SQL Query: {extracted_sql}")
-                    print(f"{'='*80}\n")
-                    
-                    # Manually execute the query
+                    logger.info("process=agent_node extracted_sql_from_text")
                     try:
-                        logger.info("Attempting to execute extracted SQL query")
-                        print(f"🔧 Attempting to execute extracted SQL query...")
-                        
-                        # Use the underlying query tool instance to execute the SQL
                         query_result = self.query_tool_instance.execute(extracted_sql)
-                        
-                        # Create ToolMessage to maintain message flow
                         tool_message = ToolMessage(
                             content=query_result,
                             name="execute_db_query",
                             tool_call_id="manual_extraction_001"
                         )
                         messages.append(tool_message)
-                        
-                        # Update state
                         state["sql_query"] = extracted_sql
                         state["query_result"] = query_result
-                        
-                        logger.info(f"✅ Executed extracted SQL query successfully")
-                        logger.info(f"Result length: {len(query_result)} characters")
-                        logger.debug(f"Query result preview: {query_result[:500]}...")
-                        print(f"✅ Executed extracted SQL query successfully")
-                        print(f"   Result length: {len(query_result)} characters")
                     except Exception as exec_error:
-                        logger.error(f"❌ Error executing extracted SQL: {exec_error}")
-                        logger.exception("SQL execution error")
-                        print(f"❌ Error executing extracted SQL: {exec_error}")
-                        import traceback
-                        traceback.print_exc()
-                        # Continue with text response even if execution fails
+                        logger.error(f"Error executing extracted SQL: {exec_error}")
         except Exception as e:
-            print(f"❌ Error invoking LLM: {e}")
-            print(f"   Messages count: {len(messages)}")
-            if messages:
-                print(f"   Message types: {[type(m).__name__ for m in messages]}")
-                # Show detailed message info
-                for i, msg in enumerate(messages):
-                    if isinstance(msg, ToolMessage):
-                        print(f"   [{i}] ToolMessage: tool_call_id={getattr(msg, 'tool_call_id', 'None')}, name={getattr(msg, 'name', 'None')}")
-                    elif isinstance(msg, AIMessage):
-                        print(f"   [{i}] AIMessage: has_tool_calls={hasattr(msg, 'tool_calls') and bool(msg.tool_calls)}")
-                    else:
-                        print(f"   [{i}] {type(msg).__name__}")
+            logger.error(f"Error invoking LLM: {e}")
+            logger.exception("LLM invocation")
             raise
         
         # Extract SQL query if execute_db_query or journey tools were called
@@ -1260,12 +1123,9 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 tool_name = tool_call["name"]
                 if tool_name in ["execute_db_query", "count_query", "list_query"]:
                     sql_query = tool_call["args"].get("query", "")
-                    logger.info(f"✅ Extracted SQL from tool call ({tool_name}): {sql_query[:100]}...")
                     break
                 elif tool_name in ["journey_list_tool", "journey_count_tool"]:
-                    # Journey tools use "sql" parameter instead of "query"
                     sql_query = tool_call["args"].get("sql", "")
-                    logger.info(f"✅ Extracted SQL from journey tool call ({tool_name}): {sql_query[:100]}...")
                     break
         
         # Check if we got query results from previous tool execution
@@ -1337,13 +1197,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                             
                             # Only retry if we haven't exceeded max iterations and haven't already called get_table_structure
                             if iteration_count < 4 and not already_called:
-                                logger.info(f"🔍 Detected column error for table {table_name}, routing back to agent for retry")
-                                print(f"\n{'='*80}")
-                                print(f"⚠️  COLUMN ERROR DETECTED - Routing back to agent")
-                                print(f"   Table: {table_name}")
-                                print(f"   Error: {result_content[:200]}...")
-                                print(f"   Agent will call get_table_structure and retry")
-                                print(f"{'='*80}\n")
+                                logger.info(f"[column_error] table={table_name} → retry agent")
                                 return "continue"
                             else:
                                 if already_called:
@@ -1352,12 +1206,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                                     logger.warning(f"Max iterations reached ({iteration_count}), formatting error message instead")
                                 # Fall through to format the error
                 
-                # We have query results (or error) - format answer directly without another agent call
-                logger.info(f"TOOL RESULT DETECTED ({msg.name}) - Routing directly to format_answer")
-                print(f"\n{'='*80}")
-                print(f"✅ TOOL RESULT DETECTED ({msg.name}) - Routing directly to format_answer")
-                print(f"   This saves tokens by skipping agent node with full history")
-                print(f"{'='*80}\n")
+                logger.info(f"process=tool_result tool={msg.name} next=format_answer")
                 return "format"
         
         # No query results yet, continue to agent
@@ -1369,85 +1218,44 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
         # Check if final_answer is already set (e.g., from early validation rejection)
         final_answer = state.get("final_answer")
         if final_answer:
-            logger.info("Decision: END - Final answer already set")
-            print(f"\n{'='*80}")
-            print(f"✅ DECISION POINT - Final answer already set")
-            print(f"{'='*80}")
-            print(f"   Final answer: {final_answer[:100]}...")
-            print(f"✅ Decision: END - Final answer already generated")
             return "end"
         
         messages = state.get("messages", [])
         last_message = messages[-1] if messages else None
         iteration_count = state.get("iteration_count", 0)
         
-        logger.debug(f"Decision point - Iteration: {iteration_count}, Last message type: {type(last_message).__name__ if last_message else 'None'}")
-        print(f"\n{'='*80}")
-        print(f"🤔 DECISION POINT - Should Continue?")
-        print(f"{'='*80}")
-        print(f"   Iteration: {iteration_count}")
-        print(f"   Last message type: {type(last_message).__name__ if last_message else 'None'}")
-        
-        # Safety check: prevent infinite loops
         if iteration_count >= 5:
             logger.warning(f"Max iterations reached ({iteration_count}), forcing end")
-            print(f"⚠️  Max iterations reached ({iteration_count}), forcing end")
             return "end"
         
-        # If last message has tool calls, continue to tools
         if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            tool_count = len(last_message.tool_calls)
-            logger.info(f"Decision: CONTINUE - Agent wants to call {tool_count} tool(s)")
-            print(f"🔧 Decision: CONTINUE - Agent wants to call {tool_count} tool(s)")
+            logger.debug(f"Decision: CONTINUE tool_calls={len(last_message.tool_calls)}")
             return "continue"
         
-        # If we have a query result, format the answer
         query_result = state.get("query_result")
         if query_result and query_result != "":
-            logger.info("Decision: END - Query result found in state")
-            print(f"✅ Decision: END - Query result found")
             return "end"
         
-        # Check if we have a tool message with results (from any query tool, including journey tools)
         for msg in reversed(messages):
             if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
-                # We have query results, format answer
-                logger.info(f"Decision: END - Found {msg.name} ToolMessage")
-                print(f"✅ Decision: END - Found {msg.name} ToolMessage")
                 return "end"
         
-        # If we have SQL query but no result yet, check if we already executed
         if state.get("sql_query"):
-            # Check if we already tried to execute (check all query tools, including journey tools)
             for msg in messages:
                 if isinstance(msg, ToolMessage) and msg.name in ["execute_db_query", "count_query", "list_query", "journey_list_tool", "journey_count_tool"]:
-                    # Already executed, should format answer
-                    logger.info(f"Decision: END - SQL query already executed via {msg.name}")
-                    print(f"✅ Decision: END - SQL query already executed via {msg.name}")
                     return "end"
         
-        # If last message is AIMessage without tool_calls, we have final answer
         if last_message and isinstance(last_message, AIMessage):
-            has_tool_calls = hasattr(last_message, "tool_calls") and last_message.tool_calls
-            if not has_tool_calls:
-                logger.info("Decision: END - Final AIMessage without tool_calls")
-                print(f"✅ Decision: END - Final AIMessage without tool_calls")
+            if not (hasattr(last_message, "tool_calls") and last_message.tool_calls):
                 return "end"
         
-        # Otherwise, continue (agent might want to call tools)
-        logger.debug("Decision: CONTINUE - Agent might want to call tools")
-        print(f"🔄 Decision: CONTINUE - Agent might want to call tools")
-        print(f"{'='*80}\n")
         return "continue"
     
     def _format_answer(self, state: AgentState) -> AgentState:
         """Format final natural language answer."""
-        print(f"\n{'='*80}")
-        print(f"📝 FORMATTING FINAL ANSWER")
-        print(f"{'='*80}")
-        
+        t_format = time.perf_counter()
         messages = state.get("messages", [])
-        log_message_sequence(messages, "All Messages Before Formatting")
+        _log_messages_debug(messages, "All Messages Before Formatting")
         
         # Extract query result from messages if not in state
         query_result = state.get("query_result", "")
@@ -1463,7 +1271,6 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             )
             if is_error_in_state:
                 logger.warning(f"⚠️  State contains error message, clearing and re-extracting from ToolMessages")
-                print(f"⚠️  State contains error message, clearing and re-extracting")
                 query_result = ""  # Clear the error so we can find the successful result
         
         if not query_result:
@@ -1485,24 +1292,18 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                             )
                             
                             if not is_error:
-                                # This is a successful result - use it
                                 query_result = content
                                 if tool_name in ["journey_list_tool", "journey_count_tool"]:
                                     journey_tool_used = True
-                                logger.info(f"✅ Found successful query result from ToolMessage ({tool_name}): {query_result[:200]}...")
-                                print(f"✅ Found successful query result from ToolMessage ({tool_name}): {query_result[:200]}...")
                                 break
                             else:
                                 # This is an error - skip it and continue looking
                                 logger.debug(f"⏭️  Skipping error ToolMessage ({tool_name}): {content[:100]}...")
                                 continue
                         else:
-                            # Not a string, use it as-is
                             query_result = content
                             if tool_name in ["journey_list_tool", "journey_count_tool"]:
                                 journey_tool_used = True
-                            logger.info(f"✅ Found query result from ToolMessage ({tool_name})")
-                            print(f"✅ Found query result from ToolMessage ({tool_name})")
                             break
         
         # Extract SQL query from messages if not in state
@@ -1543,14 +1344,9 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         tool_name = tool_call.get("name", "")
                         if tool_name in ["execute_db_query", "count_query", "list_query"]:
                             sql_query = tool_call["args"].get("query", "")
-                            logger.info(f"✅ Found SQL query from tool call ({tool_name}): {sql_query[:100]}...")
-                            print(f"✅ Found SQL query from tool call ({tool_name}): {sql_query}")
                             break
                         elif tool_name in ["journey_list_tool", "journey_count_tool"]:
-                            # Journey tools use "sql" parameter
                             sql_query = tool_call["args"].get("sql", "")
-                            logger.info(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query[:100]}...")
-                            print(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query}")
                             break
                     if sql_query:
                         break
@@ -1563,13 +1359,9 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                             tool_name = tool_call.get("name", "")
                             if tool_name in ["execute_db_query", "count_query", "list_query"]:
                                 sql_query = tool_call["args"].get("query", "")
-                                logger.info(f"✅ Found SQL query from tool call ({tool_name}): {sql_query[:100]}...")
-                                print(f"✅ Found SQL query from tool call ({tool_name}): {sql_query}")
                                 break
                             elif tool_name in ["journey_list_tool", "journey_count_tool"]:
                                 sql_query = tool_call["args"].get("sql", "")
-                                logger.info(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query[:100]}...")
-                                print(f"✅ Found SQL query from journey tool call ({tool_name}): {sql_query}")
                                 break
                         if sql_query:
                             break
@@ -1582,14 +1374,9 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         extracted = self._extract_sql_from_text(msg.content)
                         if extracted:
                             sql_query = extracted
-                            logger.info(f"✅ Extracted SQL from final message: {sql_query[:100]}...")
-                            print(f"✅ Extracted SQL from final message: {sql_query}")
                             break
         
-        logger.info(f"📊 Extracted SQL Query: {sql_query or 'None'}")
-        logger.info(f"📊 Query Result: {query_result[:200] if query_result else 'None'}...")
-        print(f"📊 Extracted SQL Query: {sql_query or 'None'}")
-        print(f"📊 Query Result: {query_result[:200] if query_result else 'None'}...")
+        logger.debug(f"format_answer sql_query={bool(sql_query)} query_result_len={len(query_result or '')}")
         
         # If we have query results, format them
         # CRITICAL: Double-check that query_result is not an error message
@@ -1604,7 +1391,6 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 if is_still_error:
                     logger.error(f"❌ CRITICAL: query_result is still an error after extraction! This should not happen.")
                     logger.error(f"   Error content: {query_result[:300]}...")
-                    print(f"❌ CRITICAL: query_result is still an error - this is a bug!")
                     # Try one more time to find successful result
                     for msg in reversed(messages):
                         if isinstance(msg, ToolMessage):
@@ -1617,8 +1403,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                                     content.startswith("::::::")
                                 ):
                                     query_result = content
-                                    logger.warning(f"⚠️  Recovered successful result from ToolMessage ({tool_name})")
-                                    print(f"⚠️  Recovered successful result from ToolMessage ({tool_name})")
+                                    logger.debug(f"Recovered result from ToolMessage ({tool_name})")
                                     break
                     # If still an error, we can't format it
                     if isinstance(query_result, str) and (
@@ -1629,7 +1414,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         query_result = None
         
         if query_result and not query_result.startswith("::::::"):
-            logger.info("Formatting final answer from query results")
+            logger.info("process=format_answer start")
             
             # SAFETY CHECK: Truncate extremely large results before processing
             # LLM APIs have request size limits (typically 1-2M tokens, ~4-8M characters)
@@ -1638,8 +1423,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             original_result_size = len(query_result) if query_result else 0
             
             if original_result_size > MAX_RESULT_SIZE:
-                logger.warning(f"⚠️  Query result is too large ({original_result_size:,} chars). Truncating to {MAX_RESULT_SIZE:,} chars for LLM formatting.")
-                print(f"⚠️  Query result too large ({original_result_size:,} chars) - truncating for LLM")
+                logger.warning(f"Query result too large ({original_result_size:,} chars), truncating for LLM")
                 
                 # For extremely large results, create a summary instead of trying to parse everything
                 # This prevents memory issues and API request size errors
@@ -1728,6 +1512,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
 
             # Extract CSV download link from query_result if present
             csv_download_url = None
+            csv_path = None
             csv_id = None
             
             # Try to parse as JSON first (for journey tools)
@@ -1740,8 +1525,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         csv_path = result_dict['csv_download_link']
                         csv_id = result_dict.get('csv_id')
                         csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
-                        logger.info(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
-                        print(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
+                        logger.debug(f"Extracted CSV link from JSON")
             except (json.JSONDecodeError, KeyError, TypeError):
                 # Not JSON or no CSV link, try text format
                 pass
@@ -1753,15 +1537,13 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 if csv_link_match:
                     csv_path = csv_link_match.group(1)
                     csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
-                    logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
-                    print(f"✅ Extracted CSV download link from text: {csv_download_url}")
+                    logger.debug(f"Extracted CSV link from text")
                     
                     # Also try to extract CSV ID if present
                     csv_id_match = re.search(r'CSV ID:\s*([a-f0-9\-]+)', query_result, re.IGNORECASE)
                     if csv_id_match:
                         csv_id = csv_id_match.group(1)
-                        logger.info(f"✅ Extracted CSV ID: {csv_id}")
-                        print(f"✅ Extracted CSV ID: {csv_id}")
+                        logger.debug(f"Extracted CSV ID: {csv_id}")
             
             # For journey tools, reduce token usage by filtering/truncating results before format_answer
             if journey_tool_used and result_dict:
@@ -1797,8 +1579,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         minimal_summary["example_journey"] = journies[0]
                     
                     query_result = json.dumps(minimal_summary, indent=2, default=str)
-                    logger.info(f"📊 Token optimization: Using minimal summary (total: {total_journeys} journeys, CSV: {has_csv})")
-                    print(f"📊 Token optimization: Using minimal summary only - {total_journeys} journeys (actual total, not preview), CSV available: {has_csv}")
+                    logger.debug(f"Token optimization: minimal summary total_journeys={total_journeys} csv={has_csv}")
                 elif total_journeys > 0:
                     # Small result set (<=5 journeys), but still reduce facilities_details
                     # Keep only facilities that appear in the journeys
@@ -1832,8 +1613,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 if csv_link_match:
                     csv_path = csv_link_match.group(1)
                     csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
-                    logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
-                    print(f"✅ Extracted CSV download link from text: {csv_download_url}")
+                    logger.debug(f"Extracted CSV link from text")
                     
                     # Extract CSV ID if available
                     csv_id_match = re.search(r'CSV ID:\s*([^\s\n]+)', query_result, re.IGNORECASE)
@@ -1850,38 +1630,12 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         if csv_id:
                             minimal_summary += f"\nCSV ID: {csv_id}"
                         query_result = minimal_summary
-                        logger.info(f"📊 Token optimization: Using minimal summary for SQL query ({row_count} rows, CSV available)")
-                        print(f"📊 Token optimization: Using minimal summary for SQL query - {row_count} rows, CSV available")
-                    else:
-                        # If row count not found, still create minimal summary
-                        query_result = f"Results available in CSV. Download link: {csv_path}"
-                        logger.info(f"📊 Token optimization: Using minimal summary for SQL query (CSV available, row count not found)")
-                        print(f"📊 Token optimization: Using minimal summary for SQL query - CSV available")
-                else:
-                    # No CSV link found - check if result is large and should have CSV
-                    # Count rows to see if CSV should have been generated
-                    lines = query_result.strip().split('\n')
-                    data_rows = [line for line in lines[1:] if line.strip()] if len(lines) > 1 else []
-                    row_count = len(data_rows)
-                    
-                    # If result is large (>5 rows and >1000 chars), create minimal summary even without CSV
-                    # This reduces token usage significantly
-                    if row_count > 5 and len(query_result) > 1000:
-                        logger.warning(f"⚠️  Large result ({row_count} rows, {len(query_result)} chars) but no CSV link found - creating minimal summary anyway")
-                        print(f"⚠️  Large result ({row_count} rows) but no CSV - creating minimal summary to reduce tokens")
-                        
-                        # Create minimal summary with just row count and first few rows
-                        header = lines[0] if lines else ""
-                        preview_rows = data_rows[:3]  # First 3 rows only
-                        minimal_summary = f"Total rows: {row_count}\n\nFirst 3 rows (sample):\n{header}\n" + "\n".join(preview_rows)
-                        query_result = minimal_summary
-                        logger.info(f"📊 Token optimization: Created minimal summary ({row_count} rows, showing 3 sample rows)")
-                        print(f"📊 Token optimization: Created minimal summary - {row_count} rows total, showing 3 sample rows")
+                        logger.debug(f"Token optimization: minimal summary rows={row_count}")
 
-            # Build the prompt with CSV link if available
+            # When CSV is available: add exactly ONE markdown link so the CSV is visible. Do not write "using the following link" or repeat "Download CSV" elsewhere.
             csv_link_instruction = ""
-            if csv_download_url:
-                csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link with ALL the data. You MUST include this full URL in your answer: {csv_download_url}"
+            if csv_download_url and csv_path:
+                csv_link_instruction = f"\n\nIMPORTANT: Mention the count, then add exactly this one link (no other 'Download CSV' text before it): [Download CSV]({csv_path})"
 
             # OPTIMIZATION: Ultra-minimal prompt when CSV is available
             # Safety check: If CSV is available but query_result is still large or contains preview rows, force minimal summary
@@ -1914,8 +1668,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                     else:
                         query_result = f'Results available in CSV. Download link: {csv_path_for_summary}'
                 
-                logger.warning(f"⚠️  Forced minimal summary due to large query_result ({len(query_result)} chars) with CSV")
-                print(f"⚠️  Forced minimal summary - query_result was too large even with CSV")
+                logger.warning(f"Forced minimal summary: query_result too large with CSV")
             
             if csv_download_url:
                 # When CSV is available, use even more minimal prompt
@@ -1936,7 +1689,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
 
 Query results summary: {query_result}{row_count_text}{interpretation_note}
 
-IMPORTANT: Mention the exact total count from the results in your answer, then provide the CSV download link with the full URL.{csv_link_instruction}""".strip()
+IMPORTANT: Use the EXACT count from the results. Mention that total, then add only the one download link (do not write 'using the following link' or any extra 'Download CSV' text).{csv_link_instruction}""".strip()
             else:
                 # Regular prompt for small results
                 # IMPORTANT: Add explicit instruction about interpreting results
@@ -1965,22 +1718,20 @@ Query results: {query_result}
 
 Provide a concise, natural language answer. Do not mention table names, SQL syntax, or schema details.{journey_instruction}""".strip()
             
-            logger.info("Generating final answer from query results")
-            logger.debug(f"Final prompt length: {len(final_prompt)} characters")
-            print(f"🤖 Generating final answer from query results...")
-            print(f"   Prompt length: {len(final_prompt)} characters")
-            print(f"   Using MINIMAL prompt (no system prompt, no examples, no history)")
-            
-            # Track what's being sent to LLM for final answer
             llm_call_history = state.get("llm_call_history", [])
-            
-            # Use HumanMessage format for proper LLM invocation
             from langchain_core.messages import HumanMessage
             final_messages = [HumanMessage(content=final_prompt)]
-            response = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+            response, llm_type_used = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+            state["actual_llm_type"] = llm_type_used
             final_answer = response.content if hasattr(response, 'content') else str(response)
-            
-            # Track token usage for this final call
+            # When CSV is available: keep the single [Download CSV](path) link; only remove duplicate phrasing so "Download CSV" appears once
+            if csv_path:
+                if settings.get_api_base_url():
+                    base = settings.get_api_base_url().rstrip("/")
+                    final_answer = re.sub(rf"\(({re.escape(base)}/download-csv/[a-f0-9\-]+)\)", f"({csv_path})", final_answer)
+                # Remove redundant "using the following link:" so only the link remains (one "Download CSV")
+                final_answer = re.sub(r"\s*[Uu]sing the following link[:\s]*", " ", final_answer, flags=re.IGNORECASE)
+            elapsed_format = time.perf_counter() - t_format
             call_token_usage = {"input": 0, "output": 0, "total": 0}
             if hasattr(response, "response_metadata") and response.response_metadata:
                 usage = response.response_metadata.get("token_usage", {})
@@ -1990,8 +1741,11 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                         "output": usage.get("completion_tokens", 0),
                         "total": usage.get("total_tokens", 0)
                     }
-                    print(f"📊 Final Answer Token Usage: Input={call_token_usage['input']}, Output={call_token_usage['output']}, Total={call_token_usage['total']}")
-            
+            logger.info(f"process=format_answer time={elapsed_format:.2f}s in={call_token_usage['input']} out={call_token_usage['output']} total={call_token_usage['total']}")
+            _breakdown = state.get("stage_breakdown", [])
+            _breakdown.append({"stage": "format_answer", "elapsed_s": round(elapsed_format, 3), "in": call_token_usage["input"], "out": call_token_usage["output"], "total": call_token_usage["total"]})
+            state["stage_breakdown"] = _breakdown
+
             # Update state's token_usage with this call's tokens
             current_token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
             updated_token_usage = {
@@ -2018,11 +1772,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                 "token_usage": call_token_usage
             }
             llm_call_history.append(llm_call_info)
-            
-            logger.info(f"✅ Final Answer Generated: {final_answer[:200]}...")
-            print(f"✅ Final Answer Generated: {final_answer[:200]}...")
-            
-            return {
+            out = {
                 **state,
                 "final_answer": final_answer,
                 "query_result": query_result,  # Update state with successful result (not error)
@@ -2030,6 +1780,10 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                 "llm_call_history": llm_call_history,
                 "token_usage": updated_token_usage
             }
+            if csv_path:
+                out["csv_download_path"] = csv_path
+                out["csv_id"] = csv_id if csv_id else csv_path.replace("/download-csv/", "").strip()
+            return out
         elif query_result and query_result.startswith("::::::"):
             # Empty result
             final_answer = f"Based on the query, there are no results matching your criteria for the question: {state['question']}"
@@ -2056,7 +1810,6 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                         if extracted_sql:
                             sql_query = extracted_sql
                             logger.info(f"✅ Extracted SQL from final message: {sql_query[:100]}...")
-                            print(f"✅ Extracted SQL from final message: {sql_query}")
                             
                             # Try to execute it
                             try:
@@ -2085,7 +1838,6 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                                 csv_id = result_dict.get('csv_id')
                                                 csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                                                 logger.info(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
-                                                print(f"✅ Extracted CSV download link from JSON: {csv_download_url}")
                                     except (json.JSONDecodeError, KeyError, TypeError):
                                         pass
                                     
@@ -2096,12 +1848,11 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                             csv_path = csv_link_match.group(1)
                                             csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                                             logger.info(f"✅ Extracted CSV download link from text: {csv_download_url}")
-                                            print(f"✅ Extracted CSV download link from text: {csv_download_url}")
 
-                                    # Build the prompt with CSV link if available
+                                    # When CSV is available: add exactly one link so the CSV is visible
                                     csv_link_instruction = ""
-                                    if csv_download_url:
-                                        csv_link_instruction = f"\n\nIMPORTANT: The query results include a CSV download link. You MUST include this full URL in your answer: {csv_download_url}"
+                                    if csv_download_url and csv_path:
+                                        csv_link_instruction = f"\n\nIMPORTANT: Mention the count, then add exactly this one link: [Download CSV]({csv_path}). Do not write 'using the following link' or any extra 'Download CSV' text."
                                     
                                     # Add interpretation instruction for existence questions
                                     question_lower = user_question.lower()
@@ -2141,10 +1892,10 @@ CRITICAL INTERPRETATION RULES:
                                     
                                     from langchain_core.messages import HumanMessage
                                     final_messages = [HumanMessage(content=final_prompt)]
-                                    response = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+                                    response, llm_type_used = self._invoke_llm_with_fallback(final_messages, use_tools=False, question=user_question)
+                                    state["actual_llm_type"] = llm_type_used
                                     final_answer = response.content if hasattr(response, 'content') else str(response)
                                     logger.info(f"✅ Generated final answer from query results")
-                                    print(f"✅ Final Answer: {final_answer}")
                                     return {
                                         **state,
                                         "final_answer": final_answer,
@@ -2155,7 +1906,24 @@ CRITICAL INTERPRETATION RULES:
                                 logger.error(f"Error executing SQL from final message: {exec_error}")
                                 logger.exception("SQL execution error in format_answer")
                     
-                    final_answer = last_ai_message.content
+                    # If the model incorrectly asked for user ID, don't surface that—user_id is already set
+                    last_content = (last_ai_message.content or "").strip().lower()
+                    ask_user_id_phrases = (
+                        "provide your user id",
+                        "provide your user id so",
+                        "please provide your user id",
+                        "user id so i can",
+                        "your user id",
+                    )
+                    if any(phrase in last_content for phrase in ask_user_id_phrases):
+                        current_user_id = state.get("user_id", "")
+                        logger.warning("Last AI message asked for user ID; user_id is already set, overriding response")
+                        final_answer = (
+                            f"Your user ID is already set for this session ({current_user_id}). "
+                            "I'll use it to run your query. Please try asking your question again so I can execute it."
+                        )
+                    else:
+                        final_answer = last_ai_message.content
                 else:
                     logger.warning("No suitable AI message found for final answer")
                     final_answer = "I couldn't generate a response to your question."
@@ -2163,30 +1931,31 @@ CRITICAL INTERPRETATION RULES:
                 logger.warning("No messages available for final answer")
                 final_answer = "I couldn't generate a response to your question."
         
-        print(f"✅ Final Answer: {final_answer}")
-        print(f"{'='*80}\n")
-        
         return {
             **state,
             "final_answer": final_answer
         }
     
-    def invoke(self, question: str) -> Dict[str, Any]:
+    def invoke(
+        self,
+        question: str,
+        precomputed_embedding: Optional[List[float]] = None,
+        preloaded_example_docs: Optional[List] = None,
+    ) -> Dict[str, Any]:
         """
         Process a question and return results.
         
         Args:
             question: User's natural language question
+            precomputed_embedding: Optional embedding from 80% path miss to avoid re-embedding in get_system_prompt
+            preloaded_example_docs: Optional example docs from 80% path miss to skip duplicate vector search
             
         Returns:
             Dictionary with answer, SQL query, and results
         """
-        print(f"\n{'#'*80}")
-        print(f"🚀 STARTING NEW REQUEST")
-        print(f"{'#'*80}")
-        print(f"📝 User Question: {question}")
-        print(f"👤 User ID: {self.user_id}")
-        print(f"{'#'*80}\n")
+        t_request = time.perf_counter()
+        self._groq_401_seen_this_request = False
+        logger.info(f"process=request start user_id={self.user_id} question_len={len(question)}")
         
         initial_state = {
             "question": question,
@@ -2199,11 +1968,15 @@ CRITICAL INTERPRETATION RULES:
             "iteration_count": 0,
             "token_usage": {"input": 0, "output": 0, "total": 0},
             "query_validated": False,
-            "llm_call_history": []
+            "llm_call_history": [],
+            "stage_breakdown": [],
+            "csv_id": None,
+            "csv_download_path": None,
+            "precomputed_embedding": precomputed_embedding,
+            "preloaded_example_docs": preloaded_example_docs,
+            "actual_llm_type": None,
         }
         
-        # Run the graph
-        print("🔄 Executing LangGraph workflow...\n")
         final_state = self.graph.invoke(initial_state)
         
         # Extract query result from messages if not already set
@@ -2233,27 +2006,21 @@ CRITICAL INTERPRETATION RULES:
                     if sql_query:
                         break
         
-        # Build debug information with message history and token usage
         debug_info = self._build_debug_info(final_state, question)
-        
-        # Final summary logging
-        print(f"\n{'#'*80}")
-        print(f"✅ REQUEST COMPLETED")
-        print(f"{'#'*80}")
-        print(f"📝 Question: {question}")
-        print(f"💬 Answer: {final_state.get('final_answer', 'No answer generated')}")
-        print(f"🔍 SQL Query: {sql_query or 'None'}")
-        print(f"📊 Query Result: {query_result[:200] if query_result else 'None'}...")
-        print(f"🔄 Total Iterations: {final_state.get('iteration_count', 0)}")
+        elapsed_request = time.perf_counter() - t_request
         token_usage = final_state.get("token_usage", {})
-        print(f"💰 Token Usage: Input={token_usage.get('input', 0)}, Output={token_usage.get('output', 0)}, Total={token_usage.get('total', 0)}")
-        print(f"{'#'*80}\n")
-        
+        ti, to, tt = token_usage.get("input", 0), token_usage.get("output", 0), token_usage.get("total", 0)
+        logger.info(f"process=request time={elapsed_request:.2f}s in={ti} out={to} total={tt}")
+
         return {
             "answer": final_state.get("final_answer", "No answer generated"),
             "sql_query": sql_query or final_state.get("sql_query", ""),
             "query_result": query_result or "",
-            "debug": debug_info
+            "debug": debug_info,
+            "csv_id": final_state.get("csv_id"),
+            "csv_download_path": final_state.get("csv_download_path"),
+            "stage_breakdown": final_state.get("stage_breakdown", []),
+            "actual_llm_type": final_state.get("actual_llm_type"),
         }
     
     def _build_debug_info(self, state: AgentState, question: str) -> Dict[str, Any]:

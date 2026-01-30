@@ -10,6 +10,7 @@ import re
 from typing import Dict, List, Optional, Any
 from sqlalchemy import text
 from langchain_community.utilities.sql_database import SQLDatabase
+from langchain.schema import Document
 from app.config.database import sync_engine
 from app.config.settings import settings
 from app.services.vector_store_service import VectorStoreService
@@ -290,15 +291,22 @@ class CacheAnswerService:
         # 0.80 bar is fixed in code; no env flag. If similarity ≥ 0.80, use example SQL.
         threshold = 0.80
         try:
+            # #region agent log
+            _t0 = __import__("time").perf_counter()
+            # #endregion
             query_embedding = self.vector_store.embed_query(question)
+            # #region agent log
+            _t1 = __import__("time").perf_counter()
+            # #endregion
             embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
-            # Base-columns-only query: no entry_type, is_active, question_type, user_type
+            # Base-columns-only query: include description so we can pass example docs to agent on miss (avoids duplicate vector search)
             search_query = text(f"""
                 SELECT
                     id,
                     question,
                     sql_query,
+                    description,
                     metadata,
                     {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance,
                     1 - ({self.embedding_field_name} <-> '{embedding_str}'::vector) AS similarity
@@ -311,16 +319,22 @@ class CacheAnswerService:
             with self.engine.connect() as conn:
                 result = conn.execute(search_query)
                 candidates = result.fetchall()
+            # #region agent log
+            _t2 = __import__("time").perf_counter()
+            try:
+                _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "location": "cache_answer_service.py:80_path", "message": "80% path embed vs db", "data": {"embed_ms": round((_t1 - _t0) * 1000), "db_ms": round((_t2 - _t1) * 1000), "phase": "80_path"}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                _f.close()
+            except Exception:
+                pass
+            # #endregion
 
             if not candidates:
                 logger.debug("80% path: No candidates found in ai_vector_examples")
                 return None
 
             current_params = extract_params_from_question(question)
-            
-            # Log top candidates for debugging
             top_similarities = [float(row.similarity) if row.similarity else 0.0 for row in candidates[:3]]
-            logger.info(f"80% path: Top similarities: {[f'{s:.4f}' for s in top_similarities]} (threshold: {threshold})")
 
             for row in candidates:
                 sim = float(row.similarity) if row.similarity else 0.0
@@ -352,16 +366,38 @@ class CacheAnswerService:
                     similarity=sim,
                 )
                 if adapted_result:
-                    logger.info(
-                        f"80% match-and-execute success (similarity={sim:.4f}, question_type={question_type})"
-                    )
+                    logger.info(f"[80% path] hit similarity={sim:.4f} question_type={question_type}")
                     return adapted_result
 
-            if top_similarities:
-                logger.info(f"80% path: No candidate met threshold {threshold} (top similarity: {top_similarities[0]:.4f})")
-            else:
-                logger.info(f"80% path: No candidate met threshold {threshold}")
-            return None
+            top = top_similarities[0] if top_similarities else 0.0
+            embed_ms = round((_t1 - _t0) * 1000)
+            db_ms = round((_t2 - _t1) * 1000)
+            logger.info(
+                "[80%% path] miss top=%s threshold=%s (embed_ms=%s db_ms=%s)",
+                f"{top:.4f}", threshold, embed_ms, db_ms,
+            )
+            # Build example docs in same format as search_examples_with_embedding so agent can skip duplicate vector search
+            example_docs = []
+            for row in candidates:
+                content_parts = [f"Question: {row.question}"]
+                if getattr(row, "description", None):
+                    content_parts.append(f"Description: {row.description}")
+                content_parts.append(f"\nSQL Query:\n{row.sql_query}")
+                content = "\n\n".join(content_parts)
+                meta = getattr(row, "metadata", None)
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                elif not isinstance(meta, dict):
+                    meta = {}
+                meta = dict(meta)
+                meta["distance"] = float(row.distance) if row.distance else None
+                meta["id"] = row.id
+                example_docs.append(Document(page_content=content, metadata=meta))
+            # Return miss payload with query_embedding and top_example_docs so agent skips second vector search
+            return {"_miss": True, "query_embedding": query_embedding, "top_example_docs": example_docs}
         except Exception as e:
             logger.warning(f"80% match-and-execute error: {e}")
             return None
@@ -623,8 +659,8 @@ class CacheAnswerService:
                 csv_id = result_data.get('csv_id')
                 
                 if csv_download_link:
-                    csv_url = f"{settings.get_api_base_url()}{csv_download_link}" if not csv_download_link.startswith('http') else csv_download_link
-                    return f"The device has a total of {total_journeys} facility-to-facility movements. To access the detailed journey timing information for all these movements, you can download the complete data in CSV format from the following link: {csv_url}. This link provides the full data for the {total_journeys} journeys."
+                    path = csv_download_link if csv_download_link.startswith("/") else (f"/download-csv/{csv_id}" if csv_id else csv_download_link)
+                    return f"The device has a total of {total_journeys} facility-to-facility movements. [Download CSV]({path})"
                 elif total_journeys > 0:
                     return f"Found {total_journeys} facility-to-facility movement(s) for the device."
                 else:
@@ -637,13 +673,13 @@ class CacheAnswerService:
                     raw = result_data['raw_result']
                     # Check if it mentions CSV
                     if 'CSV Download Link' in raw:
-                        # Extract CSV link and row count
+                        # Extract CSV link and row count (use relative path for UI/Postman)
                         csv_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', raw)
                         row_match = re.search(r'Total rows:\s*(\d+)', raw)
                         if csv_match and row_match:
-                            csv_url = f"{settings.get_api_base_url()}{csv_match.group(1)}"
+                            csv_path = csv_match.group(1)
                             row_count = row_match.group(1)
-                            return f"Found {row_count} result(s). You can download the complete data in CSV format from: {csv_url}."
+                            return f"Found {row_count} result(s). [Download CSV]({csv_path})"
                     
                     # Check if it's an empty result
                     if '0 rows' in raw or 'no rows' in raw.lower():

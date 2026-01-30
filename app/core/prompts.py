@@ -5,6 +5,10 @@ This module contains system prompts with optional pre-loaded examples.
 Examples are retrieved from PostgreSQL vector store (pgvector) and embedded in the initial prompt
 to reduce token usage by eliminating the need for a separate tool call.
 """
+import logging
+from typing import Optional, List
+
+logger = logging.getLogger("ship_rag_ai")
 
 # Security and access control instructions
 STRICT_INSTRUCTION = """
@@ -33,16 +37,14 @@ Do NOT call any tools until you have attempted to generate a SQL query from the 
 
 You have access to tools for interacting with the database:
 1. execute_db_query - Execute SQL queries against PostgreSQL database (use AFTER you generate a query)
-2. get_few_shot_examples - Retrieve more examples (use ONLY if you cannot generate query from examples below)
-3. get_table_list - LAST RESORT: Get list of tables (ONLY if you have tried generating query and failed)
-4. get_table_structure - LAST RESORT: Get table column structure (ONLY after get_table_list if needed)
+2. get_table_list - LAST RESORT: Get list of tables (ONLY if you have tried generating query and failed)
+3. get_table_structure - LAST RESORT: Get table column structure (ONLY after get_table_list if needed)
 
 MANDATORY Tool Usage Order:
-STEP 1: Look at the examples provided in the system prompt. Generate a SQL query based on those examples.
+STEP 1: Look at the examples provided in the system prompt (from ai_vector_examples). Generate a SQL query based on those examples.
 STEP 2: If you generated a query, call execute_db_query immediately. Do NOT call other tools.
-STEP 3: Only if you cannot generate a query from the examples, call get_few_shot_examples.
-STEP 4: Only if you STILL cannot generate a query, use get_table_list.
-STEP 5: Only if you need column details, use get_table_structure.
+STEP 3: Only if you cannot generate a query from the examples, use get_table_list.
+STEP 4: Only if you need column details, use get_table_structure.
 
 REMEMBER: Default action = Generate SQL from examples → execute_db_query. Do NOT call other tools unless you have tried and failed to generate a query.
 
@@ -55,8 +57,6 @@ DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the databa
 ==========================================================================
 DATABASE SCHEMA & BUSINESS RULES:
 ==========================================================================
-
-Use the get_few_shot_examples tool to retrieve detailed schema information and business rules when needed.
 
 Key points to remember:
 - Always join user_device_assignment (ud) table and add ud.user_id where condition when user_id is not "admin"
@@ -79,12 +79,14 @@ JOURNEY CALCULATION RULES (CRITICAL):
 
 
 def get_system_prompt(
-    user_id: str, 
+    user_id: str,
     top_k: int = 20,
     question: str = None,
     vector_store_manager = None,
     preload_examples: bool = True,
-    is_journey: bool = False
+    is_journey: bool = False,
+    precomputed_embedding: Optional[List[float]] = None,
+    preloaded_example_docs: Optional[List] = None,
 ) -> str:
     """
     Get the complete system prompt with optional pre-loaded examples.
@@ -96,6 +98,8 @@ def get_system_prompt(
         vector_store_manager: VectorStoreService instance for retrieving examples
         preload_examples: Whether to pre-load 1-2 examples in the prompt
         is_journey: Whether the question is about journeys/movement
+        precomputed_embedding: Optional embedding from 80% path miss to avoid re-embedding (saves ~450ms)
+        preloaded_example_docs: Optional list of Document-like objects from 80% path miss; when set, skips vector search (saves ~1.5s)
         
     Returns:
         Complete system prompt string with optional examples
@@ -104,8 +108,8 @@ def get_system_prompt(
     # Removed fallback tools (get_table_list, get_table_structure) and redundant query tools (count_query, list_query)
     # to save tokens. The agent handles structure errors automatically via auto-retry.
     
-    # Base tools available to everyone
-    tools_list = "execute_db_query, get_few_shot_examples"
+    # Base tools available to everyone (examples from ai_vector_examples only, pre-loaded in prompt)
+    tools_list = "execute_db_query, get_table_list, get_table_structure"
     
     # Workflow description
     if is_journey:
@@ -121,6 +125,8 @@ TOOLS: {tools_list}
 
 WORKFLOW:
 - {workflow_desc}
+
+USER_ID: The user_id for this request is set by the system (see USER/ADMIN section below). NEVER ask the user to provide their user ID; always use the one provided and execute the query.
 
 CRITICAL: You MUST execute queries when examples are provided. Do NOT refuse valid queries that match the examples.
 - If you see a similar example query, adapt it (change time ranges, filters) and EXECUTE it
@@ -155,11 +161,11 @@ RULES:
         base_prompt = f"{base_prompt}\n\n{rules_block}"
 
     admin_prompt = f"""
-ADMIN MODE: No user_id filtering required. Query across all users.
+ADMIN MODE: The user_id for this request is: {user_id}. No user_id filtering required; query across all users. Do NOT ask the user for their user ID.
 """.strip()
 
     user_prompt = f"""
-USER MODE: user_id = {user_id}
+USER MODE: The user_id for this request is: {user_id}. Do NOT ask the user for their user ID.
 - ALWAYS filter by ud.user_id = '{user_id}'
 - ALWAYS join user_device_assignment (ud)
 - Aggregations, GROUP BY, COUNT, SUM, etc. are ALLOWED for this user_id's data
@@ -176,56 +182,55 @@ USER MODE: user_id = {user_id}
     else:
         main_prompt = "\n\n".join([base_prompt, user_prompt])
     
-    # Pre-load examples if requested and parameters are provided
-    if preload_examples and question and vector_store_manager:
-        try:
-            # Check if this is a journey question
-            # Determine if we should treat as journey question based on input flag or keywords
-            is_journey_question = is_journey
-            if not is_journey_question and question:
-                 question_lower = question.lower()
-                 is_journey_question = any(keyword in question_lower for keyword in [
-                    "journey", "movement", "facility to facility", "entered", "exited", 
-                    "path", "traveled", "transition"
-                ])
-            
-            # OPTIMIZATION 2: Load minimal examples for journey questions (need SQL structure reference)
-            if is_journey_question:
-                # Load 1 example to show correct SQL structure (table names, joins)
-                # Use description-only format to save tokens (Optimization 3)
-                example_docs = vector_store_manager.search_examples(
-                    question, 
-                    k=1,
-                    use_description_only=False  # Need SQL structure, so include SQL
-                )
-                extra_docs = []
-                print(f"✅ OPTIMIZATION: Loaded 1 example for journey question (SQL structure reference) - saving ~1,000 tokens vs 2 examples")
-            else:
-                # Non-journey questions still need examples
-                example_count = 2
-                extra_count = 1
-                example_docs = vector_store_manager.search_examples(question, k=example_count)
-                extra_docs = vector_store_manager.search_extra_prompts(question, k=extra_count) if extra_count > 0 else []
-            
-            examples_section_parts = []
-            
-            if example_docs:
-                examples_section_parts.append("\n\n=== RELEVANT EXAMPLE QUERIES ===\n")
-                for i, doc in enumerate(example_docs, 1):
-                    examples_section_parts.append(f"Example {i}:\n{doc.page_content}\n")
-            
-            if extra_docs:
-                examples_section_parts.append("\n=== RELEVANT BUSINESS RULES & SCHEMA INFO ===\n")
-                for i, doc in enumerate(extra_docs, 1):
-                    examples_section_parts.append(f"{i}. {doc.page_content}\n")
-            
-            if examples_section_parts:
-                examples_section = "".join(examples_section_parts)
-                main_prompt += examples_section
-                print(f"✅ Pre-loaded {len(example_docs)} examples and {len(extra_docs)} business rules into system prompt")
-        except Exception as e:
-            # If example retrieval fails, continue without examples
-            print(f"⚠️  Warning: Failed to pre-load examples: {e}. Continuing without examples.")
+    # Pre-load examples: use preloaded from 80% path miss (skips vector search), or fetch from vector store
+    if preload_examples:
+        example_docs = None
+        if preloaded_example_docs:
+            example_docs = preloaded_example_docs
+            logger.info("get_system_prompt: using preloaded_example_docs (no vector search)")
+        elif (question or precomputed_embedding is not None) and vector_store_manager:
+            try:
+                # Check if this is a journey question
+                is_journey_question = is_journey
+                if not is_journey_question and question:
+                    question_lower = question.lower()
+                    is_journey_question = any(keyword in question_lower for keyword in [
+                        "journey", "movement", "facility to facility", "entered", "exited",
+                        "path", "traveled", "transition"
+                    ])
+
+                # Training data from ai_vector_examples only (no ai_vector_extra_prompts)
+                if precomputed_embedding is not None:
+                    logger.info("get_system_prompt: using precomputed_embedding (no re-embed)")
+                    if is_journey_question:
+                        example_docs = vector_store_manager.search_examples_with_embedding(
+                            precomputed_embedding, k=1, use_description_only=False
+                        )
+                    else:
+                        example_count = 3
+                        example_docs = vector_store_manager.search_examples_with_embedding(
+                            precomputed_embedding, k=example_count
+                        )
+                else:
+                    if is_journey_question:
+                        example_docs = vector_store_manager.search_examples(
+                            question, k=1, use_description_only=False
+                        )
+                    else:
+                        example_count = 3
+                        example_docs = vector_store_manager.search_examples(question, k=example_count)
+            except Exception as e:
+                pass  # Continue without examples
+
+        # Build examples section (whether example_docs came from preloaded or vector store)
+        examples_section_parts = []
+        if example_docs:
+            examples_section_parts.append("\n\n=== RELEVANT EXAMPLE QUERIES (ai_vector_examples) ===\n")
+            for i, doc in enumerate(example_docs, 1):
+                examples_section_parts.append(f"Example {i}:\n{doc.page_content}\n")
+        if examples_section_parts:
+            examples_section = "".join(examples_section_parts)
+            main_prompt += examples_section
     
     return main_prompt
 

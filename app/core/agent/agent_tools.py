@@ -2,10 +2,11 @@
 LangGraph Agent Tools
 
 This module defines tools that the agent can use:
-1. get_few_shot_examples - Retrieves similar examples from PostgreSQL vector store (pgvector)
-2. execute_db_query - Executes SQL queries against PostgreSQL
-3. get_table_list - Retrieves list of tables with descriptions and important fields
-4. get_table_structure - Retrieves full column structure for specified tables
+1. execute_db_query - Executes SQL queries against PostgreSQL
+2. get_table_list - Retrieves list of tables with descriptions and important fields
+3. get_table_structure - Retrieves full column structure for specified tables
+
+Training examples come from ai_vector_examples only, pre-loaded in the system prompt.
 """
 
 from typing import Optional, Dict, Any, Sequence, Tuple, List
@@ -74,71 +75,6 @@ def _is_restricted_query(query: str) -> Tuple[bool, Optional[str]]:
                 return True, table
     
     return False, None
-
-
-def create_get_few_shot_examples_tool(vector_store_manager):
-    """
-    Create the get_few_shot_examples tool function.
-    
-    Args:
-        vector_store_manager: VectorStoreService instance
-        
-    Returns:
-        Tool function for retrieving examples
-    """
-    @tool
-    def get_few_shot_examples(question: str) -> str:
-        """
-        Retrieve additional similar example queries and business rules from the knowledge base.
-        
-        NOTE: You already have 1-2 relevant examples pre-loaded in your system prompt.
-        Use this tool ONLY when:
-        - You need MORE examples beyond what's already provided
-        - The pre-loaded examples don't match your specific use case
-        - You need additional business rules or schema information
-        
-        Args:
-            question: The user's question to find similar examples for
-            
-        Returns:
-            A formatted string containing similar examples and relevant context
-        """
-        print(f"\n{'='*80}")
-        print(f"🔧 TOOL CALLED: get_few_shot_examples")
-        print(f"{'='*80}")
-        print(f"   Input Question: {question}")
-        
-        # Search for similar examples
-        example_docs = vector_store_manager.search_examples(question, k=3)
-        
-        # Search for relevant extra prompt data
-        extra_docs = vector_store_manager.search_extra_prompts(question, k=2)
-        
-        result_parts = []
-        
-        if example_docs:
-            result_parts.append("=== SIMILAR EXAMPLE QUERIES ===\n")
-            for i, doc in enumerate(example_docs, 1):
-                result_parts.append(f"Example {i}:\n{doc.page_content}\n")
-        
-        if extra_docs:
-            result_parts.append("\n=== RELEVANT BUSINESS RULES & SCHEMA INFO ===\n")
-            for i, doc in enumerate(extra_docs, 1):
-                result_parts.append(f"{i}. {doc.page_content}\n")
-        
-        if not result_parts:
-            print(f"   Result: No similar examples found")
-            print(f"{'='*80}\n")
-            return "No similar examples found. Proceed with your knowledge of the database schema."
-        
-        result = "\n".join(result_parts)
-        print(f"   Result: Found {len(example_docs)} examples and {len(extra_docs)} extra prompts")
-        print(f"   Output length: {len(result)} characters")
-        print(f"{'='*80}\n")
-        
-        return result
-    
-    return get_few_shot_examples
 
 
 def create_count_query_tool(db: SQLDatabase):
@@ -261,71 +197,6 @@ def create_list_query_tool(db: SQLDatabase):
     return list_query
 
 
-def create_get_extra_examples_tool(vector_store_manager):
-    """
-    Create the get_extra_examples tool function (alias for get_few_shot_examples).
-    
-    Args:
-        vector_store_manager: VectorStoreService instance
-        
-    Returns:
-        Tool function for retrieving additional examples
-    """
-    @tool
-    def get_extra_examples(question: str) -> str:
-        """
-        Retrieve additional similar example queries beyond the 2 pre-loaded examples.
-        
-        NOTE: You already have 1-2 relevant examples pre-loaded in your system prompt.
-        Use this tool ONLY when:
-        - You need MORE examples beyond what's already provided
-        - The pre-loaded examples don't match your specific use case
-        - You need additional business rules or schema information
-        
-        This is an alias for get_few_shot_examples for clarity.
-        
-        Args:
-            question: The user's question to find similar examples for
-            
-        Returns:
-            A formatted string containing similar examples and relevant context
-        """
-        print(f"\n{'='*80}")
-        print(f"🔧 TOOL CALLED: get_extra_examples")
-        print(f"{'='*80}")
-        print(f"   Input Question: {question}")
-        
-        # Search for similar examples (same logic as get_few_shot_examples)
-        example_docs = vector_store_manager.search_examples(question, k=3)
-        extra_docs = vector_store_manager.search_extra_prompts(question, k=2)
-        
-        result_parts = []
-        
-        if example_docs:
-            result_parts.append("=== SIMILAR EXAMPLE QUERIES ===\n")
-            for i, doc in enumerate(example_docs, 1):
-                result_parts.append(f"Example {i}:\n{doc.page_content}\n")
-        
-        if extra_docs:
-            result_parts.append("\n=== RELEVANT BUSINESS RULES & SCHEMA INFO ===\n")
-            for i, doc in enumerate(extra_docs, 1):
-                result_parts.append(f"{i}. {doc.page_content}\n")
-        
-        if not result_parts:
-            print(f"   Result: No similar examples found")
-            print(f"{'='*80}\n")
-            return "No similar examples found. Proceed with your knowledge of the database schema."
-        
-        result = "\n".join(result_parts)
-        print(f"   Result: Found {len(example_docs)} examples and {len(extra_docs)} extra prompts")
-        print(f"   Output length: {len(result)} characters")
-        print(f"{'='*80}\n")
-        
-        return result
-    
-    return get_extra_examples
-
-
 class QuerySQLDatabaseTool:
     """
     Tool for executing SQL queries against PostgreSQL database.
@@ -430,10 +301,16 @@ class QuerySQLDatabaseTool:
                 # For other errors, return error message (similar to run_no_throw behavior)
                 return f"Error executing query: {str(e)}"
         
+        # #region agent log
+        _t_sql_start = __import__("time").perf_counter()
+        # #endregion
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(_execute_query)
                 output = future.result(timeout=QUERY_TIMEOUT_SECONDS + 10)  # Add 10s buffer
+            # #region agent log
+            _t_sql_end = __import__("time").perf_counter()
+            # #endregion
         except FutureTimeoutError:
             # Python-level timeout occurred - query should be killed by PostgreSQL
             error_msg = f"Query execution exceeded {QUERY_TIMEOUT_SECONDS} seconds and was killed."
@@ -516,7 +393,19 @@ class QuerySQLDatabaseTool:
             # If > 5 rows, format with CSV
             if row_count > 5:
                 print(f"   Large result detected ({row_count} rows), generating CSV...")
+                # #region agent log
+                _t_csv_start = __import__("time").perf_counter()
+                # #endregion
                 formatted_result = format_result_with_csv(result, max_preview_rows=5)
+                # #region agent log
+                _t_csv_end = __import__("time").perf_counter()
+                try:
+                    _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                    _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "D", "location": "agent_tools.py:execute_db_query", "message": "tool_exec sql vs csv", "data": {"sql_ms": round((_t_sql_end - _t_sql_start) * 1000), "csv_ms": round((_t_csv_end - _t_csv_start) * 1000), "row_count": row_count}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                    _f.close()
+                except Exception:
+                    pass
+                # #endregion
                 print(f"   Formatted result with CSV link")
                 print(f"{'='*80}\n")
                 return formatted_result
@@ -674,7 +563,7 @@ def create_execute_db_query_tool(db: SQLDatabase, vector_store_manager):
         
         Use this tool AFTER you have:
         1. Called check_user_query_restriction with the user's question and received confirmation
-        2. Retrieved examples using get_few_shot_examples (if needed)
+        2. Used the examples provided in the system prompt (from ai_vector_examples)
         3. Generated a valid PostgreSQL query
         
         Args:
@@ -718,7 +607,6 @@ def create_get_table_list_tool(db: SQLDatabase, table_metadata: Optional[List[Di
         
         Use this tool ONLY when:
         - You have already tried to generate a query using the examples in the system prompt
-        - You have already tried using get_few_shot_examples to get more examples
         - You STILL cannot generate a query and need to discover what tables are available
         
         This tool returns all configured tables with:
@@ -799,9 +687,8 @@ def create_get_table_structure_tool(db: SQLDatabase):
         """
         FALLBACK TOOL ONLY - Use this ONLY after you have:
         1. Tried to generate a query from examples in the system prompt
-        2. Tried using get_few_shot_examples to get more examples
-        3. Used get_table_list to discover tables
-        4. STILL need detailed column information to construct a query
+        2. Used get_table_list to discover tables
+        3. STILL need detailed column information to construct a query
         
         Do NOT call this tool if you can generate a query from the examples. This is a LAST RESORT tool.
         
