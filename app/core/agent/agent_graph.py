@@ -373,9 +373,9 @@ class SQLAgentGraph:
 
         # Route to provider-specific handler
         if self.provider == "GROQ":
-            # Skip Groq if disabled via env, or 401 seen this request, or 401 seen this process (avoid repeated fail-then-fallback latency)
+            # Skip Groq if disabled via .env (GROQ_DISABLED=true), or 401 seen this request, or 401 seen this process (avoid repeated fail-then-fallback latency)
             skip = (
-                getattr(settings, "GROQ_DISABLED", False)
+                settings.groq_disabled
                 or getattr(self, "_groq_401_seen_this_request", False)
                 or getattr(SQLAgentGraph, "_groq_401_seen_process", False)
             )

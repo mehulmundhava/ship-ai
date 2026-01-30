@@ -93,19 +93,26 @@ class Settings(BaseSettings):
     def model_post_init(self, __context):
         """Post-initialization to handle fallbacks and normalization."""
         import os
-        
+
+        # Normalize GROQ_DISABLED from .env (env vars are strings: "true"/"false")
+        groq_disabled_env = os.environ.get("GROQ_DISABLED", "").strip().lower()
+        if groq_disabled_env in ("true", "1", "yes"):
+            self.GROQ_DISABLED = True
+        elif groq_disabled_env in ("false", "0", "no"):
+            self.GROQ_DISABLED = False
+
         # Handle USER vs DBUSER fallback
         if not self.USER:
             self.USER = os.environ.get("DBUSER", "")
-        
+
         # Handle API_KEY vs OPENAI_API_KEY fallback
         if not self.API_KEY:
             self.API_KEY = os.environ.get("OPENAI_API_KEY")
-        
+
         # Normalize LLM provider
         if self.LLM_PROVIDER:
             self.LLM_PROVIDER = self.LLM_PROVIDER.upper()
-        
+
         # Use HUGGING_FACE_MODEL if provided, otherwise use EMBEDDING_MODEL_NAME
         if not self.HUGGING_FACE_MODEL:
             self.HUGGING_FACE_MODEL = self.EMBEDDING_MODEL_NAME
@@ -146,7 +153,12 @@ class Settings(BaseSettings):
     @property
     def groq_api_key(self) -> Optional[str]:
         return self.GROQ_API_KEY
-    
+
+    @property
+    def groq_disabled(self) -> bool:
+        """Whether to skip Groq and use OpenAI fallback. Read from .env GROQ_DISABLED."""
+        return bool(self.GROQ_DISABLED)
+
     def get_api_base_url(self) -> str:
         """Base URL for API (e.g. CSV download links). No trailing slash."""
         return (self.API_BASE_URL or "http://localhost:3009").rstrip("/")
