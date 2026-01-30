@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     token_id: str
     question: str
     user_id: Optional[str] = None
+    login_id: Optional[str] = None
     chat_history: Optional[List[Tuple[str, str]]] = []
 
 
@@ -25,7 +26,15 @@ class ChatResponse(BaseModel):
     token_id: str
     answer: str
     sql_query: Optional[str] = None
+    results: Optional[Dict[str, Any]] = None  # Result data from query execution
+    cached: Optional[bool] = False  # True if answer came from cache
+    similarity: Optional[float] = None  # Similarity score (only when cached)
+    llm_used: Optional[bool] = True  # False if answer came from cache
+    llm_type: Optional[str] = None  # Model used when LLM was used (e.g. OPENAI/gpt-4o)
+    tokens_saved: Optional[str] = None  # Estimated tokens saved (only when cached)
     debug: Optional[Dict[str, Any]] = None
+    csv_id: Optional[str] = None  # CSV download ID; use GET /download-csv/{csv_id} (same base URL as /chat)
+    csv_download_path: Optional[str] = None  # Relative path e.g. /download-csv/{uuid} for UI/Postman
 
 
 class HealthCheckResponse(BaseModel):

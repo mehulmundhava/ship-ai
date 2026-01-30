@@ -124,10 +124,36 @@ class LLMService:
                 "Set GROQ_API_KEY environment variable."
             )
         
+        # Groq-specific configuration for better tool calling compatibility
         groq_llm = ChatGroq(
             groq_api_key=api_key,
             model_name=model,
-            temperature=temperature
+            temperature=temperature,
+            # Add timeout to prevent hanging
+            timeout=60,
+            # Some Groq models work better with explicit tool_choice
+            # We'll handle this in bind_tools if needed
         )
         return groq_llm
+    
+    def get_fallback_llm_model(
+        self, 
+        temperature: float = 0, 
+        model: str = None
+    ) -> BaseChatModel:
+        """
+        Get fallback LLM instance (always OpenAI/ChatGPT).
+        Used when primary provider (Groq) fails.
+        
+        Args:
+            temperature (float): Controls randomness in responses. Default: 0
+            model (str): Model name. If None, uses OpenAI default.
+        
+        Returns:
+            BaseChatModel: Configured OpenAI LLM instance
+        """
+        return self.openai_llm_model(
+            temperature=temperature,
+            model=model or "gpt-4o"
+        )
 

@@ -7,8 +7,11 @@ Uses Hugging Face embeddings instead of OpenAI for cost efficiency.
 """
 
 import json
+import logging
 from typing import List, Optional
 from langchain_huggingface import HuggingFaceEmbeddings
+
+logger = logging.getLogger("ship_rag_ai")
 from langchain.schema import Document
 from sqlalchemy import text
 from app.config.database import sync_engine
@@ -96,7 +99,8 @@ class VectorStoreService:
         """
         return self.embed_query(query)
     
-    def search_examples(self, query: str, k: int = 3, example_id: Optional[int] = None) -> List[Document]:
+    def search_examples(self, query: str, k: int = 3, example_id: Optional[int] = None, 
+                        use_description_only: bool = False) -> List[Document]:
         """
         Search for similar examples in the PostgreSQL vector store.
         
@@ -104,22 +108,20 @@ class VectorStoreService:
             query: Search query
             k: Number of results to return
             example_id: Optional specific example ID to filter by (to check distance)
+            use_description_only: If True, use description instead of full SQL (for journey questions)
             
         Returns:
             List of similar example documents
         """
-        print(f"\n{'='*80}")
-        print(f"🔍 VECTOR STORE SEARCH - Examples")
-        print(f"{'='*80}")
-        print(f"   Query: {query}")
-        print(f"   K: {k}")
-        if example_id:
-            print(f"   Filtering by ID: {example_id}")
-        
         try:
+            # #region agent log
+            _t0 = __import__("time").perf_counter()
+            # #endregion
             # Generate embedding for the query
             query_embedding = self.embed_query(query)
-            
+            # #region agent log
+            _t1 = __import__("time").perf_counter()
+            # #endregion
             # Convert to PostgreSQL array format string for vector type
             # pgvector expects the format: '[1,2,3]'::vector
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
@@ -144,6 +146,7 @@ class VectorStoreService:
                     id,
                     question,
                     sql_query,
+                    description,
                     metadata,
                     {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
                 FROM ai_vector_examples
@@ -155,12 +158,31 @@ class VectorStoreService:
             with self.engine.connect() as conn:
                 result = conn.execute(search_query, query_params)
                 rows = result.fetchall()
+            # #region agent log
+            _t2 = __import__("time").perf_counter()
+            try:
+                _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "B", "location": "vector_store_service.py:search_examples", "message": "search_examples embed vs db", "data": {"embed_ms": round((_t1 - _t0) * 1000), "db_ms": round((_t2 - _t1) * 1000), "k": k}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                _f.close()
+            except Exception:
+                pass
+            # #endregion
             
             # Convert results to Document objects
             documents = []
             for row in rows:
-                # Combine question and SQL for the document content
-                content = f"Question: {row.question}\n\nSQL Query:\n{row.sql_query}"
+                # OPTIMIZATION 3: For journey questions, use description instead of SQL
+                content_parts = [f"Question: {row.question}"]
+                
+                if use_description_only and row.description:
+                    content_parts.append(f"Description: {row.description}")
+                else:
+                    # Normal format: include description if available, then SQL
+                    if row.description:
+                        content_parts.append(f"Description: {row.description}")
+                    content_parts.append(f"\nSQL Query:\n{row.sql_query}")
+                
+                content = "\n\n".join(content_parts)
                 
                 # Parse metadata - JSONB columns are typically returned as dicts by psycopg2
                 # But handle string case for safety
@@ -182,22 +204,11 @@ class VectorStoreService:
                 )
                 documents.append(doc)
             
-            print(f"   Found {len(documents)} results:")
-            for i, doc in enumerate(documents, 1):
-                content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-                print(f"   [{i}] {content_preview}")
-                if doc.metadata:
-                    distance = doc.metadata.get('distance')
-                    if distance is not None:
-                        print(f"       Distance: {distance:.4f}")
-            print(f"{'='*80}\n")
-            
+            logger.debug(f"vector examples k={k} found={len(documents)}")
             return documents
             
         except Exception as e:
-            print(f"❌ Error searching examples: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"Error searching examples: {e}")
             return []
     
     def search_extra_prompts(self, query: str, k: int = 2, extra_prompts_id: Optional[int] = None) -> List[Document]:
@@ -212,18 +223,15 @@ class VectorStoreService:
         Returns:
             List of relevant prompt documents
         """
-        print(f"\n{'='*80}")
-        print(f"🔍 VECTOR STORE SEARCH - Extra Prompts")
-        print(f"{'='*80}")
-        print(f"   Query: {query}")
-        print(f"   K: {k}")
-        if extra_prompts_id:
-            print(f"   Filtering by ID: {extra_prompts_id}")
-        
         try:
+            # #region agent log
+            _t0 = __import__("time").perf_counter()
+            # #endregion
             # Generate embedding for the query
             query_embedding = self.embed_query(query)
-            
+            # #region agent log
+            _t1 = __import__("time").perf_counter()
+            # #endregion
             # Convert to PostgreSQL array format string for vector type
             # pgvector expects the format: '[1,2,3]'::vector
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
@@ -258,6 +266,15 @@ class VectorStoreService:
             with self.engine.connect() as conn:
                 result = conn.execute(search_query, query_params)
                 rows = result.fetchall()
+            # #region agent log
+            _t2 = __import__("time").perf_counter()
+            try:
+                _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "B", "location": "vector_store_service.py:search_extra_prompts", "message": "search_extra_prompts embed vs db", "data": {"embed_ms": round((_t1 - _t0) * 1000), "db_ms": round((_t2 - _t1) * 1000), "k": k}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                _f.close()
+            except Exception:
+                pass
+            # #endregion
             
             # Convert results to Document objects
             documents = []
@@ -284,24 +301,114 @@ class VectorStoreService:
                 )
                 documents.append(doc)
             
-            print(f"   Found {len(documents)} results:")
-            for i, doc in enumerate(documents, 1):
-                content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-                print(f"   [{i}] {content_preview}")
-                if doc.metadata:
-                    distance = doc.metadata.get('distance')
-                    if distance is not None:
-                        print(f"       Distance: {distance:.4f}")
-            print(f"{'='*80}\n")
-            
+            logger.debug(f"vector extra_prompts k={k} found={len(documents)}")
             return documents
             
         except Exception as e:
-            print(f"❌ Error searching extra prompts: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"Error searching extra prompts: {e}")
             return []
-    
+
+    def search_examples_with_embedding(
+        self,
+        embedding: List[float],
+        k: int = 3,
+        example_id: Optional[int] = None,
+        use_description_only: bool = False,
+    ) -> List[Document]:
+        """Search examples by precomputed embedding (no embed_query). Used when 80% path misses."""
+        try:
+            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+            where_conditions = [f"{self.embedding_field_name} IS NOT NULL"]
+            query_params = {"k": k}
+            if example_id is not None:
+                where_conditions.append("id = :example_id")
+                query_params["example_id"] = example_id
+            where_clause = " AND ".join(where_conditions)
+            search_query = text(f"""
+                SELECT id, question, sql_query, description, metadata,
+                    {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
+                FROM ai_vector_examples
+                WHERE {where_clause}
+                ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
+                LIMIT :k
+            """)
+            with self.engine.connect() as conn:
+                result = conn.execute(search_query, query_params)
+                rows = result.fetchall()
+            documents = []
+            for row in rows:
+                content_parts = [f"Question: {row.question}"]
+                if use_description_only and row.description:
+                    content_parts.append(f"Description: {row.description}")
+                else:
+                    if row.description:
+                        content_parts.append(f"Description: {row.description}")
+                    content_parts.append(f"\nSQL Query:\n{row.sql_query}")
+                content = "\n\n".join(content_parts)
+                if isinstance(row.metadata, dict):
+                    metadata = row.metadata.copy()
+                elif isinstance(row.metadata, str):
+                    try:
+                        metadata = json.loads(row.metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                else:
+                    metadata = {}
+                metadata["distance"] = float(row.distance) if row.distance else None
+                metadata["id"] = row.id
+                documents.append(Document(page_content=content, metadata=metadata))
+            return documents
+        except Exception as e:
+            logger.warning(f"Error searching examples with embedding: {e}")
+            return []
+
+    def search_extra_prompts_with_embedding(
+        self,
+        embedding: List[float],
+        k: int = 2,
+        extra_prompts_id: Optional[int] = None,
+    ) -> List[Document]:
+        """Search extra prompts by precomputed embedding (no embed_query). Used when 80% path misses."""
+        try:
+            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+            where_conditions = [f"{self.embedding_field_name} IS NOT NULL"]
+            query_params = {"k": k}
+            if extra_prompts_id is not None:
+                where_conditions.append("id = :extra_prompts_id")
+                query_params["extra_prompts_id"] = extra_prompts_id
+            where_clause = " AND ".join(where_conditions)
+            search_query = text(f"""
+                SELECT id, content, note_type, metadata,
+                    {self.embedding_field_name} <-> '{embedding_str}'::vector AS distance
+                FROM ai_vector_extra_prompts
+                WHERE {where_clause}
+                ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
+                LIMIT :k
+            """)
+            with self.engine.connect() as conn:
+                result = conn.execute(search_query, query_params)
+                rows = result.fetchall()
+            documents = []
+            for row in rows:
+                if isinstance(row.metadata, dict):
+                    metadata = row.metadata.copy()
+                elif isinstance(row.metadata, str):
+                    try:
+                        metadata = json.loads(row.metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                else:
+                    metadata = {}
+                if row.note_type:
+                    metadata["note_type"] = row.note_type
+                metadata["distance"] = float(row.distance) if row.distance else None
+                metadata["id"] = row.id
+                documents.append(Document(page_content=row.content, metadata=metadata))
+            return documents
+        except Exception as e:
+            logger.warning(f"Error searching extra prompts with embedding: {e}")
+            return []
+
     def reload_stores(self):
         """
         Reload vector stores from PostgreSQL.

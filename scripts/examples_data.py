@@ -68,6 +68,23 @@ SAMPLE_EXAMPLES = [
                 "complexity": "medium",
             },
         },
+    # Historical temperature by date: use time-series table (incoming_message_history_k or incoming_message_table), not device_current_data.
+    # If your DB uses incoming_message_table or a different timestamp column, edit the SQL and reload via load_examples_data.py.
+    {
+        "question": "What was the maximum temperature on 24 January 2026 for device id WT01EB25EC389682?",
+        "sql": """SELECT MAX(ik.temperature) AS max_temperature
+FROM incoming_message_history_k ik
+JOIN user_device_assignment ud ON ik.device_id = ud.device
+WHERE ud.user_id = 27
+  AND ik.device_id = 'WT01EB25EC389682'
+  AND ik.event_time::date = '2026-01-24';""",
+        "description": "Historical temperature by date: use incoming_message_history_k (or incoming_message_table). Filter by event_time::date for the requested date. device_current_data is for current snapshot only.",
+        "metadata": {
+            "keywords": ["maximum temperature", "historical", "specific date", "on date", "incoming_message_history_k", "incoming_message_table", "temperature by date", "device"],
+            "type": "historical_temperature",
+            "complexity": "medium",
+        },
+    },
     {
         "question": "Count devices that have current battery more than 80%",
         "sql": """SELECT COUNT(*) as device_count
@@ -194,7 +211,14 @@ SAMPLE_EXAMPLES = [
 # These provide context about database schema and business logic
 EXTRA_PROMPT_DATA = [
     {
-        "content": "device_current_data (CD) - Contains current data of devices like temperature, battery, dwell-time, event-time(location event-time), free-fall-event-time, shock-event-time, facility-id, facility-type. Join field: CD.device_id = D.device_id and ud.device = cd.device_id ",
+        "content": "Temperature by date: For 'what was the maximum/minimum temperature on a specific date' or any historical temperature-by-date question, use incoming_message_history_k (IK) or incoming_message_table—the table that stores time-series messages per device with temperature and a timestamp (e.g. event_time). device_current_data (CD) holds only the latest snapshot per device; use CD only for 'current' or 'latest' temperature, not for historical-by-date queries.",
+        "metadata": {
+            "keywords": ["historical", "maximum temperature", "minimum temperature", "specific date", "on date", "incoming_message_history_k", "incoming_message_table", "device_current_data", "current vs historical", "temperature by date"],
+            "type": "schema_info",
+        },
+    },
+    {
+        "content": "device_current_data (CD) - Contains current data of devices like temperature, battery, dwell-time, event-time(location event-time), free-fall-event-time, shock-event-time, facility-id, facility-type. Join field: CD.device_id = D.device_id and ud.device = cd.device_id. Use only for current/latest snapshot; for historical temperature on a date use incoming_message_history_k or incoming_message_table.",
         "metadata": {
             "keywords": ["device_current_data", "temperature", "battery", "dwell-time", "event-time", "free-fall-event-time", "shock-event-time", "facility-id", "facility-type"],
             "type": "schema_info",
@@ -269,15 +293,22 @@ EXTRA_PROMPT_DATA = [
         },
     },
     {
-        "content": "incoming_message_history_k (IK) - Use for get Location history (lat-long) of devices. It also contain dwell-time(how long device is there in same location), move mark (first entry at which device has change it's location). Join field: IK.device_id = D.device_id, IK.facility_id = F.facility_id",
+        "content": "incoming_message_history_k (IK) / incoming_message_table - Use for location history (lat-long), historical temperature and battery by date, dwell-time, move mark. Contains temperature, battery, event_time (or timestamp) for time-series queries. For 'max/min temperature on date X' use this table with event_time::date or equivalent. Join: IK.device_id = ud.device, user_device_assignment ud for user_id filter.",
         "metadata": {
             "keywords": [
-                "incoming_message_history_k (IK)",
+                "incoming_message_history_k",
+                "incoming_message_table",
                 "location",
                 "latitude",
                 "longitude",
                 "dwell",
                 "facility",
+                "temperature",
+                "battery",
+                "event_time",
+                "historical",
+                "maximum temperature",
+                "specific date",
             ],
             "type": "schema_info",
         },

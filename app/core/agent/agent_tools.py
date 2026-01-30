@@ -2,19 +2,28 @@
 LangGraph Agent Tools
 
 This module defines tools that the agent can use:
-1. get_few_shot_examples - Retrieves similar examples from PostgreSQL vector store (pgvector)
-2. execute_db_query - Executes SQL queries against PostgreSQL
-3. get_table_list - Retrieves list of tables with descriptions and important fields
-4. get_table_structure - Retrieves full column structure for specified tables
+1. execute_db_query - Executes SQL queries against PostgreSQL
+2. get_table_list - Retrieves list of tables with descriptions and important fields
+3. get_table_structure - Retrieves full column structure for specified tables
+
+Training examples come from ai_vector_examples only, pre-loaded in the system prompt.
 """
 
 from typing import Optional, Dict, Any, Sequence, Tuple, List
 import re
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from langchain_core.tools import tool
 from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy.engine import Result
 from sqlalchemy import text
 from app.config.table_metadata import TABLE_METADATA
+from app.config.database import QUERY_TIMEOUT_SECONDS, sync_engine
+from app.utils.csv_generator import format_result_with_csv, generate_csv_from_result, format_journey_list_with_csv
+from app.core.journey_calculator import calculate_journey_counts, calculate_journey_list
+
+logger = logging.getLogger("ship_rag_ai")
 
 # List of sensitive tables that should not be queried directly for raw data
 RESTRICTED_TABLES = [
@@ -68,69 +77,124 @@ def _is_restricted_query(query: str) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
-def create_get_few_shot_examples_tool(vector_store_manager):
+def create_count_query_tool(db: SQLDatabase):
     """
-    Create the get_few_shot_examples tool function.
+    Create the count_query tool function for COUNT/aggregation queries.
     
     Args:
-        vector_store_manager: VectorStoreService instance
+        db: SQLDatabase instance
         
     Returns:
-        Tool function for retrieving examples
+        Tool function for executing COUNT queries
     """
+    query_tool = QuerySQLDatabaseTool(db)
+    
     @tool
-    def get_few_shot_examples(question: str) -> str:
+    def count_query(query: str) -> str:
         """
-        Retrieve additional similar example queries and business rules from the knowledge base.
+        Execute COUNT or aggregation queries and return only the count/aggregation result.
         
-        NOTE: You already have 1-2 relevant examples pre-loaded in your system prompt.
-        Use this tool ONLY when:
-        - You need MORE examples beyond what's already provided
-        - The pre-loaded examples don't match your specific use case
-        - You need additional business rules or schema information
+        Use this tool when the user asks for:
+        - Counts (e.g., "how many devices", "count of assets")
+        - Totals (e.g., "total temperature", "sum of battery")
+        - Aggregations (e.g., "average temperature", "maximum battery")
+        
+        This tool is optimized for queries that return a single aggregated value.
         
         Args:
-            question: The user's question to find similar examples for
+            query: SQL query that returns a count or aggregation (should use COUNT, SUM, AVG, MAX, MIN)
             
         Returns:
-            A formatted string containing similar examples and relevant context
+            Count or aggregation result as string
         """
         print(f"\n{'='*80}")
-        print(f"🔧 TOOL CALLED: get_few_shot_examples")
+        print(f"🔧 TOOL CALLED: count_query")
         print(f"{'='*80}")
-        print(f"   Input Question: {question}")
+        print(f"   SQL Query: {query}")
         
-        # Search for similar examples
-        example_docs = vector_store_manager.search_examples(question, k=3)
+        # Execute query
+        output = query_tool.db.run_no_throw(query, include_columns=True)
         
-        # Search for relevant extra prompt data
-        extra_docs = vector_store_manager.search_extra_prompts(question, k=2)
-        
-        result_parts = []
-        
-        if example_docs:
-            result_parts.append("=== SIMILAR EXAMPLE QUERIES ===\n")
-            for i, doc in enumerate(example_docs, 1):
-                result_parts.append(f"Example {i}:\n{doc.page_content}\n")
-        
-        if extra_docs:
-            result_parts.append("\n=== RELEVANT BUSINESS RULES & SCHEMA INFO ===\n")
-            for i, doc in enumerate(extra_docs, 1):
-                result_parts.append(f"{i}. {doc.page_content}\n")
-        
-        if not result_parts:
-            print(f"   Result: No similar examples found")
+        if not output:
+            print(f"   Result: No rows returned")
             print(f"{'='*80}\n")
-            return "No similar examples found. Proceed with your knowledge of the database schema."
+            return "0"
         
-        result = "\n".join(result_parts)
-        print(f"   Result: Found {len(example_docs)} examples and {len(extra_docs)} extra prompts")
-        print(f"   Output length: {len(result)} characters")
+        result = str(output)
+        print(f"   Count Result: {result}")
         print(f"{'='*80}\n")
         
         return result
     
-    return get_few_shot_examples
+    return count_query
+
+
+def create_list_query_tool(db: SQLDatabase):
+    """
+    Create the list_query tool function for LIST queries.
+    
+    Args:
+        db: SQLDatabase instance
+        
+    Returns:
+        Tool function for executing LIST queries
+    """
+    query_tool = QuerySQLDatabaseTool(db)
+    
+    @tool
+    def list_query(query: str, limit: int = 5) -> str:
+        """
+        Execute LIST queries and return first N rows only.
+        
+        Use this tool when the user asks for:
+        - Lists of items (e.g., "list devices", "show assets", "get all facilities")
+        - Multiple rows of data
+        
+        IMPORTANT: This tool automatically limits results to the first 5 rows by default.
+        If the query returns more than 5 rows, it will:
+        1. Return the count of total rows
+        2. Show the first 5 rows
+        3. Provide a CSV download link for the full results
+        
+        Args:
+            query: SQL query that returns a list of rows
+            limit: Maximum number of rows to return in preview (default: 5)
+            
+        Returns:
+            First N rows as formatted string, with count and CSV link if > limit rows
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: list_query")
+        print(f"{'='*80}")
+        print(f"   SQL Query: {query}")
+        print(f"   Limit: {limit}")
+        
+        # Ensure query has LIMIT clause (add if not present)
+        query_upper = query.upper().strip()
+        if 'LIMIT' not in query_upper:
+            # Add LIMIT to get all rows (we'll handle splitting in result processing)
+            # But first, let's execute without modifying to preserve original query
+            pass
+        
+        # Execute query
+        output = query_tool.db.run_no_throw(query, include_columns=True)
+        
+        if not output:
+            print(f"   Result: No rows returned")
+            print(f"{'='*80}\n")
+            return ":::::: Query execution has returned 0 rows. Return final answer accordingly. ::::::"
+        
+        result = str(output)
+        
+        # Format result with CSV if needed
+        formatted_result = format_result_with_csv(result, max_preview_rows=limit)
+        
+        print(f"   Formatted result with splitting logic")
+        print(f"{'='*80}\n")
+        
+        return formatted_result
+    
+    return list_query
 
 
 class QuerySQLDatabaseTool:
@@ -141,9 +205,40 @@ class QuerySQLDatabaseTool:
     def __init__(self, db: SQLDatabase):
         self.db = db
     
+    def _detect_query_type(self, query: str) -> str:
+        """
+        Detect if query is COUNT, LIST, or other type.
+        
+        Args:
+            query: SQL query string
+            
+        Returns:
+            'count', 'list', or 'other'
+        """
+        query_upper = query.upper().strip()
+        
+        # Check for COUNT queries
+        if re.search(r'\bCOUNT\s*\(', query_upper):
+            return 'count'
+        
+        # Check for aggregation queries (SUM, AVG, MAX, MIN with GROUP BY or without)
+        if re.search(r'\b(SUM|AVG|MAX|MIN)\s*\(', query_upper):
+            # If it's just aggregation without GROUP BY, treat as count-like
+            if 'GROUP BY' not in query_upper:
+                return 'count'
+        
+        # Check for SELECT queries (list queries)
+        if query_upper.startswith('SELECT'):
+            return 'list'
+        
+        return 'other'
+    
     def execute(self, query: str) -> str:
         """
         Execute a SQL query and return results.
+        Automatically handles result splitting for large lists.
+        
+        Queries that exceed 60 seconds will be automatically killed.
         
         Args:
             query: SQL query to execute
@@ -155,9 +250,85 @@ class QuerySQLDatabaseTool:
         print(f"🔧 TOOL CALLED: execute_db_query")
         print(f"{'='*80}")
         print(f"   SQL Query: {query}")
+        print(f"   ⏱️  Timeout: {QUERY_TIMEOUT_SECONDS} seconds (query will be killed if exceeded)")
         
-        # Execute query without throwing exceptions
-        output = self.db.run_no_throw(query, include_columns=True)
+        # Detect query type
+        query_type = self._detect_query_type(query)
+        print(f"   Detected Query Type: {query_type}")
+        
+        # Execute query with timeout protection
+        # We use both connection-level statement_timeout (set at connection time) and
+        # per-query SET LOCAL as a backup to ensure queries are killed
+        def _execute_query():
+            # Get the underlying engine to execute with explicit timeout
+            engine = getattr(self.db, '_engine', None) or sync_engine
+            
+            try:
+                # Execute in a transaction with explicit statement_timeout
+                with engine.begin() as conn:
+                    # Set statement_timeout for this transaction (LOCAL means it only affects this transaction)
+                    conn.execute(text(f"SET LOCAL statement_timeout = {QUERY_TIMEOUT_SECONDS * 1000}"))
+                    
+                    # Execute the actual query
+                    result = conn.execute(text(query))
+                    
+                    # Fetch all results
+                    rows = result.fetchall()
+                    
+                    if not rows:
+                        return None
+                    
+                    # Convert to SQLDatabase format (list of dicts)
+                    columns = list(result.keys())
+                    formatted_rows = [dict(zip(columns, row)) for row in rows]
+                    
+                    # Convert to string format (pipe-separated like SQLDatabase)
+                    if not formatted_rows:
+                        return None
+                    
+                    lines = [' | '.join(columns)]
+                    for row in formatted_rows:
+                        values = [str(row.get(col, '')) for col in columns]
+                        lines.append(' | '.join(values))
+                    
+                    return '\n'.join(lines)
+            except Exception as e:
+                # Check if it's a timeout error
+                error_str = str(e).lower()
+                if 'timeout' in error_str or 'statement_timeout' in error_str or 'canceling statement' in error_str:
+                    # Re-raise timeout errors so they're handled by the outer try/except
+                    raise TimeoutError(f"Query timeout: {str(e)}")
+                # For other errors, return error message (similar to run_no_throw behavior)
+                return f"Error executing query: {str(e)}"
+        
+        # #region agent log
+        _t_sql_start = __import__("time").perf_counter()
+        # #endregion
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_execute_query)
+                output = future.result(timeout=QUERY_TIMEOUT_SECONDS + 10)  # Add 10s buffer
+            # #region agent log
+            _t_sql_end = __import__("time").perf_counter()
+            # #endregion
+        except FutureTimeoutError:
+            # Python-level timeout occurred - query should be killed by PostgreSQL
+            error_msg = f"Query execution exceeded {QUERY_TIMEOUT_SECONDS} seconds and was killed."
+            logger.error(f"⏱️  Query timeout: {error_msg}")
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return f":::::: Query execution timeout: The query took longer than {QUERY_TIMEOUT_SECONDS} seconds and was automatically killed. Please optimize your query or use more specific filters. ::::::"
+        except Exception as e:
+            # If it's a timeout-related error from PostgreSQL, handle it
+            error_str = str(e).lower()
+            if 'timeout' in error_str or 'statement_timeout' in error_str or 'canceling statement' in error_str or 'cancelled' in error_str:
+                error_msg = f"Query execution exceeded {QUERY_TIMEOUT_SECONDS} seconds and was killed by database."
+                logger.error(f"⏱️  Database timeout: {error_msg}")
+                print(f"   ❌ {error_msg}")
+                print(f"{'='*80}\n")
+                return f":::::: Query execution timeout: The query took longer than {QUERY_TIMEOUT_SECONDS} seconds and was automatically killed. Please optimize your query or use more specific filters. ::::::"
+            # Re-raise other exceptions to be handled by run_no_throw
+            raise
         
         # Check if query returned no rows
         if not output:
@@ -166,12 +337,99 @@ class QuerySQLDatabaseTool:
             return ":::::: Query execution has returned 0 rows. Return final answer accordingly. ::::::"
         
         result = str(output)
-        result_preview = result[:300] + "..." if len(result) > 300 else result
-        print(f"   Result: {len(result)} characters")
-        print(f"   Preview: {result_preview}")
-        print(f"{'='*80}\n")
         
-        return result
+        # Check if query returned no rows
+        if not output:
+            print(f"   Result: No rows returned")
+            print(f"{'='*80}\n")
+            return ":::::: Query execution has returned 0 rows. Return final answer accordingly. ::::::"
+        
+        result = str(output)
+        
+        # Handle result splitting for LIST queries
+        if query_type == 'list':
+            # Check if result is a Python list/dict format (from SQLDatabase)
+            import ast
+            
+            row_count = 0
+            is_dict_format = False
+            original_result = result
+            
+            # Try to parse as Python list/dict
+            try:
+                # Check if it looks like a Python list/dict representation
+                if result.strip().startswith('[') and ('{' in result or '[' in result):
+                    # Try to parse as JSON-like structure
+                    parsed = ast.literal_eval(result)
+                    if isinstance(parsed, list):
+                        row_count = len(parsed)
+                        is_dict_format = True
+                        # Convert to formatted string for CSV generation
+                        if parsed and isinstance(parsed[0], dict):
+                            # Convert list of dicts to pipe-separated format
+                            headers = list(parsed[0].keys())
+                            lines = [' | '.join(headers)]
+                            for row in parsed:
+                                values = [str(row.get(h, '')) for h in headers]
+                                lines.append(' | '.join(values))
+                            result = '\n'.join(lines)
+                            print(f"   Converted Python dict format to pipe-separated format")
+            except (ValueError, SyntaxError, AttributeError):
+                # Not a Python list format, parse as string
+                pass
+            
+            # If not dict format, parse as string
+            if not is_dict_format:
+                lines = result.strip().split('\n')
+                data_rows = [line for line in lines[1:] if line.strip()] if len(lines) > 1 else []
+                row_count = len(data_rows)
+            else:
+                # Count from the converted format
+                lines = result.strip().split('\n')
+                row_count = len(lines) - 1  # Exclude header
+            
+            print(f"   Result: {row_count} rows, {len(original_result)} characters")
+            
+            # If > 5 rows, format with CSV
+            if row_count > 5:
+                print(f"   Large result detected ({row_count} rows), generating CSV...")
+                # #region agent log
+                _t_csv_start = __import__("time").perf_counter()
+                # #endregion
+                formatted_result = format_result_with_csv(result, max_preview_rows=5)
+                # #region agent log
+                _t_csv_end = __import__("time").perf_counter()
+                try:
+                    _f = open(r"d:\Shipmentia Codes\ship-ai\.cursor\debug.log", "a")
+                    _f.write(__import__("json").dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "D", "location": "agent_tools.py:execute_db_query", "message": "tool_exec sql vs csv", "data": {"sql_ms": round((_t_sql_end - _t_sql_start) * 1000), "csv_ms": round((_t_csv_end - _t_csv_start) * 1000), "row_count": row_count}, "timestamp": int(__import__("time").time() * 1000)}) + "\n")
+                    _f.close()
+                except Exception:
+                    pass
+                # #endregion
+                print(f"   Formatted result with CSV link")
+                print(f"{'='*80}\n")
+                return formatted_result
+            else:
+                # <= 5 rows, return original format (or converted if dict format)
+                if is_dict_format:
+                    # Return the converted pipe-separated format for consistency
+                    result_preview = result[:300] + "..." if len(result) > 300 else result
+                    print(f"   Result preview: {result_preview}")
+                    print(f"{'='*80}\n")
+                    return result
+                else:
+                    # Return original string format
+                    result_preview = original_result[:300] + "..." if len(original_result) > 300 else original_result
+                    print(f"   Result preview: {result_preview}")
+                    print(f"{'='*80}\n")
+                    return original_result
+        else:
+            # COUNT or other queries - return as-is
+            result_preview = result[:300] + "..." if len(result) > 300 else result
+            print(f"   Result: {len(result)} characters")
+            print(f"   Preview: {result_preview}")
+            print(f"{'='*80}\n")
+            return result
 
 
 def _is_restricted_user_query(user_question: str) -> Tuple[bool, Optional[str]]:
@@ -290,7 +548,7 @@ def create_execute_db_query_tool(db: SQLDatabase, vector_store_manager):
         
         Use this tool AFTER you have:
         1. Called check_user_query_restriction with the user's question and received confirmation
-        2. Retrieved examples using get_few_shot_examples (if needed)
+        2. Used the examples provided in the system prompt (from ai_vector_examples)
         3. Generated a valid PostgreSQL query
         
         Args:
@@ -334,7 +592,6 @@ def create_get_table_list_tool(db: SQLDatabase, table_metadata: Optional[List[Di
         
         Use this tool ONLY when:
         - You have already tried to generate a query using the examples in the system prompt
-        - You have already tried using get_few_shot_examples to get more examples
         - You STILL cannot generate a query and need to discover what tables are available
         
         This tool returns all configured tables with:
@@ -415,9 +672,8 @@ def create_get_table_structure_tool(db: SQLDatabase):
         """
         FALLBACK TOOL ONLY - Use this ONLY after you have:
         1. Tried to generate a query from examples in the system prompt
-        2. Tried using get_few_shot_examples to get more examples
-        3. Used get_table_list to discover tables
-        4. STILL need detailed column information to construct a query
+        2. Used get_table_list to discover tables
+        3. STILL need detailed column information to construct a query
         
         Do NOT call this tool if you can generate a query from the examples. This is a LAST RESORT tool.
         
@@ -544,4 +800,470 @@ def create_get_table_structure_tool(db: SQLDatabase):
             return error_msg
     
     return get_table_structure
+
+
+def create_journey_list_tool(db: SQLDatabase, user_id: Optional[str] = None):
+    """
+    Create the journey_list_tool function for journey lists and facility breakdowns.
+    
+    This tool:
+    1. Executes SQL to fetch raw geofencing rows
+    2. Runs Python journey calculation algorithm
+    3. Returns structured journey list (NOT raw SQL rows)
+    
+    Args:
+        db: SQLDatabase instance
+        user_id: User ID for access control
+        
+    Returns:
+        Tool function for calculating journey lists
+    """
+    query_tool = QuerySQLDatabaseTool(db)
+    # Store user_id in closure to use when SQL doesn't contain it
+    stored_user_id = user_id
+    
+    @tool
+    def journey_list_tool(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Calculate journey list from geofencing data. For journey/movement questions only.
+        
+        SQL MUST use: device_geofencings dg, JOIN user_device_assignment uda ON uda.device = dg.device_id
+        Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
+        Order: ORDER BY dg.entry_event_time ASC
+        
+        Args:
+            sql: SELECT query to fetch geofencing rows
+            params: Optional dict with from_facility, extraJourneyTimeLimit, etc.
+        
+        Returns: JSON with facilities_details and journies array
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: journey_list_tool")
+        print(f"{'='*80}")
+        print(f"   SQL Query: {sql}")
+        print(f"   Params: {params}")
+        
+        # Validate SQL is SELECT only
+        sql_upper = sql.strip().upper()
+        if not sql_upper.startswith('SELECT'):
+            error_msg = "Only SELECT queries are allowed for journey calculations"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return error_msg
+        
+        # Execute query
+        try:
+            # Extract parameters first to check if we need to expand the query
+            extra_journey_time_limit = None
+            from_facility = None
+            if params:
+                extra_journey_time_limit = params.get("extraJourneyTimeLimit")
+                from_facility = params.get("from_facility")
+            
+            # Check if SQL filters by a specific facility_id
+            # When from_facility param is provided, we need to handle this correctly:
+            # - For "journeys starting from facility X": Remove facility_id filter (journey calculator handles filtering)
+            # - For "devices that entered facility X" (with time interval): Expand query to get all records
+            sql_upper_clean = ' '.join(sql_upper.split())
+            facility_filter_pattern = r"DG\.FACILITY_ID\s*=\s*'([^']+)'"
+            import re
+            facility_match = re.search(facility_filter_pattern, sql_upper_clean)
+            
+            if facility_match and from_facility:
+                sql_facility = facility_match.group(1)
+                # Check if they match (case-insensitive)
+                if sql_facility.upper() == str(from_facility).upper():
+                    target_facility = sql_facility
+                    print(f"   🔍 Detected facility filter: {target_facility}")
+                    print(f"   🔍 from_facility param: {from_facility}")
+                    
+                    # Extract time interval from original query if present
+                    time_interval_match = re.search(r"INTERVAL\s+'(\d+)\s+days'", sql_upper_clean)
+                    
+                    if time_interval_match:
+                        # Has time interval: This is a "devices that entered facility X" query - expand it
+                        days = time_interval_match.group(1)
+                        print(f"   📝 Expanding query to get ALL records for devices that entered {target_facility}")
+                        
+                        # Extract user_id from original query, or use stored user_id from closure
+                        user_id_match = re.search(r"UDA\.USER_ID\s*=\s*(\d+)", sql_upper_clean)
+                        if user_id_match:
+                            user_id = user_id_match.group(1)
+                        elif stored_user_id:
+                            user_id = str(stored_user_id)
+                            print(f"   ⚠️  user_id not found in SQL, using stored user_id: {user_id}")
+                        else:
+                            error_msg = "ERROR: user_id not found in SQL query and no user_id provided. Cannot proceed without user_id."
+                            print(f"   ❌ {error_msg}")
+                            return error_msg
+                        
+                        # Build expanded query: Get all records for devices that entered the target facility
+                        expanded_sql = f"""
+                        WITH devices_entered_facility AS (
+                            SELECT DISTINCT dg.device_id
+                            FROM device_geofencings dg
+                            JOIN user_device_assignment uda ON uda.device = dg.device_id
+                            WHERE uda.user_id = {user_id}
+                              AND dg.facility_id = '{target_facility}'
+                              AND dg.entry_event_time >= NOW() - INTERVAL '{days} days'
+                        )
+                        SELECT 
+                            dg.device_id,
+                            dg.facility_id,
+                            dg.facility_type,
+                            dg.entry_event_time,
+                            dg.exit_event_time
+                        FROM device_geofencings dg
+                        JOIN user_device_assignment uda ON uda.device = dg.device_id
+                        JOIN devices_entered_facility def ON def.device_id = dg.device_id
+                        WHERE uda.user_id = {user_id}
+                        ORDER BY dg.device_id, dg.entry_event_time ASC
+                        """
+                        
+                        print(f"   ✅ Using user_id: {user_id}, time interval: {days} days")
+                        sql = expanded_sql.strip()
+                        print(f"   📋 Expanded SQL: {sql[:200]}...")
+                    else:
+                        # No time interval: This is a "journeys starting from facility X" query
+                        # Remove the facility_id filter - journey calculator will handle from_facility filtering
+                        print(f"   📝 Removing facility_id filter - journey calculator will filter by from_facility={from_facility}")
+                        # Remove the facility_id filter from SQL
+                        # Pattern: AND dg.facility_id = 'RCOSX00018' (with optional whitespace)
+                        facility_filter_remove_pattern = rf"\s+AND\s+DG\.FACILITY_ID\s*=\s*'{re.escape(sql_facility)}'"
+                        sql = re.sub(facility_filter_remove_pattern, '', sql, flags=re.IGNORECASE)
+                        print(f"   ✅ Removed facility_id filter from SQL")
+                        print(f"   📋 Modified SQL: {sql[:200]}...")
+                else:
+                    print(f"   ⚠️  Facility mismatch: SQL has {sql_facility}, param has {from_facility} - not modifying")
+            
+            output = query_tool.db.run_no_throw(sql, include_columns=True)
+            
+            # Check if output is empty (handle different empty formats)
+            output_str = str(output).strip() if output else ""
+            is_empty = (
+                not output or 
+                output_str == "" or 
+                output_str == "[]" or
+                (isinstance(output, str) and output.strip() == "") or
+                (isinstance(output, list) and len(output) == 0)
+            )
+            
+            if is_empty:
+                print(f"   Result: No geofencing rows returned")
+                print(f"   Output type: {type(output)}")
+                print(f"   Output value: {repr(output)}")
+                print(f"{'='*80}\n")
+                return json.dumps({
+                    "facilities_details": {},
+                    "journies": []
+                })
+            
+            # Debug: Log the raw SQL output format
+            print(f"   Raw SQL output type: {type(output)}")
+            print(f"   Raw SQL output length: {len(str(output)) if output else 0}")
+            print(f"   Raw SQL output preview (first 500 chars): {str(output)[:500] if output else 'None'}")
+            
+            # Parse query results into list of dicts
+            geofencing_rows = _parse_sql_result_to_dicts(output)
+            
+            print(f"   Parsed {len(geofencing_rows)} geofencing rows from SQL result")
+            
+            if not geofencing_rows:
+                print(f"   ⚠️ WARNING: SQL returned data but parsing failed!")
+                print(f"   Raw output was: {str(output)[:1000] if output else 'None'}")
+                print(f"{'='*80}\n")
+                # Return error with raw data info
+                return json.dumps({
+                    "error": "Failed to parse SQL results",
+                    "raw_output_preview": str(output)[:500] if output else None,
+                    "facilities_details": {},
+                    "journies": []
+                })
+            
+            # Run Python journey calculation
+            filter_note = f" (filtering from_facility={from_facility})" if from_facility else ""
+            print(f"   Processing {len(geofencing_rows)} geofencing rows with Python journey algorithm{filter_note}...")
+            journey_result = calculate_journey_list(geofencing_rows, extra_journey_time_limit, from_facility)
+            
+            journey_count = len(journey_result.get('journies', []))
+            facilities_count = len(journey_result.get('facilities_details', {}))
+            
+            # Format result with CSV if > 5 journeys
+            if journey_count > 5:
+                print(f"   📊 Large result detected ({journey_count} journeys), generating CSV...")
+                result_json = format_journey_list_with_csv(journey_result, max_preview=5)
+                print(f"   ✅ Showing first 5 journeys, CSV available for all {journey_count} journeys")
+            else:
+                # Format result normally (no CSV needed)
+                result_json = json.dumps(journey_result, indent=2, default=str)
+                print(f"   ✅ Showing all {journey_count} journeys (no CSV needed)")
+            
+            print(f"   Found {facilities_count} unique facilities")
+            print(f"{'='*80}\n")
+            
+            return result_json
+            
+        except Exception as e:
+            error_msg = f"Error calculating journeys: {str(e)}"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            import traceback
+            traceback.print_exc()
+            return error_msg
+    
+    return journey_list_tool
+
+
+def create_journey_count_tool(db: SQLDatabase, user_id: Optional[str] = None):
+    """
+    Create the journey_count_tool function for journey counts.
+    
+    This tool:
+    1. Executes SQL to fetch raw geofencing rows
+    2. Runs Python journey count algorithm
+    3. Returns journey counts by facility pair
+    
+    Args:
+        db: SQLDatabase instance
+        user_id: User ID for access control
+        
+    Returns:
+        Tool function for calculating journey counts
+    """
+    query_tool = QuerySQLDatabaseTool(db)
+    
+    @tool
+    def journey_count_tool(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Calculate journey counts. For "how many journeys" questions only.
+        
+        SQL MUST use: device_geofencings dg, JOIN user_device_assignment uda ON uda.device = dg.device_id
+        Select: dg.device_id, dg.facility_id, dg.facility_type, dg.entry_event_time, dg.exit_event_time
+        Order: ORDER BY dg.entry_event_time ASC
+        
+        Args:
+            sql: SELECT query to fetch geofencing rows
+            params: Optional dict with extraJourneyTimeLimit, etc.
+        
+        Returns: JSON with counts dict and total
+        """
+        print(f"\n{'='*80}")
+        print(f"🔧 TOOL CALLED: journey_count_tool")
+        print(f"{'='*80}")
+        print(f"   SQL Query: {sql}")
+        print(f"   Params: {params}")
+        
+        # Validate SQL is SELECT only
+        sql_upper = sql.strip().upper()
+        if not sql_upper.startswith('SELECT'):
+            error_msg = "Only SELECT queries are allowed for journey calculations"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            return error_msg
+        
+        # Execute query
+        try:
+            output = query_tool.db.run_no_throw(sql, include_columns=True)
+            
+            if not output:
+                print(f"   Result: No geofencing rows returned")
+                print(f"{'='*80}\n")
+                return json.dumps({
+                    "counts": {},
+                    "total": 0
+                })
+            
+            # Debug: Log the raw SQL output format
+            print(f"   Raw SQL output type: {type(output)}")
+            print(f"   Raw SQL output length: {len(str(output)) if output else 0}")
+            print(f"   Raw SQL output preview (first 500 chars): {str(output)[:500] if output else 'None'}")
+            
+            # Parse query results into list of dicts
+            geofencing_rows = _parse_sql_result_to_dicts(output)
+            
+            print(f"   Parsed {len(geofencing_rows)} geofencing rows from SQL result")
+            
+            if not geofencing_rows:
+                print(f"   ⚠️ WARNING: SQL returned data but parsing failed!")
+                print(f"   Raw output was: {str(output)[:1000] if output else 'None'}")
+                print(f"{'='*80}\n")
+                # Return error with raw data info
+                return json.dumps({
+                    "error": "Failed to parse SQL results",
+                    "raw_output_preview": str(output)[:500] if output else None,
+                    "counts": {},
+                    "total": 0
+                })
+            
+            # Extract extraJourneyTimeLimit from params
+            extra_journey_time_limit = None
+            if params:
+                extra_journey_time_limit = params.get("extraJourneyTimeLimit")
+            
+            # Run Python journey calculation
+            print(f"   Processing {len(geofencing_rows)} geofencing rows with Python journey algorithm...")
+            journey_result = calculate_journey_counts(geofencing_rows, extra_journey_time_limit)
+            
+            # Log metadata for debugging
+            metadata = journey_result.get('metadata', {})
+            if metadata:
+                print(f"   📊 Metadata: {metadata.get('total_rows_processed', 0)} rows, "
+                      f"{metadata.get('devices_processed', 0)} devices, "
+                      f"facility types: {metadata.get('facility_types_found', [])}")
+            
+            # Format result
+            result_json = json.dumps(journey_result, indent=2, default=str)
+            
+            total_journeys = journey_result.get('total', 0)
+            print(f"   ✅ Calculated {total_journeys} total journeys")
+            print(f"   Found {len(journey_result.get('counts', {}))} unique facility pairs")
+            
+            if total_journeys == 0 and len(geofencing_rows) > 0:
+                print(f"   ⚠️ NOTE: Found {len(geofencing_rows)} geofencing records but 0 journeys")
+                print(f"   This could mean: same facility only, or journey time < 4 hours")
+            
+            print(f"{'='*80}\n")
+            
+            return result_json
+            
+        except Exception as e:
+            error_msg = f"Error calculating journey counts: {str(e)}"
+            print(f"   ❌ {error_msg}")
+            print(f"{'='*80}\n")
+            import traceback
+            traceback.print_exc()
+            return error_msg
+    
+    return journey_count_tool
+
+
+def _parse_sql_result_to_dicts(sql_result: str) -> List[Dict[str, Any]]:
+    """
+    Parse SQL result string into list of dictionaries.
+    
+    Handles different SQL result formats from SQLDatabase.run_no_throw().
+    
+    Args:
+        sql_result: SQL result string (can be pipe-separated, JSON, or Python list format)
+        
+    Returns:
+        List of dictionaries with row data
+    """
+    rows = []
+    
+    if not sql_result or not sql_result.strip():
+        return rows
+    
+    # Try to parse as Python list/dict format first
+    import ast
+    import datetime as dt_module
+    from datetime import datetime
+    try:
+        if sql_result.strip().startswith('['):
+            # First try ast.literal_eval (safe, but doesn't handle datetime objects)
+            try:
+                parsed = ast.literal_eval(sql_result)
+                if isinstance(parsed, list):
+                    return parsed
+            except (ValueError, SyntaxError):
+                # If that fails, it might contain datetime objects
+                # Use eval() with a safe namespace (only datetime module and class allowed)
+                # This handles cases like: [{'entry_event_time': datetime.datetime(2024, 12, 6, 15, 14, 59), ...}]
+                # The string uses datetime.datetime(...) so we need both the module and the class
+                safe_dict = {
+                    '__builtins__': {},
+                    'datetime': dt_module,  # Provide the datetime module so datetime.datetime works
+                    'dict': dict,
+                    'list': list,
+                    'tuple': tuple,
+                    'None': None,
+                    'True': True,
+                    'False': False
+                }
+                parsed = eval(sql_result, safe_dict)
+                if isinstance(parsed, list):
+                    # datetime objects are preserved - perfect!
+                    return parsed
+    except (ValueError, SyntaxError, NameError, TypeError) as e:
+        logger.debug(f"Failed to parse as Python list: {e}")
+        pass
+    
+    # Try to parse as JSON
+    try:
+        parsed = json.loads(sql_result)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    
+    # Parse as pipe-separated format (default SQLDatabase format)
+    lines = sql_result.strip().split('\n')
+    if len(lines) < 2:
+        return rows
+    
+    # First line is headers
+    headers = [h.strip() for h in lines[0].split('|')]
+    headers = [h for h in headers if h]  # Remove empty headers
+    
+    # Remaining lines are data
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        
+        values = [v.strip() for v in line.split('|')]
+        values = [v for v in values if v]  # Remove empty values
+        
+        if len(values) != len(headers):
+            continue
+        
+        row_dict = {}
+        for i, header in enumerate(headers):
+            value = values[i] if i < len(values) else None
+            
+            # Try to convert numeric values or parse timestamps
+            if value:
+                # Check if it looks like a timestamp string (for entry_event_time, exit_event_time columns)
+                if isinstance(value, str) and ('event_time' in header.lower() or 'time' in header.lower()):
+                    # Try to parse as timestamp (common PostgreSQL formats)
+                    from datetime import datetime
+                    timestamp_formats = [
+                        '%Y-%m-%d %H:%M:%S.%f',
+                        '%Y-%m-%d %H:%M:%S',
+                        '%Y-%m-%dT%H:%M:%S.%f',
+                        '%Y-%m-%dT%H:%M:%S',
+                        '%Y-%m-%d %H:%M:%S+00:00',
+                        '%Y-%m-%d %H:%M:%S.%f+00:00'
+                    ]
+                    timestamp_parsed = False
+                    for fmt in timestamp_formats:
+                        try:
+                            value = datetime.strptime(value, fmt)
+                            timestamp_parsed = True
+                            break
+                        except ValueError:
+                            continue
+                    
+                    # If timestamp parsing failed, keep as string (will be handled by _convert_to_unix_timestamp)
+                    if not timestamp_parsed:
+                        # Keep as string - _convert_to_unix_timestamp will handle it
+                        pass
+                elif isinstance(value, str):
+                    # For non-timestamp strings, try numeric conversion
+                    try:
+                        # Try float first (handles decimals)
+                        if '.' in value and not any(c.isalpha() for c in value):
+                            value = float(value)
+                        elif not any(c.isalpha() for c in value):
+                            # Try int
+                            value = int(value)
+                    except ValueError:
+                        # Keep as string
+                        pass
+                # If it's already a datetime, int, or float, keep as is
+            
+            row_dict[header] = value
+        
+        rows.append(row_dict)
+    
+    return rows
 
