@@ -36,6 +36,7 @@ class ChatResponse(BaseModel):
     debug: Optional[Dict[str, Any]] = None
     csv_id: Optional[str] = None  # CSV download ID; use GET /download-csv/{csv_id} (same base URL as /chat)
     csv_download_path: Optional[str] = None  # Relative path e.g. /download-csv/{uuid} for UI/Postman
+    security_failure_reason: Optional[str] = None  # Reason why query failed security check (if blocked)
 
 
 class HealthCheckResponse(BaseModel):

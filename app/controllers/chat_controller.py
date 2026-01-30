@@ -167,6 +167,7 @@ def process_chat(
     t_request = time.perf_counter()
 
     # Process user question (precomputed_embedding from 80% path miss avoids re-embedding in get_system_prompt)
+    security_failure_reason = None  # Initialize for security failure reason
     try:
         logger.info(f"[chat] user_id={payload.user_id} question_len={len(payload.question)} history_len={len(payload.chat_history or [])}")
         
@@ -197,6 +198,7 @@ def process_chat(
         debug_info = result.get("debug", {})
         csv_id = result.get("csv_id")
         csv_download_path = result.get("csv_download_path")
+        security_failure_reason = result.get("security_failure_reason")
         
         # Extract result data for caching (if available)
         result_data = None
@@ -243,6 +245,7 @@ def process_chat(
         }
         error_message = str(e)
         result_data = None
+        security_failure_reason = None
 
     # Build steps_time for LLM path (all non-80%-hit requests)
     steps_time = {
@@ -267,6 +270,7 @@ def process_chat(
         debug=debug_info,
         csv_id=csv_id if 'csv_id' in locals() else None,
         csv_download_path=csv_download_path if 'csv_download_path' in locals() else None,
+        security_failure_reason=security_failure_reason,
     )
     save_message_to_history(
         user_id=payload.user_id,

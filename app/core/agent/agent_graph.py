@@ -794,7 +794,8 @@ RISKY (BLOCK): Requests for other users' data, system schema, admin logs.
 Device IDs (WT01...) and Facility IDs (MNIAZ...) are SAFE - not user IDs.
 User IDs are standalone numbers (27, 63) in context of "user 27".
 
-Respond ONLY: 'ALLOW' or 'BLOCK'"""
+If SAFE, respond with: ALLOW
+If RISKY, respond with: BLOCK: [brief reason why it's risky]"""
                 
                 user_question = state["question"]
                 security_messages = [
@@ -804,7 +805,35 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 
                 security_response, llm_type_used = self._invoke_llm_with_fallback(security_messages, use_tools=False, question=user_question)
                 state["actual_llm_type"] = llm_type_used
-                security_decision = security_response.content.strip().upper() if hasattr(security_response, 'content') else ""
+                security_response_content = security_response.content.strip() if hasattr(security_response, 'content') else ""
+                security_decision = security_response_content.upper()
+                
+                # Extract security failure reason if blocked
+                security_failure_reason = None
+                if "BLOCK" in security_decision:
+                    # Try to extract reason after "BLOCK:" or "BLOCK"
+                    security_response_upper = security_response_content.upper()
+                    if "BLOCK:" in security_response_upper:
+                        # Extract text after "BLOCK:" (case-insensitive split)
+                        # Find the position of "BLOCK:" in original case
+                        block_pos = security_response_upper.find("BLOCK:")
+                        if block_pos != -1:
+                            # Extract everything after "BLOCK:" (accounting for case)
+                            colon_pos = security_response_content.find(":", block_pos)
+                            if colon_pos != -1:
+                                security_failure_reason = security_response_content[colon_pos + 1:].strip()
+                    elif len(security_response_content) > len("BLOCK"):
+                        # If response is longer than just "BLOCK", use the rest as reason
+                        # Remove "BLOCK" (case-insensitive) and any following colon/space
+                        remaining = security_response_content
+                        block_pos = security_response_upper.find("BLOCK")
+                        if block_pos != -1:
+                            remaining = security_response_content[block_pos + len("BLOCK"):].lstrip(": ").strip()
+                            if remaining:
+                                security_failure_reason = remaining
+                    # If no reason found, use a default message
+                    if not security_failure_reason:
+                        security_failure_reason = "Query violates security policy - may request access to restricted data"
                 elapsed_security = time.perf_counter() - t_security
                 security_token_usage = {"input": 0, "output": 0, "total": 0}
                 if hasattr(security_response, "response_metadata") and security_response.response_metadata:
@@ -823,7 +852,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                 # Check if query is blocked
                 if "BLOCK" in security_decision:
                     error_msg = "Sorry, I cannot provide that information."
-                    logger.warning("User query BLOCKED by Security Guard")
+                    logger.warning(f"User query BLOCKED by Security Guard. Reason: {security_failure_reason}")
                     
                     # Update token usage
                     current_token_usage = state.get("token_usage", {"input": 0, "output": 0, "total": 0})
@@ -849,7 +878,7 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         }],
                         "input_message_count": 2,
                         "output": {
-                            "content": security_decision,
+                            "content": security_response_content,
                             "has_tool_calls": False
                         },
                         "token_usage": security_token_usage
@@ -862,7 +891,8 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
                         "token_usage": updated_token_usage,
                         "llm_call_history": llm_call_history,
                         "messages": [HumanMessage(content=state["question"])],
-                        "stage_breakdown": state.get("stage_breakdown", [])
+                        "stage_breakdown": state.get("stage_breakdown", []),
+                        "security_failure_reason": security_failure_reason
                     }
                 else:
                     # Mark as validated and continue with full prompt setup
@@ -2021,6 +2051,7 @@ CRITICAL INTERPRETATION RULES:
             "csv_download_path": final_state.get("csv_download_path"),
             "stage_breakdown": final_state.get("stage_breakdown", []),
             "actual_llm_type": final_state.get("actual_llm_type"),
+            "security_failure_reason": final_state.get("security_failure_reason"),
         }
     
     def _build_debug_info(self, state: AgentState, question: str) -> Dict[str, Any]:
