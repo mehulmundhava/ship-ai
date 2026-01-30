@@ -6,6 +6,7 @@ This module defines Pydantic models for request and response validation.
 
 from typing import List, Tuple, Optional, Dict, Any
 from pydantic import BaseModel
+from app.constants.vector_search_constants import VECTOR_EXAMPLES_LIMIT, VECTOR_EXTRA_PROMPTS_LIMIT
 
 
 class ChatRequest(BaseModel):
@@ -81,8 +82,8 @@ class VectorSearchRequest(BaseModel):
     """
     question: str
     search_type: Optional[str] = "both"  # "examples", "extra_prompts", or "both"
-    k_examples: Optional[int] = 3  # Number of example results
-    k_extra_prompts: Optional[int] = 2  # Number of extra prompt results
+    k_examples: Optional[int] = VECTOR_EXAMPLES_LIMIT  # Number of example results
+    k_extra_prompts: Optional[int] = VECTOR_EXTRA_PROMPTS_LIMIT  # Number of extra prompt results
     example_id: Optional[int] = None  # Filter by specific example ID (to check distance)
     extra_prompts_id: Optional[int] = None  # Filter by specific extra prompt ID (to check distance)
 

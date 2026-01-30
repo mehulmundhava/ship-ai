@@ -7,6 +7,7 @@ to reduce token usage by eliminating the need for a separate tool call.
 """
 import logging
 from typing import Optional, List
+from app.constants.vector_search_constants import VECTOR_EXAMPLES_LIMIT
 
 logger = logging.getLogger("ship_rag_ai")
 
@@ -207,7 +208,7 @@ USER MODE: The user_id for this request is: {user_id}. Do NOT ask the user for t
                             precomputed_embedding, k=1, use_description_only=False
                         )
                     else:
-                        example_count = 3
+                        example_count = VECTOR_EXAMPLES_LIMIT
                         example_docs = vector_store_manager.search_examples_with_embedding(
                             precomputed_embedding, k=example_count
                         )
@@ -217,7 +218,7 @@ USER MODE: The user_id for this request is: {user_id}. Do NOT ask the user for t
                             question, k=1, use_description_only=False
                         )
                     else:
-                        example_count = 3
+                        example_count = VECTOR_EXAMPLES_LIMIT
                         example_docs = vector_store_manager.search_examples(question, k=example_count)
             except Exception as e:
                 pass  # Continue without examples
