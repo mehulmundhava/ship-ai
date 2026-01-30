@@ -16,6 +16,7 @@ from langchain.schema import Document
 from sqlalchemy import text
 from app.config.database import sync_engine
 from app.config.settings import settings
+from app.constants.vector_search_constants import VECTOR_EXAMPLES_LIMIT, VECTOR_EXTRA_PROMPTS_LIMIT
 
 
 class VectorStoreService:
@@ -99,7 +100,7 @@ class VectorStoreService:
         """
         return self.embed_query(query)
     
-    def search_examples(self, query: str, k: int = 3, example_id: Optional[int] = None, 
+    def search_examples(self, query: str, k: int = VECTOR_EXAMPLES_LIMIT, example_id: Optional[int] = None, 
                         use_description_only: bool = False) -> List[Document]:
         """
         Search for similar examples in the PostgreSQL vector store.
@@ -211,7 +212,7 @@ class VectorStoreService:
             logger.warning(f"Error searching examples: {e}")
             return []
     
-    def search_extra_prompts(self, query: str, k: int = 2, extra_prompts_id: Optional[int] = None) -> List[Document]:
+    def search_extra_prompts(self, query: str, k: int = VECTOR_EXTRA_PROMPTS_LIMIT, extra_prompts_id: Optional[int] = None) -> List[Document]:
         """
         Search for relevant extra prompt data.
         
@@ -311,7 +312,7 @@ class VectorStoreService:
     def search_examples_with_embedding(
         self,
         embedding: List[float],
-        k: int = 3,
+        k: int = VECTOR_EXAMPLES_LIMIT,
         example_id: Optional[int] = None,
         use_description_only: bool = False,
     ) -> List[Document]:
@@ -365,7 +366,7 @@ class VectorStoreService:
     def search_extra_prompts_with_embedding(
         self,
         embedding: List[float],
-        k: int = 2,
+        k: int = VECTOR_EXTRA_PROMPTS_LIMIT,
         extra_prompts_id: Optional[int] = None,
     ) -> List[Document]:
         """Search extra prompts by precomputed embedding (no embed_query). Used when 80% path misses."""

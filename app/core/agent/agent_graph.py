@@ -1600,21 +1600,35 @@ Respond ONLY: 'ALLOW' or 'BLOCK'"""
             
             # If not found in JSON, try text format (for regular SQL queries)
             if not csv_download_url:
-                csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
+                # Check for CSV link in text format (multiple patterns to catch all formats)
+                # Pattern 1: "CSV Download Link: /download-csv/..."
+                csv_link_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result, re.IGNORECASE)
+                if not csv_link_match:
+                    # Pattern 2: "CSV.*Link.*: /download-csv/..." (more flexible)
+                    csv_link_match = re.search(r'CSV.*?Link.*?:\s*(/download-csv/[^\s\n]+)', query_result, re.IGNORECASE)
+                if not csv_link_match:
+                    # Pattern 3: Just look for "/download-csv/" anywhere in result
+                    csv_link_match = re.search(r'(/download-csv/[^\s\n]+)', query_result)
+                
                 if csv_link_match:
                     csv_path = csv_link_match.group(1)
                     csv_download_url = f"{settings.get_api_base_url()}{csv_path}"
                     logger.debug(f"Extracted CSV link from text")
                     
-                    # For regular SQL queries with CSV, also create minimal summary
+                    # Extract CSV ID if available
+                    csv_id_match = re.search(r'CSV ID:\s*([^\s\n]+)', query_result, re.IGNORECASE)
+                    if csv_id_match:
+                        csv_id = csv_id_match.group(1)
+                    
+                    # For regular SQL queries with CSV, ALWAYS create minimal summary
                     # Extract row count from query_result if available
-                    row_count_match = re.search(r'Total rows:\s*(\d+)', query_result)
+                    row_count_match = re.search(r'Total rows?:\s*(\d+)', query_result, re.IGNORECASE)
                     if row_count_match:
                         row_count = int(row_count_match.group(1))
-                        # Create minimal summary for regular SQL queries too
-                        minimal_summary = f"""Total rows: {row_count}
-CSV Download Link: {csv_path}
-Note: Full data available in CSV. Showing summary only."""
+                        # Create minimal summary - NO preview rows, just count and CSV link
+                        minimal_summary = f"Total rows: {row_count}\nCSV Download Link: {csv_path}"
+                        if csv_id:
+                            minimal_summary += f"\nCSV ID: {csv_id}"
                         query_result = minimal_summary
                         logger.debug(f"Token optimization: minimal summary rows={row_count}")
 
@@ -1624,8 +1638,10 @@ Note: Full data available in CSV. Showing summary only."""
                 csv_link_instruction = f"\n\nIMPORTANT: Mention the count, then add exactly this one link (no other 'Download CSV' text before it): [Download CSV]({csv_path})"
 
             # OPTIMIZATION: Ultra-minimal prompt when CSV is available
-            # Safety check: If CSV is available but query_result is still large, force minimal summary
-            if csv_download_url and len(query_result) > 1000:
+            # Safety check: If CSV is available but query_result is still large or contains preview rows, force minimal summary
+            # Check if query_result contains preview rows (indicates CSV was generated but preview is still included)
+            has_preview_rows = "First" in query_result and "rows:" in query_result.lower()
+            if csv_download_url and (len(query_result) > 500 or has_preview_rows):
                 # Force minimal summary if somehow we still have large data
                 if journey_tool_used:
                     # For journey tools, extract just the count
@@ -1641,27 +1657,64 @@ Note: Full data available in CSV. Showing summary only."""
                         logger.warning(f"Error parsing query_result in safety check: {e}")
                         query_result = f'Total journeys available in CSV. Download link: {csv_download_url}'
                 else:
-                    # For regular SQL, extract row count
-                    row_match = re.search(r'Total rows:\s*(\d+)', query_result)
+                    # For regular SQL, extract row count and CSV path
+                    row_match = re.search(r'Total rows?:\s*(\d+)', query_result, re.IGNORECASE)
+                    csv_path_match = re.search(r'CSV Download Link:\s*(/download-csv/[^\s\n]+)', query_result)
+                    csv_path_for_summary = csv_path_match.group(1) if csv_path_match else csv_download_url.replace("http://localhost:3009", "")
+                    
                     if row_match:
-                        query_result = f'Total rows: {row_match.group(1)}. Full data in CSV: {csv_download_url}'
+                        row_count = row_match.group(1)
+                        query_result = f'Total rows: {row_count}\nCSV Download Link: {csv_path_for_summary}'
                     else:
-                        query_result = f'Results available in CSV. Download link: {csv_download_url}'
+                        query_result = f'Results available in CSV. Download link: {csv_path_for_summary}'
                 
                 logger.warning(f"Forced minimal summary: query_result too large with CSV")
             
             if csv_download_url:
                 # When CSV is available, use even more minimal prompt
+                # Add interpretation instruction for existence questions
+                question_lower = user_question.lower()
+                interpretation_note = ""
+                if any(keyword in question_lower for keyword in ["which", "how many", "have", "has", "are there", "list"]):
+                    interpretation_note = "\n\nCRITICAL INTERPRETATION RULES:\n- If query results show a count > 0, it means devices/records DO exist that match the criteria.\n- The SQL query already applied all filters (e.g., 'more than 5 times', 'in last 48 hours', etc.).\n- DO NOT say 'none' or 'no devices' if the count is > 0 - that would be incorrect.\n- Provide a positive answer mentioning the total count, then provide the CSV download link."
+                
+                # Extract row count from query_result for better answer
+                row_count_match = re.search(r'Total rows?:\s*(\d+)', query_result, re.IGNORECASE)
+                row_count_text = ""
+                if row_count_match:
+                    row_count = int(row_count_match.group(1))
+                    row_count_text = f"\n\nThe query found {row_count} devices/records that match the criteria."
+                
                 final_prompt = f"""User asked: {user_question}
 
-Query results summary: {query_result}
+Query results summary: {query_result}{row_count_text}{interpretation_note}
 
 IMPORTANT: Use the EXACT count from the results. Mention that total, then add only the one download link (do not write 'using the following link' or any extra 'Download CSV' text).{csv_link_instruction}""".strip()
             else:
                 # Regular prompt for small results
+                # IMPORTANT: Add explicit instruction about interpreting results
+                # If results are returned, it means devices/records DO exist that match the criteria
+                # The SQL query already applied all filters (e.g., "more than 5 times", "in last 48 hours")
+                # So any rows in results = positive answer
+                result_interpretation_instruction = ""
+                
+                # Check if the question asks about existence/count (e.g., "which devices", "how many", "have switched")
+                question_lower = user_question.lower()
+                if any(keyword in question_lower for keyword in ["which", "how many", "have", "has", "are there", "list"]):
+                    result_interpretation_instruction = """
+                    
+CRITICAL INTERPRETATION RULES:
+- If query results contain ANY rows, it means devices/records DO exist that match the criteria.
+- The SQL query already applied all filters (e.g., "more than 5 times", "in last 48 hours", etc.).
+- If you see results with device IDs and counts, those devices MATCH the criteria.
+- DO NOT say "none" or "no devices" if results are present - that would be incorrect.
+- If results show devices with counts (e.g., "device_id | count"), those devices satisfy the condition.
+- Provide a positive answer listing or summarizing the devices that match."""
+                
                 final_prompt = f"""User asked: {user_question}
 
 Query results: {query_result}
+{result_interpretation_instruction}
 
 Provide a concise, natural language answer. Do not mention table names, SQL syntax, or schema details.{journey_instruction}""".strip()
             
@@ -1801,6 +1854,20 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                     if csv_download_url and csv_path:
                                         csv_link_instruction = f"\n\nIMPORTANT: Mention the count, then add exactly this one link: [Download CSV]({csv_path}). Do not write 'using the following link' or any extra 'Download CSV' text."
                                     
+                                    # Add interpretation instruction for existence questions
+                                    question_lower = user_question.lower()
+                                    interpretation_instruction = ""
+                                    if any(keyword in question_lower for keyword in ["which", "how many", "have", "has", "are there", "list"]):
+                                        interpretation_instruction = """
+                                        
+CRITICAL INTERPRETATION RULES:
+- If query results contain ANY rows, it means devices/records DO exist that match the criteria.
+- The SQL query already applied all filters (e.g., "more than 5 times", "in last 48 hours", etc.).
+- If you see results with device IDs and counts, those devices MATCH the criteria.
+- DO NOT say "none" or "no devices" if results are present - that would be incorrect.
+- If results show devices with counts (e.g., "device_id | count"), those devices satisfy the condition.
+- Provide a positive answer listing or summarizing the devices that match."""
+                                    
                                     final_prompt = f"""
                                         You are a helpful assistant. Your task is ONLY to explain database query results
                                         to the user in clear, natural language.
@@ -1809,7 +1876,7 @@ Provide a concise, natural language answer. Do not mention table names, SQL synt
                                         - Do NOT mention or describe table names, column names, joins, or SQL syntax.
                                         - Do NOT reveal anything about database schema or internal implementation.
                                         - Answer ONLY for the active user_id if relevant: {user_id}.
-                                        - Be concise and focus on what the numbers mean for the question.{csv_link_instruction}
+                                        - Be concise and focus on what the numbers mean for the question.{interpretation_instruction}{csv_link_instruction}
 
                                         User Question:
                                         {user_question}

@@ -15,6 +15,7 @@ from app.config.database import sync_engine
 from app.config.settings import settings
 from app.services.vector_store_service import VectorStoreService
 from app.core.agent.agent_tools import QuerySQLDatabaseTool, create_journey_list_tool, create_journey_count_tool
+from app.constants.vector_search_constants import VECTOR_EXAMPLES_LIMIT
 import logging
 
 logger = logging.getLogger("ship_rag_ai")
@@ -301,6 +302,7 @@ class CacheAnswerService:
             embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
             # Base-columns-only query: include description so we can pass example docs to agent on miss (avoids duplicate vector search)
+            limit_value = VECTOR_EXAMPLES_LIMIT
             search_query = text(f"""
                 SELECT
                     id,
@@ -313,7 +315,7 @@ class CacheAnswerService:
                 FROM ai_vector_examples
                 WHERE {self.embedding_field_name} IS NOT NULL
                 ORDER BY {self.embedding_field_name} <-> '{embedding_str}'::vector
-                LIMIT 3
+                LIMIT {limit_value}
             """)
 
             with self.engine.connect() as conn:
