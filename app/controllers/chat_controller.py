@@ -102,7 +102,12 @@ def process_chat(
             precomputed_embedding = match_result.get("query_embedding")
             preloaded_example_docs = match_result.get("top_example_docs")
             elapsed_80_sec = time.perf_counter() - t0
-            logger.info(f"[80% path] miss in {elapsed_80_sec:.2f}s → LLM (reusing embedding)")
+            top_sim = match_result.get("top_similarity")
+            thresh = match_result.get("threshold", 0.8)
+            if top_sim is not None:
+                logger.info(f"[80% path] miss in {elapsed_80_sec:.2f}s similarity={top_sim:.4f} (below threshold {thresh}) → LLM (reusing embedding)")
+            else:
+                logger.info(f"[80% path] miss in {elapsed_80_sec:.2f}s → LLM (reusing embedding)")
         elif match_result:
             elapsed = time.perf_counter() - t0
             logger.info(f"[80% path] hit in {elapsed:.2f}s similarity={match_result['similarity']:.4f}")

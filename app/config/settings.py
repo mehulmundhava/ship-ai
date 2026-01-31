@@ -64,8 +64,13 @@ class Settings(BaseSettings):
     GROQ_DISABLED: bool = False
     
     # Embedding Configuration
+    # Provider: "huggingface" (local) or "huggingface_api" (HF Inference API, free tier). When "huggingface_api", uses HUGGINGFACE_EMBEDDING_MODEL and HUGGINGFACE_API_KEY.
+    EMBEDDING_PROVIDER: str = "huggingface"
     EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
     HUGGING_FACE_MODEL: Optional[str] = None
+    # Hugging Face Inference API when EMBEDDING_PROVIDER=huggingface_api (free; uses existing bge_large_embedding column)
+    HUGGINGFACE_EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5"
+    HUGGINGFACE_API_KEY: Optional[str] = None
     
     # Logging Configuration
     LOG_LEVEL: str = "INFO"  # DEBUG, INFO, WARNING, ERROR
@@ -116,6 +121,14 @@ class Settings(BaseSettings):
         # Use HUGGING_FACE_MODEL if provided, otherwise use EMBEDDING_MODEL_NAME
         if not self.HUGGING_FACE_MODEL:
             self.HUGGING_FACE_MODEL = self.EMBEDDING_MODEL_NAME
+
+        # Normalize EMBEDDING_PROVIDER to lowercase
+        if self.EMBEDDING_PROVIDER:
+            self.EMBEDDING_PROVIDER = self.EMBEDDING_PROVIDER.strip().lower()
+
+        # Hugging Face API key: prefer HUGGINGFACE_API_KEY, fallback to HUGGINGFACEHUB_API_TOKEN
+        if not self.HUGGINGFACE_API_KEY:
+            self.HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
     
     # Properties for backward compatibility with db_* naming
     @property
@@ -170,21 +183,18 @@ class Settings(BaseSettings):
     
     def get_embedding_field_name(self) -> str:
         """
-        Get the database field name for embeddings based on the model.
-        
-        Returns:
-            'minilm_embedding' for all-MiniLM-L6-v2 models
-            'bge_large_embedding' for BAAI/bge-large-en-v1.5 models
-            'minilm_embedding' as default fallback
+        Get the database field name for embeddings based on provider and model.
+        When EMBEDDING_PROVIDER=huggingface_api we use bge_large_embedding (no new column).
         """
+        if self.EMBEDDING_PROVIDER == "huggingface_api":
+            return "bge_large_embedding"
+
         model_name = self.embedding_model_name.lower()
-        
         if "bge-large" in model_name or "bge_large" in model_name:
             return "bge_large_embedding"
         elif "minilm" in model_name:
             return "minilm_embedding"
         else:
-            # Default fallback
             return "minilm_embedding"
     
     def validate_database_config(self):
@@ -229,6 +239,14 @@ class Settings(BaseSettings):
                 "Must be 'OPENAI' or 'GROQ'"
             )
 
+    def validate_embedding_config(self):
+        """Validate embedding configuration (e.g. API key when using Hugging Face Inference API)."""
+        if self.EMBEDDING_PROVIDER == "huggingface_api" and not self.HUGGINGFACE_API_KEY:
+            raise ValueError(
+                "Hugging Face API key not found for embeddings. "
+                "Set HUGGINGFACE_API_KEY or HUGGINGFACEHUB_API_TOKEN when EMBEDDING_PROVIDER=huggingface_api (get token at https://huggingface.co/settings/tokens)."
+            )
+
 
 # Global settings instance
 settings = Settings()
@@ -236,6 +254,7 @@ settings = Settings()
 # Validate on import
 settings.validate_database_config()
 settings.validate_llm_config()
+settings.validate_embedding_config()
 
 # Debug output
 masked_password = "***" if settings.PASSWORD else "NOT SET"

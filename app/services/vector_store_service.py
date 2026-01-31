@@ -3,11 +3,13 @@ PostgreSQL Vector Store Service
 
 This module handles PostgreSQL vector store initialization and management.
 It uses pgvector extension for semantic search on example queries and extra prompt data.
-Uses Hugging Face embeddings instead of OpenAI for cost efficiency.
+Supports Hugging Face local or Hugging Face Inference API (free) based on EMBEDDING_PROVIDER.
+Uses existing bge_large_embedding column when EMBEDDING_PROVIDER=huggingface_api.
 """
 
 import json
 import logging
+import math
 from typing import List, Optional
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -19,34 +21,77 @@ from app.config.settings import settings
 from app.constants.vector_search_constants import VECTOR_EXAMPLES_LIMIT, VECTOR_EXTRA_PROMPTS_LIMIT
 
 
+class _HFInferenceEmbeddings:
+    """Hugging Face Inference API via InferenceClient.feature_extraction(text, model=..., normalize=...). Uses existing bge_large_embedding (1024-dim)."""
+
+    def __init__(self, model: str, token: Optional[str]):
+        from huggingface_hub import InferenceClient
+        self._client = InferenceClient(token=token)
+        self._model = model
+
+    def _normalize(self, vec: List[float]) -> List[float]:
+        n = math.sqrt(sum(x * x for x in vec)) or 1.0
+        return [x / n for x in vec]
+
+    def _embed_one(self, text: str) -> List[float]:
+        # feature_extraction(text, model=...) — first arg is positional 'text', not 'inputs'
+        raw = self._client.feature_extraction(text, model=self._model)
+        if hasattr(raw, "tolist"):
+            raw = raw.tolist()
+        # API may return 2D (token-level) or 1D (sentence); reduce to 1D if needed
+        if raw and isinstance(raw[0], (list, tuple)):
+            # Mean-pool token embeddings into one vector
+            n = len(raw)
+            vec = [sum(row[i] for row in raw) / n for i in range(len(raw[0]))]
+        else:
+            vec = list(raw)
+        return self._normalize(vec)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        texts = [t.replace("\n", " ") for t in texts]
+        return [self._embed_one(t) for t in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed_one(text.replace("\n", " "))
+
+
 class VectorStoreService:
     """
     Service for managing PostgreSQL vector stores for examples and extra prompt data.
-    Uses Hugging Face embeddings and pgvector for semantic search.
+    Uses Hugging Face (local or Inference API) and pgvector for semantic search.
+    When huggingface_api: uses existing bge_large_embedding column (BAAI/bge-large-en-v1.5, 1024-dim).
     """
     
     def __init__(self, model_name: str = None):
         """
-        Initialize embeddings model using Hugging Face.
+        Initialize embeddings: HF Inference API when EMBEDDING_PROVIDER=huggingface_api, else local Hugging Face.
         
         Args:
-            model_name: Hugging Face model name for embeddings.
-                       Default: from settings
+            model_name: For local Hugging Face only; model name for embeddings. Default: from settings.
         """
-        model_name = model_name or settings.embedding_model_name
-        print(f"🔧 Initializing Hugging Face embeddings with model: {model_name}")
-        
-        # Initialize Hugging Face embeddings
-        # This will download the model on first use if not cached
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=model_name,
-            model_kwargs={'device': 'cpu'},  # Use CPU by default
-            encode_kwargs={'normalize_embeddings': True}  # Normalize for better similarity
-        )
-        
-        self.model_name = model_name
         self.engine = sync_engine
         self.embedding_field_name = settings.get_embedding_field_name()
+
+        if settings.EMBEDDING_PROVIDER == "huggingface_api":
+            # Hugging Face Inference API (free; uses bge_large_embedding, no new column)
+            hf_model = settings.HUGGINGFACE_EMBEDDING_MODEL or "BAAI/bge-large-en-v1.5"
+            print(f"🔧 Initializing Hugging Face Inference API embeddings with model: {hf_model}")
+            self.embeddings = _HFInferenceEmbeddings(
+                model=hf_model,
+                token=settings.HUGGINGFACE_API_KEY,
+            )
+            self.model_name = hf_model
+        else:
+            # Local Hugging Face embeddings
+            model_name = model_name or settings.embedding_model_name
+            print(f"🔧 Initializing Hugging Face embeddings (local) with model: {model_name}")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=model_name,
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+            self.model_name = model_name
+
         print(f"🔧 Using embedding field: {self.embedding_field_name}")
     
     def initialize_stores(self):

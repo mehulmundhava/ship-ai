@@ -7,6 +7,7 @@ Ensures cached answers are only returned when SQL parameters match exactly.
 
 import json
 import re
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from sqlalchemy import text
 from langchain_community.utilities.sql_database import SQLDatabase
@@ -106,7 +107,49 @@ def extract_params_from_question(question: str) -> Dict[str, List[str]]:
     
     if to_values:
         params['to_facility'] = sorted(list(set(to_values)))
-    
+
+    # Extract date from question (e.g. "24 January 2026", "1 January 2026", "on Jan 1 2026")
+    date_values = []
+    # Already ISO: 2026-01-24, 2026-01-01
+    for iso_m in re.finditer(r'\b(20\d{2}-\d{2}-\d{2})\b', question):
+        if iso_m.group(1) not in date_values:
+            date_values.append(iso_m.group(1))
+    # Text forms: "24 January 2026", "1 January 2026", "January 24 2026"
+    # Must be capturing so group numbers align: Day Month Year → (1)=day,(2)=month,(3)=year; Month Day Year → (1)=month,(2)=day,(3)=year
+    months = r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
+    # Day Month Year: 24 January 2026
+    for m in re.finditer(rf'\b(\d{{1,2}})\s+{months}\s+(20\d{{2}})\b', question, re.IGNORECASE):
+        try:
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %b %Y")
+            norm = dt.strftime("%Y-%m-%d")
+            if norm not in date_values:
+                date_values.append(norm)
+        except ValueError:
+            try:
+                dt = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y")
+                norm = dt.strftime("%Y-%m-%d")
+                if norm not in date_values:
+                    date_values.append(norm)
+            except ValueError:
+                pass
+    # Month Day Year: January 24 2026
+    for m in re.finditer(rf'\b{months}\s+(\d{{1,2}}),?\s+(20\d{{2}})\b', question, re.IGNORECASE):
+        try:
+            dt = datetime.strptime(f"{m.group(2)} {m.group(1)} {m.group(3)}", "%d %b %Y")
+            norm = dt.strftime("%Y-%m-%d")
+            if norm not in date_values:
+                date_values.append(norm)
+        except ValueError:
+            try:
+                dt = datetime.strptime(f"{m.group(2)} {m.group(1)} {m.group(3)}", "%d %B %Y")
+                norm = dt.strftime("%Y-%m-%d")
+                if norm not in date_values:
+                    date_values.append(norm)
+            except ValueError:
+                pass
+    if date_values:
+        params['date'] = sorted(list(set(date_values)))
+
     return params
 
 
@@ -205,7 +248,22 @@ def extract_sql_parameters(sql: str) -> Dict[str, List[str]]:
             interval_values.append(value)
     if interval_values:
         params['interval'] = sorted(list(set(interval_values)))
-    
+
+    # Extract date literals (e.g. event_time::date = '2026-01-24', or = '2026-01-24' in WHERE)
+    date_values = []
+    # ::date = 'YYYY-MM-DD' or ::date = ''YYYY-MM-DD''
+    for m in re.finditer(r"::date\s*=\s*['\"](20\d{2}-\d{2}-\d{2})['\"]", sql, re.IGNORECASE):
+        v = m.group(1)
+        if v not in date_values:
+            date_values.append(v)
+    # Standalone quoted date in WHERE (common pattern)
+    for m in re.finditer(r"['\"](20\d{2}-\d{2}-\d{2})['\"]", sql):
+        v = m.group(1)
+        if v not in date_values:
+            date_values.append(v)
+    if date_values:
+        params['date'] = sorted(list(set(date_values)))
+
     return params
 
 
@@ -375,8 +433,8 @@ class CacheAnswerService:
             embed_ms = round((_t1 - _t0) * 1000)
             db_ms = round((_t2 - _t1) * 1000)
             logger.info(
-                "[80%% path] miss top=%s threshold=%s (embed_ms=%s db_ms=%s)",
-                f"{top:.4f}", threshold, embed_ms, db_ms,
+                "[80%% path] miss similarity=%.4f (below threshold %.2f) embed_ms=%s db_ms=%s",
+                top, threshold, embed_ms, db_ms,
             )
             # Build example docs in same format as search_examples_with_embedding so agent can skip duplicate vector search
             example_docs = []
@@ -399,7 +457,7 @@ class CacheAnswerService:
                 meta["id"] = row.id
                 example_docs.append(Document(page_content=content, metadata=meta))
             # Return miss payload with query_embedding and top_example_docs so agent skips second vector search
-            return {"_miss": True, "query_embedding": query_embedding, "top_example_docs": example_docs}
+            return {"_miss": True, "query_embedding": query_embedding, "top_example_docs": example_docs, "top_similarity": top, "threshold": threshold}
         except Exception as e:
             logger.warning(f"80% match-and-execute error: {e}")
             return None
@@ -442,11 +500,35 @@ class CacheAnswerService:
                     continue
                 
                 # For each old value, replace with corresponding new value
-                # If multiple values, use the first one (or handle IN clause)
                 old_value = old_values[0] if old_values else None
                 new_value = new_values[0] if new_values else None
                 
                 if not old_value or not new_value:
+                    continue
+                
+                # Date parameter: replace date literal anywhere (e.g. event_time::date = '2026-01-24')
+                if param_name == 'date':
+                    # Normalize new date to ISO YYYY-MM-DD and ensure quoted literal in SQL
+                    new_date = new_value.strip().strip("'\"")
+                    if re.match(r"^20\d{2}-\d{2}-\d{2}$", new_date):
+                        pass  # already ISO
+                    else:
+                        try:
+                            parsed = datetime.strptime(new_date[:10], "%Y-%m-%d")
+                            new_date = parsed.strftime("%Y-%m-%d")
+                        except ValueError:
+                            pass
+                    quoted_new = f"'{new_date}'"
+                    # 1) Replace quoted old date with quoted new date
+                    date_literal_pattern = rf"(['\"])({re.escape(old_value)})\1"
+                    adapted_sql = re.sub(date_literal_pattern, quoted_new, adapted_sql)
+                    # 2) Fallback: fix any ::date = <malformed> (e.g. P26-01-24', missing quote, etc.)
+                    adapted_sql = re.sub(
+                        r"(::date\s*=\s*)(['\"]?)(?:\d{2,4}[-\d]*\d{2}|P\d{2}-\d{2}-\d{2})['\"]?\s*",
+                        rf"\1{quoted_new} ",
+                        adapted_sql,
+                        flags=re.IGNORECASE,
+                    )
                     continue
                 
                 # Skip column references (values with dots that aren't quoted)
@@ -458,25 +540,6 @@ class CacheAnswerService:
                 alias_pattern = r'(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?'
                 
                 # Replace in WHERE clause (equality): device_id = 'old_value'
-                # Only replace in WHERE clauses, not in JOIN clauses
-                # Look for WHERE before the match to ensure we're in a WHERE clause
-                pattern = rf'({alias_pattern}{param_name}\s*=\s*[\'"]?){re.escape(old_value)}([\'"]?\s*)'
-                replacement = rf'\1{new_value}\2'
-                
-                # Only replace if it's in a WHERE clause (not in JOIN)
-                def replace_if_in_where(match):
-                    full_match = match.group(0)
-                    # Check if this is in a WHERE clause by looking backwards
-                    before_match = adapted_sql[:match.start()]
-                    # Find the last WHERE or JOIN before this match
-                    last_where = before_match.rfind('WHERE')
-                    last_join = before_match.rfind('JOIN')
-                    # Only replace if WHERE comes after the last JOIN (or no JOIN found)
-                    if last_where > last_join or last_join == -1:
-                        return replacement.replace(r'\1', match.group(1)).replace(r'\2', match.group(2))
-                    return full_match
-                
-                # Use a more careful replacement that checks context
                 where_section_pattern = rf'(WHERE\s+[^O]*?)({alias_pattern}{param_name}\s*=\s*[\'"]?){re.escape(old_value)}([\'"]?\s*)'
                 def replace_in_where_section(match):
                     prefix = match.group(1)
@@ -487,14 +550,12 @@ class CacheAnswerService:
                 adapted_sql = re.sub(where_section_pattern, replace_in_where_section, adapted_sql, flags=re.IGNORECASE | re.DOTALL)
                 
                 # Replace in WHERE clause (IN clause): device_id IN ('old_value', ...)
-                # Match the IN clause and replace the specific value
                 in_pattern = rf'({alias_pattern}{param_name}\s+IN\s*\([^)]*?)([\'"]?){re.escape(old_value)}([\'"]?)([^)]*?\))'
                 def replace_in_value(match):
                     prefix = match.group(1)
                     quote1 = match.group(2)
                     quote2 = match.group(3)
                     suffix = match.group(4)
-                    # Replace old_value with new_value, preserving quotes
                     return f"{prefix}{quote1}{new_value}{quote2}{suffix}"
                 
                 adapted_sql = re.sub(in_pattern, replace_in_value, adapted_sql, flags=re.IGNORECASE)

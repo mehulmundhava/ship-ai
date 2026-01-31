@@ -436,8 +436,8 @@ def search_embedding(
         # Convert to PostgreSQL array format string
         embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
         
-        # Use bge_large_embedding field for search
-        embedding_field = 'bge_large_embedding'
+        # Use embedding field from settings (bge_large_embedding, minilm_embedding, or openai_embedding)
+        embedding_field = settings.get_embedding_field_name()
         print(f"   Using embedding field: {embedding_field}")
         
         # Execute the search query using CTE (Common Table Expression)
